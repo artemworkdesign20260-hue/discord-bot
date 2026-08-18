@@ -2,15 +2,14 @@ import os
 import asyncio
 import discord
 from discord.ext import commands
-import google.generativeai as genai
+from google import genai
 
-# Налаштування Gemini API
+# Налаштування Gemini API (новий SDK)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    client = genai.Client(api_key=GEMINI_API_KEY)
 else:
-    model = None
+    client = None
 
 # Налаштування Discord бота
 intents = discord.Intents.default()
@@ -28,7 +27,7 @@ async def on_message(message):
 
     # Відповідь у приватні повідомлення або згадування бота
     if isinstance(message.channel, discord.DMChannel) or bot.user in message.mentions:
-        if not model:
+        if not client:
             await message.channel.send("Помилка: GEMINI_API_KEY не налаштовано в Environment Variables.")
             return
 
@@ -36,15 +35,18 @@ async def on_message(message):
             try:
                 # Затримка перед відповіддю для імітації людини
                 await asyncio.sleep(2)
-                
+
                 prompt = (
                     "Ти менеджер з продажів послуг розробки. Твоя мета: "
                     "ввічливо спілкуватися, дізнаватися потреби клієнта, "
                     "пропонувати відповідні рішення та домовлятися про ціну. "
                     f"Повідомлення клієнта: {message.content}"
                 )
-                
-                response = model.generate_content(prompt)
+
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=prompt,
+                )
                 await message.channel.send(response.text)
             except Exception as e:
                 await message.channel.send("Вибачте, виникла помилка при обробці запиту.")
