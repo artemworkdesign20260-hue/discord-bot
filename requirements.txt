@@ -1,5 +1,4 @@
 discord.py
-google-generativeai
 google-genai
 
 
