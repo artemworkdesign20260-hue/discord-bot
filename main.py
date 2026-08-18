@@ -57,4 +57,5 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 if DISCORD_TOKEN:
     bot.run(DISCORD_TOKEN)
 else:
-    print("Помилка: DISCORD_TOKEN не знайдено в Environment Variables
+    print("Помилка: DISCORD_TOKEN не знайдено в Environment Variables!")
+
