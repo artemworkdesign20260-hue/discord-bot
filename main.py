@@ -48,7 +48,8 @@ async def on_message(message):
                 payload = {"contents": [{"parts": [{"text": user_text}]}]}
                 headers = {'Content-Type': 'application/json'}
                 
-                response = requests.post(url, json=payload, headers=headers, timeout=15)
+                response = requests.post(url, json=payload, headers=headers, timeout=60)
+
                 result = response.json()
 
                 if "candidates" in result and len(result["candidates"]) > 0:
