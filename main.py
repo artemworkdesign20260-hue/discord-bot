@@ -4,7 +4,7 @@ import threading
 from flask import Flask
 import discord
 from discord.ext import commands
-from google import genai
+import requests
 
 app = Flask(__name__)
 
@@ -17,7 +17,6 @@ def run_flask():
     app.run(host='0.0.0.0', port=port)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -33,7 +32,7 @@ async def on_message(message):
         return
 
     if isinstance(message.channel, discord.DMChannel) or bot.user in message.mentions:
-        if not client:
+        if not GEMINI_API_KEY:
             await message.channel.send("Помилка: GEMINI_API_KEY не налаштовано в Render.")
             return
 
@@ -44,19 +43,25 @@ async def on_message(message):
                 if not user_text:
                     user_text = "Привіт"
 
-                # Використовуємо актуальну модель через офіційну бібліотеку Google
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=user_text,
-                )
+                # Використовуємо актуальну модель gemini-3.6-flash
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY.strip()}"
+                payload = {"contents": [{"parts": [{"text": user_text}]}]}
+                headers = {'Content-Type': 'application/json'}
+                
+                response = requests.post(url, json=payload, headers=headers, timeout=15)
+                result = response.json()
 
-                if response.text:
-                    await message.channel.send(response.text)
+                if "candidates" in result and len(result["candidates"]) > 0:
+                    reply_text = result["candidates"][0]["content"]["parts"][0]["text"]
+                    await message.channel.send(reply_text)
+                elif "error" in result:
+                    err_msg = result["error"].get("message", "Невідома помилка API")
+                    await message.channel.send(f"Помилка Gemini API: {err_msg}")
                 else:
                     await message.channel.send("Отримано порожню відповідь від Gemini.")
 
             except Exception as e:
-                await message.channel.send(f"Помилка Gemini API: {e}")
+                await message.channel.send(f"Системна помилка: {e}")
 
     await bot.process_commands(message)
 
