@@ -33,7 +33,7 @@ async def on_message(message):
 
     if isinstance(message.channel, discord.DMChannel) or bot.user in message.mentions:
         if not GEMINI_API_KEY:
-            await message.channel.send("Помилка: GEMINI_API_KEY не налаштовано в Render.")
+            await message.channel.send("Помилка: API ключ не налаштовано.")
             return
 
         async with message.channel.typing():
@@ -43,26 +43,33 @@ async def on_message(message):
                 if not user_text:
                     user_text = "Привіт"
 
-                # Використовуємо актуальну модель gemini-3.6-flash
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY.strip()}"
                 payload = {"contents": [{"parts": [{"text": user_text}]}]}
                 headers = {'Content-Type': 'application/json'}
                 
-                response = requests.post(url, json=payload, headers=headers, timeout=60)
-
-                result = response.json()
+                # Робимо до 2 спроб запиту, якщо сервери Google зайняті
+                result = None
+                for _ in range(2):
+                    response = requests.post(url, json=payload, headers=headers, timeout=60)
+                    result = response.json()
+                    if "candidates" in result:
+                        break
+                    await asyncio.sleep(2)
 
                 if "candidates" in result and len(result["candidates"]) > 0:
                     reply_text = result["candidates"][0]["content"]["parts"][0]["text"]
                     await message.channel.send(reply_text)
                 elif "error" in result:
-                    err_msg = result["error"].get("message", "Невідома помилка API")
-                    await message.channel.send(f"Помилка Gemini API: {err_msg}")
+                    err_msg = result["error"].get("message", "")
+                    if "high demand" in err_msg or "429" in str(result):
+                        await message.channel.send("Вибач, сервери Google зараз трохи перевантажені. Спробуй написати мені ще раз через кілька секунд!")
+                    else:
+                        await message.channel.send("Ой, виникла тимчасова проблема з відповіддю. Спробуй ще раз!")
                 else:
-                    await message.channel.send("Отримано порожню відповідь від Gemini.")
+                    await message.channel.send("Отримано порожню відповідь від сервера.")
 
             except Exception as e:
-                await message.channel.send(f"Системна помилка: {e}")
+                await message.channel.send("На жаль, стався збій підключення. Напиши мені ще раз!")
 
     await bot.process_commands(message)
 
