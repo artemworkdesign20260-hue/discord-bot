@@ -21,7 +21,7 @@ async def on_message(message):
 
     if isinstance(message.channel, discord.DMChannel) or bot.user in message.mentions:
         if not GEMINI_API_KEY:
-            await message.channel.send("Помилка: GEMINI_API_KEY не налаштовано.")
+            await message.channel.send("Помилка: GEMINI_API_KEY не налаштовано в Render.")
             return
 
         async with message.channel.typing():
@@ -31,22 +31,24 @@ async def on_message(message):
                 if not user_text:
                     user_text = "Привіт"
 
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY.strip()}"
                 payload = {"contents": [{"parts": [{"text": user_text}]}]}
+                headers = {'Content-Type': 'application/json'}
                 
-                response = requests.post(url, json=payload, timeout=10)
+                response = requests.post(url, json=payload, headers=headers, timeout=15)
                 result = response.json()
 
-                if "candidates" in result:
+                if "candidates" in result and len(result["candidates"]) > 0:
                     reply_text = result["candidates"][0]["content"]["parts"][0]["text"]
                     await message.channel.send(reply_text)
+                elif "error" in result:
+                    err_msg = result["error"].get("message", "Невідома помилка API")
+                    await message.channel.send(f"Помилка Gemini API: {err_msg}")
                 else:
-                    print(f"Помилка API: {result}")
-                    await message.channel.send("Виникла помилка при зверненні до Gemini.")
+                    await message.channel.send("Отримано порожню відповідь від Gemini.")
 
             except Exception as e:
-                print(f"Помилка: {e}")
-                await message.channel.send(f"Виникла помилка: {e}")
+                await message.channel.send(f"Системна помилка: {e}")
 
     await bot.process_commands(message)
 
