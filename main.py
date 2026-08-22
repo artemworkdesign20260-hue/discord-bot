@@ -1,8 +1,20 @@
 import os
 import asyncio
+import threading
+from flask import Flask
 import discord
 from discord.ext import commands
 import requests
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
@@ -31,7 +43,8 @@ async def on_message(message):
                 if not user_text:
                     user_text = "Привіт"
 
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY.strip()}"
+                # Оновлена модель Gemini
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY.strip()}"
                 payload = {"contents": [{"parts": [{"text": user_text}]}]}
                 headers = {'Content-Type': 'application/json'}
                 
@@ -52,6 +65,11 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-if DISCORD_TOKEN:
-    bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    t = threading.Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+
+    DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+    if DISCORD_TOKEN:
+        bot.run(DISCORD_TOKEN)
