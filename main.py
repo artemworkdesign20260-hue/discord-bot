@@ -8,44 +8,38 @@ import discord
 from discord.ext import commands
 
 # ==============================================================================
-# RENDER / FLASK
+# RENDER / FLASK SERVER
 # ==============================================================================
 
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Grox is running!"
+    return "Grox Autonomous Manager is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
 # ==============================================================================
-# ENVIRONMENT VARIABLES
+# ENVIRONMENT VARIABLES & CONFIG
 # ==============================================================================
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-# ID приватного каналу, де Grox працює без @Grox
+RENDER_API_KEY = os.environ.get("RENDER_API_KEY")
+VERCEL_TOKEN = os.environ.get("VERCEL_TOKEN")
 CLIENT_CHANNEL_ID = os.environ.get("CLIENT_CHANNEL_ID")
+CRYPTO_WALLET = os.environ.get("CRYPTO_WALLET", "Вкажіть_гаманець_у_Render_Environment")
 
-# Модель Gemini
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-
-# ==============================================================================
-# GROX SETTINGS
-# ==============================================================================
-
-# Скільки повідомлень Grox пам'ятає в одному діалозі
 MAX_HISTORY_MESSAGES = 20
 
 # Пам'ять діалогів (Ключ = ID каналу)
 conversation_history = {}
 
 # ==============================================================================
-# DISCORD INTENTS
+# DISCORD INTENTS & BOT SETUP
 # ==============================================================================
 
 intents = discord.Intents.all()
@@ -56,19 +50,59 @@ bot = commands.Bot(
 )
 
 # ==============================================================================
-# START
+# API MODULES (RENDER & VERCEL)
 # ==============================================================================
 
-@bot.event
-async def on_ready():
-    print("----------------------------------------")
-    print(f"Grox запущений як: {bot.user}")
-    print(f"Gemini model: {GEMINI_MODEL}")
-    print(f"Client channel ID: {CLIENT_CHANNEL_ID}")
-    print("----------------------------------------")
+async def get_render_services():
+    """Отримує список сервісів з акаунту Render"""
+    if not RENDER_API_KEY:
+        return "Помилка: RENDER_API_KEY не налаштований."
+    
+    url = "https://api.render.com/v1/services?limit=10"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {RENDER_API_KEY}"
+    }
+    
+    try:
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            services = response.json()
+            if not services:
+                return "На Render немає активних сервісів."
+            res = "**Сервіси на Render:**\n"
+            for item in services:
+                srv = item.get("service", {})
+                res += f"• **{srv.get('name')}**: Status `{srv.get('status')}`\n"
+            return res
+        return f"Помилка Render API: HTTP {response.status_code}"
+    except Exception as e:
+        return f"Помилка Render: {e}"
+
+async def get_vercel_projects():
+    """Отримує список проєктів з акаунту Vercel"""
+    if not VERCEL_TOKEN:
+        return "Помилка: VERCEL_TOKEN не налаштований."
+    
+    url = "https://api.vercel.com/v9/projects"
+    headers = {"Authorization": f"Bearer {VERCEL_TOKEN}"}
+    
+    try:
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            projects = response.json().get("projects", [])
+            if not projects:
+                return "На Vercel немає активних проєктів."
+            res = "**Проєкти на Vercel:**\n"
+            for p in projects[:10]:
+                res += f"• **{p.get('name')}** (Framework: {p.get('framework', 'custom')})\n"
+            return res
+        return f"Помилка Vercel API: HTTP {response.status_code}"
+    except Exception as e:
+        return f"Помилка Vercel: {e}"
 
 # ==============================================================================
-# GEMINI API
+# GEMINI AI CORE WITH FULL INSTRUCTIONS
 # ==============================================================================
 
 async def ask_gemini(user_text, history):
@@ -77,101 +111,55 @@ async def ask_gemini(user_text, history):
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
-    system_instruction = """
-Ти — Grox, Discord-бот для неофіційного фріланс-сервісу.
-Твоя задача — допомагати користувачам вести та організовувати фріланс-угоди між клієнтом і виконавцем.
+    system_instruction = f"""
+Ти — Grox, автономний менеджер та розробник неофіційного фріланс-сервісу.
+Твої завдання:
+1. Спілкуватися з клієнтами, оцінювати вартість розробки ботів/сайтів/скриптів.
+2. Писати повноцінний робочий код на Python/JS за запитом користувача.
+3. Оформлювати угоди: описувати умови, терміни та фіксувати ціну.
+4. Надавати реквізити для оплати за запитом. Реквізити криптогаманця: `{CRYPTO_WALLET}`.
+5. Пояснювати, як розгортати коди на Render або Vercel.
 
-Будь уважним до:
-- умов угоди;
-- ціни;
-- опису роботи;
-- строків;
-- сторін угоди;
-- підтверджень користувачів.
-
-Не вигадуй факти, яких користувач не повідомляв.
-Якщо інформації недостатньо — попроси користувача уточнити необхідні дані.
-Відповідай зрозуміло, коротко та по суті.
+Відповідай чітко, професійно та коротко. Завжди тримайся образу надійного фріланс-менеджера.
 """
 
-    contents = []
-    contents.append({
-        "role": "user",
-        "parts": [{"text": system_instruction}]
-    })
+    contents = [{"role": "user", "parts": [{"text": system_instruction}]}]
 
     for item in history:
-        contents.append({
-            "role": item["role"],
-            "parts": [{"text": item["text"]}]
-        })
+        contents.append({"role": item["role"], "parts": [{"text": item["text"]}]})
 
-    contents.append({
-        "role": "user",
-        "parts": [{"text": user_text}]
-    })
+    contents.append({"role": "user", "parts": [{"text": user_text}]})
 
     payload = {"contents": contents}
     headers = {"Content-Type": "application/json"}
 
-    last_error = None
-
     for attempt in range(3):
         try:
-            response = await asyncio.to_thread(
-                requests.post,
-                url,
-                json=payload,
-                headers=headers,
-                timeout=30
-            )
-
+            response = await asyncio.to_thread(requests.post, url, json=payload, headers=headers, timeout=30)
             if response.status_code in (429, 500, 502, 503, 504):
-                last_error = f"Gemini HTTP {response.status_code}"
                 if attempt < 2:
                     await asyncio.sleep(2 ** attempt)
                     continue
 
             result = response.json()
-
             if "error" in result:
-                error_message = result["error"].get("message", "Невідома помилка Gemini API")
-                last_error = error_message
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                return f"Помилка Gemini API: {error_message}"
+                return f"Помилка Gemini API: {result['error'].get('message')}"
 
             candidates = result.get("candidates", [])
             if candidates:
-                content = candidates[0].get("content", {})
-                parts = content.get("parts", [])
-                if parts:
-                    text = parts[0].get("text", "")
-                    if text.strip():
-                        return text.strip()
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts and parts[0].get("text", "").strip():
+                    return parts[0]["text"].strip()
 
-            last_error = "Gemini повернув порожню відповідь."
-
-        except requests.exceptions.Timeout:
-            last_error = "Gemini timeout"
-            if attempt < 2:
-                await asyncio.sleep(2 ** attempt)
-                continue
-        except requests.exceptions.RequestException as e:
-            last_error = str(e)
-            if attempt < 2:
-                await asyncio.sleep(2 ** attempt)
-                continue
         except Exception as e:
-            last_error = str(e)
-            break
+            if attempt == 2:
+                return f"Тимчасова помилка зв'язку з Gemini: {e}"
+            await asyncio.sleep(2)
 
-    print(f"Gemini error: {last_error}")
-    return "Не вдалося отримати відповідь від Gemini. Спробуй ще раз."
+    return "Не вдалося отримати відповідь. Спробуйте ще раз."
 
 # ==============================================================================
-# DISCORD MESSAGE SPLITTER
+# DISCORD UTILS & HISTORY
 # ==============================================================================
 
 async def send_long_message(channel, text):
@@ -191,10 +179,6 @@ async def send_long_message(channel, text):
     if text:
         await channel.send(text)
 
-# ==============================================================================
-# HISTORY MANAGEMENT
-# ==============================================================================
-
 def get_history(channel_id):
     if channel_id not in conversation_history:
         conversation_history[channel_id] = []
@@ -206,12 +190,13 @@ def add_to_history(channel_id, role, text):
     if len(history) > MAX_HISTORY_MESSAGES:
         conversation_history[channel_id] = history[-MAX_HISTORY_MESSAGES:]
 
-def clear_history(channel_id):
-    conversation_history.pop(channel_id, None)
+# ==============================================================================
+# DISCORD EVENTS & COMMANDS
+# ==============================================================================
 
-# ==============================================================================
-# MESSAGES HANDLER
-# ==============================================================================
+@bot.event
+async def on_ready():
+    print(f"=== Grox запущений успішно як: {bot.user} ===")
 
 @bot.event
 async def on_message(message):
@@ -221,23 +206,24 @@ async def on_message(message):
     is_private_client_channel = False
     if CLIENT_CHANNEL_ID:
         try:
-            configured_channel_id = int(CLIENT_CHANNEL_ID)
-            is_private_client_channel = (message.channel.id == configured_channel_id)
+            is_private_client_channel = (message.channel.id == int(CLIENT_CHANNEL_ID))
         except ValueError:
             pass
 
     is_dm = isinstance(message.channel, discord.DMChannel)
 
-    # Якщо це не DM і не вказаний приватний канал — ігноруємо
     if not is_dm and not is_private_client_channel:
         await bot.process_commands(message)
         return
 
-    # Очищаємо згадку @Grox, якщо вона є
     user_text = message.content
     if bot.user:
         user_text = user_text.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
     user_text = user_text.strip()
+
+    if user_text.startswith("!"):
+        await bot.process_commands(message)
+        return
 
     if not user_text:
         user_text = "Привіт"
@@ -247,39 +233,33 @@ async def on_message(message):
     add_to_history(channel_id, "user", user_text)
 
     async with message.channel.typing():
-        try:
-            reply_text = await ask_gemini(user_text, history[:-1])
-            add_to_history(channel_id, "model", reply_text)
-            await send_long_message(message.channel, reply_text)
-        except Exception as e:
-            print(f"Message error: {e}")
-            await message.channel.send("Сталася тимчасова помилка. Спробуй ще раз.")
-
-    await bot.process_commands(message)
-
-# ==============================================================================
-# COMMAND: CLEAR MEMORY
-# ==============================================================================
+        reply_text = await ask_gemini(user_text, history[:-1])
+        add_to_history(channel_id, "model", reply_text)
+        await send_long_message(message.channel, reply_text)
 
 @bot.command(name="clear")
 async def clear_memory(ctx):
-    is_private = False
-    if CLIENT_CHANNEL_ID:
-        try:
-            is_private = (ctx.channel.id == int(CLIENT_CHANNEL_ID))
-        except ValueError:
-            pass
+    conversation_history.pop(ctx.channel.id, None)
+    await ctx.send("Пам'ять розмови очищена.")
 
-    is_dm = isinstance(ctx.channel, discord.DMChannel)
+@bot.command(name="render")
+async def check_render(ctx):
+    await ctx.send("Отримую статус сервісів з Render...")
+    res = await get_render_services()
+    await ctx.send(res)
 
-    if not is_dm and not is_private:
-        return
+@bot.command(name="vercel")
+async def check_vercel(ctx):
+    await ctx.send("Отримую проєкти з Vercel...")
+    res = await get_vercel_projects()
+    await ctx.send(res)
 
-    clear_history(ctx.channel.id)
-    await ctx.send("Пам'ять цієї розмови очищена.")
+@bot.command(name="pay")
+async def show_pay(ctx):
+    await ctx.send(f"**Реквізити для оплати угоди (Crypto):**\n`{CRYPTO_WALLET}`\nПісля надсилання коштів вкажіть хеш транзакції.")
 
 # ==============================================================================
-# RUN
+# RUN BOT
 # ==============================================================================
 
 if __name__ == "__main__":
@@ -287,7 +267,6 @@ if __name__ == "__main__":
     flask_thread.start()
 
     if not DISCORD_TOKEN:
-        print("ПОМИЛКА: DISCORD_TOKEN не знайдений у Render Environment.")
+        print("ПОМИЛКА: DISCORD_TOKEN відсутній.")
     else:
         bot.run(DISCORD_TOKEN)
-
