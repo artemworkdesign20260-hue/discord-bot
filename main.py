@@ -1,23 +1,23 @@
 import os
 import asyncio
 import threading
+import requests
 
 from flask import Flask
 import discord
 from discord.ext import commands
-import requests
 
 
-# =========================
-# Flask для Render
-# =========================
+# =========================================================
+# RENDER / FLASK
+# =========================================================
 
 app = Flask(__name__)
 
 
 @app.route("/")
 def home():
-    return "Bot is running!"
+    return "Grox is running!"
 
 
 def run_flask():
@@ -25,17 +25,26 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 
-# =========================
-# Налаштування
-# =========================
+# =========================================================
+# ENVIRONMENT VARIABLES
+# =========================================================
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# ID приватного каналу, де Grox працює без @Grox
+CLIENT_CHANNEL_ID = os.environ.get("CLIENT_CHANNEL_ID")
+
+# Модель Gemini
+GEMINI_MODEL = os.environ.get(
+    "GEMINI_MODEL",
+    "gemini-2.5-flash"
+)
 
 
-# =========================
-# Discord
-# =========================
+# =========================================================
+# DISCORD
+# =========================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -46,18 +55,209 @@ bot = commands.Bot(
 )
 
 
-# =========================
-# Коли бот запустився
-# =========================
+# =========================================================
+# START
+# =========================================================
 
 @bot.event
 async def on_ready():
-    print(f"Бот успішно запущений як {bot.user}")
+    print("--------------------------------")
+    print(f"Grox запущений як: {bot.user}")
+    print(f"Gemini model: {GEMINI_MODEL}")
+    print(f"Client channel ID: {CLIENT_CHANNEL_ID}")
+    print("--------------------------------")
 
 
-# =========================
-# Повідомлення
-# =========================
+# =========================================================
+# GEMINI
+# =========================================================
+
+async def ask_gemini(user_text):
+    """
+    Відправляє повідомлення Gemini.
+    Запит запускається через asyncio.to_thread(),
+    тому Discord event loop не блокується.
+    """
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{GEMINI_MODEL}:generateContent"
+        f"?key={GEMINI_API_KEY}"
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": user_text
+                    }
+                ]
+            }
+        ]
+    }
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    last_error = None
+
+    # До 3 спроб
+    for attempt in range(3):
+
+        try:
+
+            response = await asyncio.to_thread(
+                requests.post,
+                url,
+                json=payload,
+                headers=headers,
+                timeout=30
+            )
+
+            # Тимчасові серверні помилки
+            if response.status_code in (429, 500, 502, 503, 504):
+
+                last_error = (
+                    f"Gemini HTTP {response.status_code}"
+                )
+
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+                return (
+                    "Gemini зараз тимчасово перевантажений. "
+                    "Спробуй ще раз через кілька секунд."
+                )
+
+            result = response.json()
+
+            # API повернув помилку
+            if "error" in result:
+
+                error_message = result["error"].get(
+                    "message",
+                    "Невідома помилка Gemini API"
+                )
+
+                last_error = error_message
+
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+                return (
+                    f"Помилка Gemini API: {error_message}"
+                )
+
+            # Нормальна відповідь
+            candidates = result.get("candidates", [])
+
+            if candidates:
+
+                content = candidates[0].get(
+                    "content",
+                    {}
+                )
+
+                parts = content.get(
+                    "parts",
+                    []
+                )
+
+                if parts:
+
+                    text = parts[0].get(
+                        "text",
+                        ""
+                    )
+
+                    if text.strip():
+                        return text.strip()
+
+            last_error = "Gemini повернув порожню відповідь."
+
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+                continue
+
+        except requests.exceptions.Timeout:
+
+            last_error = "Gemini timeout"
+
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+                continue
+
+        except requests.exceptions.RequestException as e:
+
+            last_error = str(e)
+
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+                continue
+
+        except Exception as e:
+
+            last_error = str(e)
+            break
+
+    print(f"Gemini error: {last_error}")
+
+    return (
+        "Не вдалося отримати відповідь від Gemini. "
+        "Спробуй ще раз."
+    )
+
+
+# =========================================================
+# DISCORD MESSAGE SPLITTER
+# =========================================================
+
+async def send_long_message(channel, text):
+    """
+    Discord має обмеження приблизно 2000 символів
+    на одне повідомлення.
+    """
+
+    max_length = 1900
+
+    while len(text) > max_length:
+
+        # Намагаємося розділити по переносу рядка
+        split_at = text.rfind(
+            "\n",
+            0,
+            max_length
+        )
+
+        # Якщо переносу немає — по пробілу
+        if split_at <= 0:
+            split_at = text.rfind(
+                " ",
+                0,
+                max_length
+            )
+
+        # Якщо нічого не знайшли
+        if split_at <= 0:
+            split_at = max_length
+
+        part = text[:split_at].strip()
+
+        await channel.send(part)
+
+        text = text[split_at:].strip()
+
+    if text:
+        await channel.send(text)
+
+
+# =========================================================
+# MESSAGES
+# =========================================================
 
 @bot.event
 async def on_message(message):
@@ -66,198 +266,131 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # Працюємо тільки в ЛС або коли бота згадали
-    if (
-        isinstance(message.channel, discord.DMChannel)
-        or bot.user in message.mentions
-    ):
+    # -----------------------------------------------------
+    # ВИЗНАЧАЄМО, ЧИ МОЖЕ GROX ВІДПОВІДАТИ
+    # -----------------------------------------------------
 
-        # Перевіряємо API ключ Gemini
-        if not GEMINI_API_KEY:
-            await message.channel.send(
-                "Помилка: API ключ Gemini не налаштовано в Render."
+    is_private_client_channel = False
+
+    if CLIENT_CHANNEL_ID:
+
+        try:
+            configured_channel_id = int(
+                CLIENT_CHANNEL_ID
             )
-            return
 
-        async with message.channel.typing():
+            is_private_client_channel = (
+                message.channel.id
+                == configured_channel_id
+            )
 
-            try:
+        except ValueError:
+            print(
+                "Помилка: CLIENT_CHANNEL_ID "
+                "має бути числом."
+            )
 
-                # Прибираємо згадку бота з повідомлення
-                user_text = message.content.replace(
-                    f"<@{bot.user.id}>",
-                    ""
-                ).strip()
+    # Особисті повідомлення також дозволені
+    is_dm = isinstance(
+        message.channel,
+        discord.DMChannel
+    )
 
-                if not user_text:
-                    user_text = "Привіт"
+    # Якщо це не DM і не наш приватний канал —
+    # Grox мовчить
+    if not is_dm and not is_private_client_channel:
+        await bot.process_commands(message)
+        return
 
-                # Gemini API
-                url = (
-                    "https://generativelanguage.googleapis.com/"
-                    "v1beta/models/gemini-3.6-flash:"
-                    f"generateContent?key={GEMINI_API_KEY}"
-                )
+    # -----------------------------------------------------
+    # ПЕРЕВІРКА GEMINI KEY
+    # -----------------------------------------------------
 
-                payload = {
-                    "contents": [
-                        {
-                            "parts": [
-                                {
-                                    "text": user_text
-                                }
-                            ]
-                        }
-                    ]
-                }
+    if not GEMINI_API_KEY:
 
-                headers = {
-                    "Content-Type": "application/json"
-                }
+        await message.channel.send(
+            "Помилка: GEMINI_API_KEY не налаштований "
+            "у Render Environment."
+        )
 
-                result = None
+        return
 
-                # До 3 спроб
-                for attempt in range(3):
+    # -----------------------------------------------------
+    # ОЧИЩАЄМО @GROX, ЯКЩО ВІН РАПТОМ Є
+    # -----------------------------------------------------
 
-                    try:
+    user_text = message.content
 
-                        # ВАЖЛИВО:
-                        # requests запускаємо окремо,
-                        # щоб він не блокував Discord
-                        response = await asyncio.to_thread(
-                            requests.post,
-                            url,
-                            json=payload,
-                            headers=headers,
-                            timeout=30
-                        )
+    if bot.user:
 
-                        result = response.json()
+        user_text = user_text.replace(
+            f"<@{bot.user.id}>",
+            ""
+        )
 
-                        # Якщо отримали нормальну відповідь
-                        if (
-                            "candidates" in result
-                            and len(result["candidates"]) > 0
-                        ):
-                            break
+        user_text = user_text.replace(
+            f"<@!{bot.user.id}>",
+            ""
+        )
 
-                        # Якщо Gemini тимчасово перевантажений
-                        if "error" in result:
+    user_text = user_text.strip()
 
-                            err_msg = result["error"].get(
-                                "message",
-                                ""
-                            )
+    if not user_text:
+        user_text = "Привіт"
 
-                            if (
-                                "429" in str(err_msg)
-                                or "high demand" in str(err_msg).lower()
-                                or "503" in str(err_msg)
-                            ):
+    # -----------------------------------------------------
+    # GEMINI
+    # -----------------------------------------------------
 
-                                if attempt < 2:
-                                    await asyncio.sleep(
-                                        2 * (attempt + 1)
-                                    )
-                                    continue
+    async with message.channel.typing():
 
-                    except requests.exceptions.Timeout:
+        try:
 
-                        if attempt < 2:
-                            await asyncio.sleep(
-                                2 * (attempt + 1)
-                            )
-                            continue
+            reply_text = await ask_gemini(
+                user_text
+            )
 
-                        await message.channel.send(
-                            "Gemini занадто довго не відповідає. "
-                            "Спробуй ще раз."
-                        )
-                        return
+            await send_long_message(
+                message.channel,
+                reply_text
+            )
 
-                    except requests.exceptions.RequestException:
+        except Exception as e:
 
-                        if attempt < 2:
-                            await asyncio.sleep(
-                                2 * (attempt + 1)
-                            )
-                            continue
+            print(
+                f"Message error: {e}"
+            )
 
-                        await message.channel.send(
-                            "Не вдалося підключитися до Gemini. "
-                            "Спробуй ще раз."
-                        )
-                        return
+            await message.channel.send(
+                "Сталася тимчасова помилка. "
+                "Спробуй ще раз."
+            )
 
-                # =========================
-                # Обробка відповіді Gemini
-                # =========================
-
-                if (
-                    result
-                    and "candidates" in result
-                    and len(result["candidates"]) > 0
-                ):
-
-                    reply_text = (
-                        result["candidates"][0]
-                        ["content"]
-                        ["parts"][0]
-                        ["text"]
-                    )
-
-                    await message.channel.send(
-                        reply_text
-                    )
-
-                elif result and "error" in result:
-
-                    err_msg = result["error"].get(
-                        "message",
-                        "Невідома помилка Gemini API"
-                    )
-
-                    await message.channel.send(
-                        f"Помилка Gemini API: {err_msg}"
-                    )
-
-                else:
-
-                    await message.channel.send(
-                        "Gemini не повернув відповідь. "
-                        "Спробуй ще раз."
-                    )
-
-            except Exception as e:
-
-                print(f"Помилка: {e}")
-
-                await message.channel.send(
-                    "На жаль, сталася тимчасова помилка. "
-                    "Спробуй ще раз."
-                )
-
-    # Обробка Discord-команд
     await bot.process_commands(message)
 
 
-# =========================
-# Запуск
-# =========================
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
 
-    # Запускаємо Flask окремо
-    t = threading.Thread(
-        target=run_flask
+    # Flask для Render
+    flask_thread = threading.Thread(
+        target=run_flask,
+        daemon=True
     )
 
-    t.daemon = True
-    t.start()
+    flask_thread.start()
 
-    # Запускаємо Discord
+    # Перевірка Discord token
     if not DISCORD_TOKEN:
-        print("ПОМИЛКА: DISCORD_TOKEN не налаштовано в Render.")
+
+        print(
+            "ПОМИЛКА: DISCORD_TOKEN "
+            "не знайдений у Render Environment."
+        )
+
     else:
+
         bot.run(DISCORD_TOKEN)
