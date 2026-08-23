@@ -29,7 +29,6 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY")
 VERCEL_TOKEN = os.environ.get("VERCEL_TOKEN")
-CLIENT_CHANNEL_ID = os.environ.get("CLIENT_CHANNEL_ID")
 CRYPTO_WALLET = os.environ.get("CRYPTO_WALLET", "Вкажіть_гаманець_у_Render_Environment")
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -191,7 +190,7 @@ def add_to_history(channel_id, role, text):
         conversation_history[channel_id] = history[-MAX_HISTORY_MESSAGES:]
 
 # ==============================================================================
-# DISCORD EVENTS & COMMANDS
+# DISCORD EVENTS & COMMANDS (ВІДПОВІДЬ У ВСІХ ЧАТАХ)
 # ==============================================================================
 
 @bot.event
@@ -200,27 +199,17 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
+    # Ігноруємо власній відповіді бота
     if message.author == bot.user:
         return
 
-    is_private_client_channel = False
-    if CLIENT_CHANNEL_ID:
-        try:
-            is_private_client_channel = (message.channel.id == int(CLIENT_CHANNEL_ID))
-        except ValueError:
-            pass
-
-    is_dm = isinstance(message.channel, discord.DMChannel)
-
-    if not is_dm and not is_private_client_channel:
-        await bot.process_commands(message)
-        return
-
+    # Очищаємо згадку @Grox, якщо вона є
     user_text = message.content
     if bot.user:
         user_text = user_text.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
     user_text = user_text.strip()
 
+    # Якщо це команда з "!"
     if user_text.startswith("!"):
         await bot.process_commands(message)
         return
@@ -232,6 +221,7 @@ async def on_message(message):
     history = get_history(channel_id)
     add_to_history(channel_id, "user", user_text)
 
+    # Відповідаємо в БУДЬ-ЯКОМУ каналі сервера та в DM без перевірки ID
     async with message.channel.typing():
         reply_text = await ask_gemini(user_text, history[:-1])
         add_to_history(channel_id, "model", reply_text)
@@ -270,3 +260,4 @@ if __name__ == "__main__":
         print("ПОМИЛКА: DISCORD_TOKEN відсутній.")
     else:
         bot.run(DISCORD_TOKEN)
+
