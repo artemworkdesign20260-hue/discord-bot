@@ -9,7 +9,7 @@ from google import genai
 from google.genai import types
 
 # ==============================================================================
-# 1. ВЕБ-СЕРВЕР ДЛЯ RENDER
+# 1. ВЕБ-СЕРВЕР ДЛЯ RENDER (ФІКС СТАТУСУ ТА ПОРТУ)
 # ==============================================================================
 
 app = Flask('')
@@ -35,10 +35,6 @@ CRYPTO_WALLET = os.getenv(
 )
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-# ID конкретного каналу, де бот має відповідати на ВСІ повідомлення БЕЗ згадки @
-# Якщо хочеш прив'язати до конкретного каналу — вкажи його ID замість None (наприклад: 123456789012345678)
-TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", None)
 
 # ==============================================================================
 # 3. НАЛАШТУВАННЯ ЛОГУВАННЯ
@@ -110,10 +106,6 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # УМОВИ ВІДПОВІДІ:
-    # 1. Це особисті повідомлення (DM / ЛС)
-    # 2. Бот згаданий через @
-    # 3. АБО це текстовий канал на сервері (реагує на ВСІ повідомлення в каналах сервера)
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user.mentioned_in(message)
     is_server_channel = isinstance(message.channel, discord.TextChannel)
@@ -139,12 +131,15 @@ async def on_message(message):
     await bot.process_commands(message)
 
 # ==============================================================================
-# 8. ЗАПУСК
+# 8. ЗАПУСК ВЕБ-СЕРВЕРА ТА БОТА
 # ==============================================================================
 
 if __name__ == "__main__":
+    # Обов'язковий запуск веб-сервера у фоновому потоці
     t = threading.Thread(target=run_flask)
     t.daemon = True
     t.start()
+    
+    # Запуск бота Discord
     bot.run(DISCORD_TOKEN)
 
