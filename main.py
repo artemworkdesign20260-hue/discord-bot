@@ -9,7 +9,7 @@ from google import genai
 from google.genai import types
 
 # ==============================================================================
-# 1. ВЕБ-СЕРВЕР ДЛЯ RENDER (ЩОБ НЕ БУЛО ПОМИЛКИ PORT BINDING)
+# 1. ВЕБ-СЕРВЕР ДЛЯ RENDER
 # ==============================================================================
 
 app = Flask('')
@@ -36,6 +36,10 @@ CRYPTO_WALLET = os.getenv(
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
+# ID конкретного каналу, де бот має відповідати на ВСІ повідомлення БЕЗ згадки @
+# Якщо хочеш прив'язати до конкретного каналу — вкажи його ID замість None (наприклад: 123456789012345678)
+TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", None)
+
 # ==============================================================================
 # 3. НАЛАШТУВАННЯ ЛОГУВАННЯ
 # ==============================================================================
@@ -47,16 +51,16 @@ logging.basicConfig(
 logger = logging.getLogger("GroxBot")
 
 # ==============================================================================
-# 4. ПЕРЕВІРКА НАЯВНОСТІ КЛЮЧІВ
+# 4. ПЕРЕВІРКА КЛЮЧІВ
 # ==============================================================================
 
 if not DISCORD_TOKEN:
-    logger.error("❌ DISCORD_TOKEN не знайдено в змінних оточення!")
-    raise RuntimeError("Не знайдено DISCORD_TOKEN у Render Environment.")
+    logger.error("❌ DISCORD_TOKEN не знайдено!")
+    raise RuntimeError("Не знайдено DISCORD_TOKEN.")
 
 if not GEMINI_API_KEY:
-    logger.error("❌ GEMINI_API_KEY не знайдено в змінних оточення!")
-    raise RuntimeError("Не знайдено GEMINI_API_KEY у Render Environment.")
+    logger.error("❌ GEMINI_API_KEY не знайдено!")
+    raise RuntimeError("Не знайдено GEMINI_API_KEY.")
 
 # ==============================================================================
 # 5. ІНІЦІАЛІЗАЦІЯ GEMINI CLIENT
@@ -90,7 +94,7 @@ SYSTEM_INSTRUCTION = f"""
 """
 
 # ==============================================================================
-# 7. НАЛАШТУВАННЯ DISCORD БОТА
+# 7. DISCORD BOT SETUP
 # ==============================================================================
 
 intents = discord.Intents.default()
@@ -99,14 +103,22 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    logger.info(f"✅ Бот успішно запущений і підключений як: {bot.user}")
+    logger.info(f"✅ Бот успішно запущений як: {bot.user}")
 
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
 
-    if isinstance(message.channel, discord.DMChannel) or bot.user.mentioned_in(message):
+    # УМОВИ ВІДПОВІДІ:
+    # 1. Це особисті повідомлення (DM / ЛС)
+    # 2. Бот згаданий через @
+    # 3. АБО це текстовий канал на сервері (реагує на ВСІ повідомлення в каналах сервера)
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    is_mentioned = bot.user.mentioned_in(message)
+    is_server_channel = isinstance(message.channel, discord.TextChannel)
+
+    if is_dm or is_mentioned or is_server_channel:
         async with message.channel.typing():
             await asyncio.sleep(20)
 
@@ -119,22 +131,20 @@ async def on_message(message):
                     )
                 )
                 await message.channel.send(response.text)
-                logger.info(f"Успішно відправлено відповідь користувачу {message.author}")
+                logger.info(f"Успішно відправлено відповідь у чат {message.channel}")
             except Exception as e:
-                logger.error(f"❌ Помилка при запиті до Gemini API: {e}")
+                logger.error(f"❌ Помилка Gemini API: {e}")
                 await message.channel.send("Вибачте, виникла тимчасова помилка при обробці вашого запиту.")
 
     await bot.process_commands(message)
 
 # ==============================================================================
-# 8. ЗАПУСК ВЕБ-СЕРВЕРА ТА БОТА
+# 8. ЗАПУСК
 # ==============================================================================
 
 if __name__ == "__main__":
-    # Запускаємо Flask у окремому потоці
     t = threading.Thread(target=run_flask)
     t.daemon = True
     t.start()
-    
-    # Запускаємо Discord-бота
     bot.run(DISCORD_TOKEN)
+
