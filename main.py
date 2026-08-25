@@ -1,13 +1,29 @@
 import os
 import asyncio
 import logging
+import threading
+from flask import Flask
 import discord
 from discord.ext import commands
 from google import genai
 from google.genai import types
 
 # ==============================================================================
-# 1. НАЛАШТУВАННЯ ТА ЗМІННІ СЕРЕДОВИЩА
+# 1. ВЕБ-СЕРВЕР ДЛЯ RENDER (ЩОБ НЕ БУЛО ПОМИЛКИ PORT BINDING)
+# ==============================================================================
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Grox Discord Bot is online!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# ==============================================================================
+# 2. НАЛАШТУВАННЯ ТА ЗМІННІ СЕРЕДОВИЩА
 # ==============================================================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -18,11 +34,10 @@ CRYPTO_WALLET = os.getenv(
     "адресу гаманця буде вказано під час оплати"
 )
 
-# Використовуємо актуальну та стабільну модель Gemini
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # ==============================================================================
-# 2. НАЛАШТУВАННЯ ЛОГУВАННЯ
+# 3. НАЛАШТУВАННЯ ЛОГУВАННЯ
 # ==============================================================================
 
 logging.basicConfig(
@@ -32,7 +47,7 @@ logging.basicConfig(
 logger = logging.getLogger("GroxBot")
 
 # ==============================================================================
-# 3. ПЕРЕВІРКА НАЯВНОСТІ КЛЮЧІВ
+# 4. ПЕРЕВІРКА НАЯВНОСТІ КЛЮЧІВ
 # ==============================================================================
 
 if not DISCORD_TOKEN:
@@ -44,13 +59,13 @@ if not GEMINI_API_KEY:
     raise RuntimeError("Не знайдено GEMINI_API_KEY у Render Environment.")
 
 # ==============================================================================
-# 4. ІНІЦІАЛІЗАЦІЯ GEMINI CLIENT
+# 5. ІНІЦІАЛІЗАЦІЯ GEMINI CLIENT
 # ==============================================================================
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ==============================================================================
-# 5. СИСТЕМНА ІНСТРУКЦІЯ ДЛЯ МЕНЕДЖЕРА ПРОДАЖІВ
+# 6. СИСТЕМНА ІНСТРУКЦІЯ
 # ==============================================================================
 
 SYSTEM_INSTRUCTION = f"""
@@ -75,7 +90,7 @@ SYSTEM_INSTRUCTION = f"""
 """
 
 # ==============================================================================
-# 6. НАЛАШТУВАННЯ DISCORD БОТА
+# 7. НАЛАШТУВАННЯ DISCORD БОТА
 # ==============================================================================
 
 intents = discord.Intents.default()
@@ -88,18 +103,14 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    # Ігноруємо власні повідомлення бота
     if message.author == bot.user:
         return
 
-    # Реагуємо на особисті повідомлення (DM) або згадки бота через @
     if isinstance(message.channel, discord.DMChannel) or bot.user.mentioned_in(message):
         async with message.channel.typing():
-            # Затримка 20 секунд для імітації введення повідомлення людиною
             await asyncio.sleep(20)
 
             try:
-                # Запит до Gemini API
                 response = gemini_client.models.generate_content(
                     model=GEMINI_MODEL,
                     contents=message.content,
@@ -116,9 +127,14 @@ async def on_message(message):
     await bot.process_commands(message)
 
 # ==============================================================================
-# 7. ТОЧКА ВХОДУ (ЗАПУСК)
+# 8. ЗАПУСК ВЕБ-СЕРВЕРА ТА БОТА
 # ==============================================================================
 
 if __name__ == "__main__":
+    # Запускаємо Flask у окремому потоці
+    t = threading.Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+    
+    # Запускаємо Discord-бота
     bot.run(DISCORD_TOKEN)
-
