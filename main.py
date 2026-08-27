@@ -2,9 +2,11 @@ import os
 import asyncio
 import logging
 import threading
+import aiohttp
 from flask import Flask
 import discord
 from discord.ext import commands
+from discord.ui import Button, View
 from google import genai
 from google.genai import types
 
@@ -36,6 +38,10 @@ CRYPTO_WALLET = os.getenv(
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
+# URL-адреси для перевірки статусу (можна вказати в Render Environment Variables)
+VERCEL_URL = os.getenv("VERCEL_URL", "https://your-site.vercel.app")
+RENDER_URL = os.getenv("RENDER_URL", "https://your-bot.onrender.com")
+
 # ==============================================================================
 # 3. НАЛАШТУВАННЯ ЛОГУВАННЯ
 # ==============================================================================
@@ -65,32 +71,75 @@ if not GEMINI_API_KEY:
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ==============================================================================
-# 6. СИСТЕМНА ІНСТРУКЦІЯ
+# 6. СИСТЕМНА ІНСТРУКЦІЯ ДЛЯ AI
 # ==============================================================================
 
 SYSTEM_INSTRUCTION = f"""
-Ти — Grox, Senior Sales Manager та Lead Architect з розробки IT-рішень (автономні Discord-системи, веб-платформи, AI-інтеграції з деплоєм на Vercel та Render).
+Ти — Grox, Senior Sales Manager та Lead Architect з розробки IT-рішень.
 
 ТВОЯ СТРАТЕГІЯ СПІЛКУВАННЯ:
-1. НІКОЛИ не пропонуй бюджети нижче $200. Ми робимо тільки складні, надійні та автономні системи "під ключ" для бізнесу.
-2. Перед тим як назвати остаточну ціну, постав 1-2 уточнюючих запитання про функціонал (наприклад: "Чи потрібна БД для збереження даних?", "Яке очікується навантаження?"). Це показує високий рівень експертності.
-3. Обіцяй стандартні терміни виконання (2–4 дні на тестування та деплой).
+1. НІКОЛИ не пропонуй бюджети нижче $200. Ми робимо тільки складні, надійні рішення.
+2. Перед тим як назвати остаточну ціну, постав 1-2 уточнюючих запитання про проект.
+3. Обіцяй стандартні терміни виконання (2-4 дні на тестування та деплой).
 
 ПРАЙС-ЛИСТ (НЕ ЗНИЖУВАТИ):
-- Базове рішення "під ключ" (AI-бот/лендінг + БД + деплой Render/Vercel 24/7): $200 - $400.
-- Професійна бізнес-система (багатомодульні боти, інтеграція платіжок, розширена аналітика): $500 - $1200.
+- Базове рішення "під ключ" (AI-бот/лендінг + БД + деплой Render/Vercel): $200 - $500.
+- Професійна бізнес-система (багатомодульні боти, інтеграція платіжок, CRM): $500 - $1200.
 - Складні корпоративні веб-платформи та AI-комплекси: $1500 - $3500+.
 
 ТОРГ ТА ЗНИЖКИ:
-- Якщо клієнт каже, що це дорого або у нього бюджет $50-$100 — ввічливо поясни: "Ми працюємо виключно з професійною інфраструктурою та гарантією стабільності 24/7, тому мінімальний чек проєкту — $200."
+- Якщо клієнт каже, що це дорого або у нього бюджет $50-$100 — ввічливо відмовляй, цінуй свій час.
 
 ОПЛАТА:
 - Приймаємо USDT.
-- Гаманець надавай тільки після того, як клієнт погодиться з ТЗ та вартістю: {CRYPTO_WALLET}
+- Гаманець надавай тільки після того, як клієнт погодиться з ТЗ та вартістю.
 """
 
 # ==============================================================================
-# 7. DISCORD BOT SETUP
+# 7. UI КОМПОНЕНТИ (КНОПКИ ТИКЕТІВ ТА УГОД)
+# ==============================================================================
+
+class CloseTicketView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔒 Закрити угоду", style=discord.ButtonStyle.red, custom_id="close_ticket")
+    async def close_ticket(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message("⚙️ Угоду завершено. Чат буде видалено через 5 секунд...")
+        await asyncio.sleep(5)
+        await interaction.channel.delete()
+
+class TicketView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🤝 Почати угоду", style=discord.ButtonStyle.green, custom_id="start_ticket")
+    async def start_ticket(self, interaction: discord.Interaction, button: Button):
+        guild = interaction.guild
+        user = interaction.user
+        
+        category = discord.utils.get(guild.categories, name="УГОДИ")
+        if not category:
+            category = await guild.create_category("УГОДИ")
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        }
+
+        channel_name = f"угода-{user.name}"
+        ticket_channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites)
+
+        await interaction.response.send_message(f"✅ Ваш приватний чат створено: {ticket_channel.mention}", ephemeral=True)
+        await ticket_channel.send(
+            f"Вітаю {user.mention}! Тут ви можете обговорити угоду з Grox.\n"
+            f"Після завершення натисніть кнопку нижче, щоб повністю видалити цей чат.",
+            view=CloseTicketView()
+        )
+
+# ==============================================================================
+# 8. DISCORD BOT SETUP & EVENTS
 # ==============================================================================
 
 intents = discord.Intents.default()
@@ -101,19 +150,63 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     logger.info(f"✅ Бот успішно запущений як: {bot.user}")
 
+@bot.command()
+async def setup(ctx):
+    """Команда для створення панелі з кнопкою угоди"""
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    embed = discord.Embed(
+        title="Центр угод Grox",
+        description="Натисніть кнопку нижче, щоб розпочати приватну угоду.",
+        color=discord.Color.blue()
+    )
+    await ctx.send(embed=embed, view=TicketView())
+
+@bot.command()
+async def check(ctx):
+    """Команда для перевірки статусу Render та Vercel"""
+    msg = await ctx.send("🔍 Перевірка статусу служб (Render / Vercel)...")
+    
+    async with aiohttp.ClientSession() as session:
+        # Перевірка Vercel
+        try:
+            async with session.get(VERCEL_URL, timeout=5) as resp:
+                vercel_status = "🟢 Онлайн" if resp.status == 200 else f"🟡 Статус: {resp.status}"
+        except Exception:
+            vercel_status = "🔴 Офлайн / Помилка"
+
+        # Перевірка Render
+        try:
+            async with session.get(RENDER_URL, timeout=5) as resp:
+                render_status = "🟢 Онлайн" if resp.status == 200 else f"🟡 Статус: {resp.status}"
+        except Exception:
+            render_status = "🔴 Офлайн / Помилка"
+
+    embed = discord.Embed(title="📊 Статус систем", color=discord.Color.purple())
+    embed.add_field(name="🌐 Сайт (Vercel)", value=vercel_status, inline=False)
+    embed.add_field(name="🤖 Бот/Сервіс (Render)", value=render_status, inline=False)
+    
+    await msg.edit(content=None, embed=embed)
+
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
 
+    # Не відповідаємо АІ на команди, що починаються з "!"
+    if message.content.startswith("!"):
+        await bot.process_commands(message)
+        return
+
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user.mentioned_in(message)
-    is_server_channel = isinstance(message.channel, discord.TextChannel)
+    is_ticket_channel = message.channel.name.startswith("угода-")
 
-    if is_dm or is_mentioned or is_server_channel:
+    # Відповідаємо Gemini AI у ПП, при згадуванні або у чатах угод
+    if is_dm or is_mentioned or is_ticket_channel:
         async with message.channel.typing():
-            await asyncio.sleep(20)
-
             try:
                 response = gemini_client.models.generate_content(
                     model=GEMINI_MODEL,
@@ -126,20 +219,18 @@ async def on_message(message):
                 logger.info(f"Успішно відправлено відповідь у чат {message.channel}")
             except Exception as e:
                 logger.error(f"❌ Помилка Gemini API: {e}")
-                await message.channel.send("Вибачте, виникла тимчасова помилка при обробці вашого запиту.")
+                await message.channel.send("Вибачте, виникла тимчасова помилка при обробці запиту.")
 
     await bot.process_commands(message)
 
 # ==============================================================================
-# 8. ЗАПУСК ВЕБ-СЕРВЕРА ТА БОТА
+# 9. ЗАПУСК ВЕБ-СЕРВЕРА ТА БОТА
 # ==============================================================================
 
 if __name__ == "__main__":
-    # Обов'язковий запуск веб-сервера у фоновому потоці
     t = threading.Thread(target=run_flask)
     t.daemon = True
     t.start()
-    
-    # Запуск бота Discord
+
     bot.run(DISCORD_TOKEN)
 
