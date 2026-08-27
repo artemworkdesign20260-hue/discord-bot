@@ -38,7 +38,6 @@ CRYPTO_WALLET = os.getenv(
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# URL-адреси для перевірки статусу (можна вказати в Render Environment Variables)
 VERCEL_URL = os.getenv("VERCEL_URL", "https://your-site.vercel.app")
 RENDER_URL = os.getenv("RENDER_URL", "https://your-bot.onrender.com")
 
@@ -71,7 +70,7 @@ if not GEMINI_API_KEY:
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ==============================================================================
-# 6. СИСТЕМНА ІНСТРУКЦІЯ ДЛЯ AI
+# 6. ОНОВЛЕНА СИСТЕМНА ІНСТРУКЦІЯ (ПРОДАЖІ + ДЕМО + КЛИК АДМІНА)
 # ==============================================================================
 
 SYSTEM_INSTRUCTION = f"""
@@ -81,18 +80,16 @@ SYSTEM_INSTRUCTION = f"""
 1. НІКОЛИ не пропонуй бюджети нижче $200. Ми робимо тільки складні, надійні рішення.
 2. Перед тим як назвати остаточну ціну, постав 1-2 уточнюючих запитання про проект.
 3. Обіцяй стандартні терміни виконання (2-4 дні на тестування та деплой).
+4. Якщо клієнт сумнівається — покажи приклад демо-версії або портфоліо (наші сайти розгортаються на Vercel, а боти працюють на Render).
 
-ПРАЙС-ЛИСТ (НЕ ЗНИЖУВАТИ):
+ПРАЙС-ЛИСТ:
 - Базове рішення "під ключ" (AI-бот/лендінг + БД + деплой Render/Vercel): $200 - $500.
 - Професійна бізнес-система (багатомодульні боти, інтеграція платіжок, CRM): $500 - $1200.
 - Складні корпоративні веб-платформи та AI-комплекси: $1500 - $3500+.
 
-ТОРГ ТА ЗНИЖКИ:
-- Якщо клієнт каже, що це дорого або у нього бюджет $50-$100 — ввічливо відмовляй, цінуй свій час.
-
-ОПЛАТА:
-- Приймаємо USDT.
-- Гаманець надавай тільки після того, як клієнт погодиться з ТЗ та вартістю.
+ФІНАЛІЗАЦІЯ УГОДИ:
+Коли клієнт узгодив ТЗ, ціну та готовий до оплати/отримання розробленого проєкту — скажи йому:
+"Чудово! Я зафіксував деталі угоди. Зараз підключиться наш головний розробник, щоб підтвердити реквізити та передати готові доступи/посилання!"
 """
 
 # ==============================================================================
@@ -152,7 +149,6 @@ async def on_ready():
 
 @bot.command()
 async def setup(ctx):
-    """Команда для створення панелі з кнопкою угоди"""
     try:
         await ctx.message.delete()
     except Exception:
@@ -166,18 +162,15 @@ async def setup(ctx):
 
 @bot.command()
 async def check(ctx):
-    """Команда для перевірки статусу Render та Vercel"""
     msg = await ctx.send("🔍 Перевірка статусу служб (Render / Vercel)...")
     
     async with aiohttp.ClientSession() as session:
-        # Перевірка Vercel
         try:
             async with session.get(VERCEL_URL, timeout=5) as resp:
                 vercel_status = "🟢 Онлайн" if resp.status == 200 else f"🟡 Статус: {resp.status}"
         except Exception:
             vercel_status = "🔴 Офлайн / Помилка"
 
-        # Перевірка Render
         try:
             async with session.get(RENDER_URL, timeout=5) as resp:
                 render_status = "🟢 Онлайн" if resp.status == 200 else f"🟡 Статус: {resp.status}"
@@ -195,7 +188,6 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # Не відповідаємо АІ на команди, що починаються з "!"
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
@@ -204,7 +196,6 @@ async def on_message(message):
     is_mentioned = bot.user.mentioned_in(message)
     is_ticket_channel = message.channel.name.startswith("угода-")
 
-    # Відповідаємо Gemini AI у ПП, при згадуванні або у чатах угод
     if is_dm or is_mentioned or is_ticket_channel:
         async with message.channel.typing():
             try:
@@ -224,7 +215,7 @@ async def on_message(message):
     await bot.process_commands(message)
 
 # ==============================================================================
-# 9. ЗАПУСК ВЕБ-СЕРВЕРА ТА БОТА
+# 9. ЗАПУСК
 # ==============================================================================
 
 if __name__ == "__main__":
