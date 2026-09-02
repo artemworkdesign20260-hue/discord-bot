@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import uuid
+import traceback
 
 import aiohttp
 from aiohttp import web
@@ -74,9 +75,30 @@ except ValueError:
 # GEMINI
 # ============================================================
 
-gemini_client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+try:
+
+    gemini_client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+
+    print(
+        f"[GEMINI] Client initialized. "
+        f"Model: {GEMINI_MODEL}"
+    )
+
+except Exception as error:
+
+    print("========== GEMINI CLIENT ERROR ==========")
+    print(
+        f"Type: {type(error).__name__}"
+    )
+    print(
+        f"Message: {error!r}"
+    )
+    traceback.print_exc()
+    print("=========================================")
+
+    raise
 
 
 # ============================================================
@@ -220,8 +242,26 @@ async def generate_site_code(
 ) -> str:
 
     print(
+        "========================================"
+    )
+
+    print(
         "[GEMINI] Починаю генерацію сайту..."
     )
+
+    print(
+        f"[GEMINI] Model: {GEMINI_MODEL}"
+    )
+
+    print(
+        f"[GEMINI] ТЗ length: "
+        f"{len(client_task)} characters"
+    )
+
+    print(
+        "========================================"
+    )
+
 
     prompt = f"""
 Ти — професійний веб-розробник системи Grox.
@@ -252,7 +292,12 @@ async def generate_site_code(
 {client_task}
 """
 
+
     try:
+
+        print(
+            "[GEMINI] Відправляю запит до Gemini..."
+        )
 
         response = await asyncio.to_thread(
             gemini_client.models.generate_content,
@@ -263,31 +308,141 @@ async def generate_site_code(
             )
         )
 
-    except Exception as error:
-
         print(
-            "[GEMINI EXCEPTION]",
-            repr(error)
+            "[GEMINI] Запит успішно завершений."
         )
 
+
+    except Exception as error:
+
+        print("")
+        print("========================================")
+        print("🔥🔥🔥 GEMINI EXCEPTION 🔥🔥🔥")
+        print("========================================")
+
+        print(
+            f"ERROR TYPE: {type(error).__name__}"
+        )
+
+        print(
+            f"ERROR MESSAGE: {str(error)}"
+        )
+
+        print(
+            f"ERROR REPR: {repr(error)}"
+        )
+
+        print("")
+        print("FULL TRACEBACK:")
+
+        traceback.print_exc()
+
+        print("")
+        print("========================================")
+        print("END GEMINI EXCEPTION")
+        print("========================================")
+        print("")
+
         raise
+
 
     print(
         "[GEMINI] Відповідь отримана."
     )
 
-    if not response.text:
+
+    # ========================================================
+    # CHECK RESPONSE OBJECT
+    # ========================================================
+
+    if response is None:
+
+        print(
+            "[GEMINI ERROR] "
+            "Response object is None."
+        )
+
+        raise RuntimeError(
+            "Gemini повернув порожній response."
+        )
+
+
+    # ========================================================
+    # RESPONSE TEXT
+    # ========================================================
+
+    try:
+
+        response_text = response.text
+
+    except Exception as error:
+
+        print(
+            "[GEMINI RESPONSE TEXT ERROR]"
+        )
+
+        print(
+            f"Type: {type(error).__name__}"
+        )
+
+        print(
+            f"Message: {error!r}"
+        )
+
+        traceback.print_exc()
+
+        raise
+
+
+    if not response_text:
 
         print(
             "[GEMINI ERROR] "
             "Модель повернула порожню відповідь."
         )
 
+        print(
+            "[GEMINI RESPONSE OBJECT]"
+        )
+
+        print(
+            repr(response)
+        )
+
+        # ----------------------------------------------------
+        # TRY TO SHOW CANDIDATES
+        # ----------------------------------------------------
+
+        try:
+
+            print(
+                "[GEMINI CANDIDATES]"
+            )
+
+            print(
+                repr(response.candidates)
+            )
+
+        except Exception as error:
+
+            print(
+                "[GEMINI] "
+                "Не вдалося прочитати candidates:",
+                repr(error)
+            )
+
         raise RuntimeError(
             "Gemini не повернув код."
         )
 
-    html = response.text.strip()
+
+    html = response_text.strip()
+
+
+    print(
+        f"[GEMINI] Response length: "
+        f"{len(html)} characters."
+    )
 
 
     # ========================================================
@@ -328,8 +483,11 @@ async def generate_site_code(
         )
 
         print(
-            "[GEMINI RESPONSE PREVIEW]",
-            html[:1000]
+            "[GEMINI RESPONSE PREVIEW]"
+        )
+
+        print(
+            html[:2000]
         )
 
         raise RuntimeError(
@@ -344,6 +502,26 @@ async def generate_site_code(
             "У HTML немає body."
         )
 
+        print(
+            "[GEMINI RESPONSE PREVIEW]"
+        )
+
+        print(
+            html[:2000]
+        )
+
+        raise RuntimeError(
+            "Gemini повернув неповний HTML."
+        )
+
+
+    if "<head" not in html.lower():
+
+        print(
+            "[GEMINI ERROR] "
+            "У HTML немає head."
+        )
+
         raise RuntimeError(
             "Gemini повернув неповний HTML."
         )
@@ -352,6 +530,10 @@ async def generate_site_code(
     print(
         f"[GEMINI] HTML готовий. "
         f"Довжина: {len(html)} символів."
+    )
+
+    print(
+        "[GEMINI] Генерація успішна."
     )
 
     return html
@@ -407,6 +589,12 @@ async def deploy_to_vercel(
     )
 
 
+    print(
+        f"[VERCEL] Starting deployment: "
+        f"{project_name}"
+    )
+
+
     try:
 
         async with aiohttp.ClientSession(
@@ -456,6 +644,13 @@ async def deploy_to_vercel(
                                 + deployment_url
                             )
 
+
+                        print(
+                            f"[VERCEL] Deployment successful: "
+                            f"{deployment_url}"
+                        )
+
+
                         return deployment_url
 
 
@@ -479,10 +674,22 @@ async def deploy_to_vercel(
 
     except Exception as error:
 
+        print("")
+        print("========================================")
+        print("🔥 VERCEL EXCEPTION")
+        print("========================================")
+
         print(
-            "[VERCEL EXCEPTION]",
-            repr(error)
+            f"Type: {type(error).__name__}"
         )
+
+        print(
+            f"Message: {error!r}"
+        )
+
+        traceback.print_exc()
+
+        print("========================================")
 
         return None
 
@@ -561,6 +768,8 @@ async def process_order(
                 "[THREAD ERROR]",
                 repr(error)
             )
+
+            traceback.print_exc()
 
 
             await message.channel.send(
@@ -684,20 +893,33 @@ async def process_order(
 
         except Exception as error:
 
+            print("")
+            print("========================================")
+            print("🔥 ORDER → GEMINI ERROR")
+            print("========================================")
+
             print(
-                "[GEMINI ERROR]",
-                repr(error)
+                f"Type: {type(error).__name__}"
             )
+
+            print(
+                f"Message: {error!r}"
+            )
+
+            traceback.print_exc()
+
+            print("========================================")
 
 
             await thread.send(
 
-                "❌ Не вдалося згенерувати сайт.\n\n"
+                "❌ **Не вдалося згенерувати сайт.**\n\n"
 
-                "Технічна причина вже записана "
-                "в Render Logs.\n"
+                "🔎 Я записав повну технічну "
+                "помилку в Render Logs.\n\n"
 
-                "Спробуємо виправити проблему."
+                "🛠️ Потрібно перевірити помилку "
+                "Gemini перед наступною спробою."
             )
 
             return
@@ -719,7 +941,7 @@ async def process_order(
 
         await thread.send(
 
-            "🚀 Код готовий.\n"
+            "🚀 **Код готовий.**\n\n"
 
             "Виконую автоматичний деплой "
             "на Vercel..."
@@ -789,10 +1011,22 @@ async def process_order(
 
     except Exception as error:
 
+        print("")
+        print("========================================")
+        print("🔥 ORDER ERROR")
+        print("========================================")
+
         print(
-            "[ORDER ERROR]",
-            repr(error)
+            f"Type: {type(error).__name__}"
         )
+
+        print(
+            f"Message: {error!r}"
+        )
+
+        traceback.print_exc()
+
+        print("========================================")
 
 
         try:
@@ -1030,4 +1264,4 @@ if __name__ == "__main__":
 
         print(
             "🛑 Grox stopped."
-    )
+        )
