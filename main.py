@@ -1,7 +1,6 @@
 import asyncio
 import os
 import re
-import time
 import uuid
 
 import aiohttp
@@ -64,6 +63,7 @@ if missing_variables:
 
 try:
     CLIENT_CHANNEL_ID = int(CLIENT_CHANNEL_ID)
+
 except ValueError:
     raise RuntimeError(
         "CLIENT_CHANNEL_ID повинен бути числом."
@@ -88,6 +88,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
 intents.guilds = True
+
 
 bot = commands.Bot(
     command_prefix="!",
@@ -148,14 +149,18 @@ MINIMUM_BUDGET = 200
 
 
 def extract_budget(text: str):
+
     match = BUDGET_PATTERN.search(text)
 
     if not match:
         return None
 
     for group in match.groups():
+
         if group:
+
             try:
+
                 cleaned = (
                     group
                     .replace(" ", "")
@@ -166,12 +171,15 @@ def extract_budget(text: str):
                 return int(cleaned)
 
             except ValueError:
+
                 return None
 
     return None
 
 
-def contains_service_keyword(text: str) -> bool:
+def contains_service_keyword(
+    text: str
+) -> bool:
 
     text = text.lower()
 
@@ -181,7 +189,9 @@ def contains_service_keyword(text: str) -> bool:
     )
 
 
-def is_order_message(text: str) -> bool:
+def is_order_message(
+    text: str
+) -> bool:
 
     if not contains_service_keyword(text):
         return False
@@ -209,16 +219,20 @@ async def generate_site_code(
     client_task: str
 ) -> str:
 
+    print(
+        "[GEMINI] Починаю генерацію сайту..."
+    )
+
     prompt = f"""
 Ти — професійний веб-розробник системи Grox.
 
 Твоє завдання — створити повністю готовий до запуску
 односторінковий вебсайт за технічним завданням клієнта.
 
-Вимоги:
+ВАЖЛИВІ ВИМОГИ:
 
-1. Поверни ТІЛЬКИ HTML.
-2. Не використовуй markdown.
+1. Поверни ТІЛЬКИ HTML-код.
+2. Не використовуй Markdown.
 3. Не використовуй ```html.
 4. CSS повинен бути всередині HTML.
 5. JavaScript повинен бути всередині HTML.
@@ -226,33 +240,60 @@ async def generate_site_code(
 7. Дизайн повинен виглядати професійно.
 8. Використовуй сучасний UI/UX.
 9. Якщо клієнт не вказав кольори — вибери професійну кольорову схему.
-10. Не додавай пояснення поза HTML.
+10. Не додавай пояснення перед або після HTML.
 11. Код повинен бути одним повним файлом index.html.
+12. Не залишай незаповнених TODO.
+13. Не використовуй зовнішні файли CSS або JS.
+14. Сайт повинен працювати одразу після відкриття index.html.
+15. Переконайся, що HTML має правильну структуру DOCTYPE, html, head та body.
 
 Технічне завдання клієнта:
 
 {client_task}
 """
 
-    response = await asyncio.to_thread(
-        gemini_client.models.generate_content,
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.7,
-            max_output_tokens=30000,
+    try:
+
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=30000,
+            )
         )
+
+    except Exception as error:
+
+        print(
+            "[GEMINI EXCEPTION]",
+            repr(error)
+        )
+
+        raise
+
+    print(
+        "[GEMINI] Відповідь отримана."
     )
 
     if not response.text:
+
+        print(
+            "[GEMINI ERROR] "
+            "Модель повернула порожню відповідь."
+        )
+
         raise RuntimeError(
             "Gemini не повернув код."
         )
 
     html = response.text.strip()
 
-    # Видаляємо markdown-блоки,
-    # якщо Gemini все-таки їх додав.
+
+    # ========================================================
+    # CLEAN MARKDOWN
+    # ========================================================
+
     html = re.sub(
         r"^```html\s*",
         "",
@@ -272,7 +313,48 @@ async def generate_site_code(
         html
     )
 
-    return html.strip()
+    html = html.strip()
+
+
+    # ========================================================
+    # BASIC HTML CHECK
+    # ========================================================
+
+    if "<html" not in html.lower():
+
+        print(
+            "[GEMINI ERROR] "
+            "Відповідь не схожа на HTML."
+        )
+
+        print(
+            "[GEMINI RESPONSE PREVIEW]",
+            html[:1000]
+        )
+
+        raise RuntimeError(
+            "Gemini повернув некоректний HTML."
+        )
+
+
+    if "<body" not in html.lower():
+
+        print(
+            "[GEMINI ERROR] "
+            "У HTML немає body."
+        )
+
+        raise RuntimeError(
+            "Gemini повернув неповний HTML."
+        )
+
+
+    print(
+        f"[GEMINI] HTML готовий. "
+        f"Довжина: {len(html)} символів."
+    )
+
+    return html
 
 
 # ============================================================
@@ -284,29 +366,46 @@ async def deploy_to_vercel(
     html_content: str
 ):
 
-    url = "https://api.vercel.com/v13/deployments"
+    url = (
+        "https://api.vercel.com/v13/deployments"
+    )
 
     headers = {
-        "Authorization": f"Bearer {VERCEL_TOKEN}",
-        "Content-Type": "application/json",
+        "Authorization":
+            f"Bearer {VERCEL_TOKEN}",
+
+        "Content-Type":
+            "application/json",
     }
 
     payload = {
-        "name": project_name,
+
+        "name":
+            project_name,
+
         "files": [
+
             {
-                "file": "index.html",
-                "data": html_content,
+                "file":
+                    "index.html",
+
+                "data":
+                    html_content,
             }
+
         ],
+
         "projectSettings": {
-            "framework": None
+
+            "framework":
+                None
         }
     }
 
     timeout = aiohttp.ClientTimeout(
         total=120
     )
+
 
     try:
 
@@ -320,26 +419,38 @@ async def deploy_to_vercel(
                 json=payload
             ) as response:
 
-                response_text = await response.text()
+                response_text = (
+                    await response.text()
+                )
+
 
                 try:
+
                     data = await response.json(
                         content_type=None
                     )
+
                 except Exception:
+
                     data = {}
 
-                if response.status in (200, 201):
 
-                    deployment_url = data.get(
-                        "url"
+                if response.status in (
+                    200,
+                    201
+                ):
+
+                    deployment_url = (
+                        data.get("url")
                     )
+
 
                     if deployment_url:
 
                         if not deployment_url.startswith(
                             "http"
                         ):
+
                             deployment_url = (
                                 "https://"
                                 + deployment_url
@@ -347,12 +458,15 @@ async def deploy_to_vercel(
 
                         return deployment_url
 
+
                     print(
-                        "[VERCEL] Відповідь без URL:",
+                        "[VERCEL] "
+                        "Відповідь без URL:",
                         response_text
                     )
 
                     return None
+
 
                 print(
                     f"[VERCEL ERROR] "
@@ -361,6 +475,7 @@ async def deploy_to_vercel(
                 )
 
                 return None
+
 
     except Exception as error:
 
@@ -381,11 +496,14 @@ async def process_order(
 ):
 
     if message.id in active_orders:
+
         return
+
 
     active_orders.add(
         message.id
     )
+
 
     try:
 
@@ -393,33 +511,41 @@ async def process_order(
             message.content
         )
 
+
         print(
             f"[NEW ORDER] "
             f"{message.author} | "
             f"Budget: ${budget}"
         )
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # CREATE THREAD
-        # ----------------------------------------------------
+        # ====================================================
 
         try:
 
             thread = await message.create_thread(
+
                 name=(
                     f"Grox Order ${budget} | "
                     f"{message.author.name}"
                 ),
+
                 auto_archive_duration=1440
             )
+
 
         except discord.Forbidden:
 
             await message.channel.send(
+
                 f"{message.author.mention}, "
                 f"я знайшов ваше замовлення, "
-                f"але мені не вистачає прав для створення thread."
+                f"але мені не вистачає прав "
+                f"для створення thread."
             )
+
 
             print(
                 "[DISCORD ERROR] "
@@ -428,6 +554,7 @@ async def process_order(
 
             return
 
+
         except Exception as error:
 
             print(
@@ -435,7 +562,9 @@ async def process_order(
                 repr(error)
             )
 
+
             await message.channel.send(
+
                 f"{message.author.mention}, "
                 f"я знайшов ваше замовлення, "
                 f"але виникла технічна помилка."
@@ -443,53 +572,80 @@ async def process_order(
 
             return
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # FIRST MESSAGE
-        # ----------------------------------------------------
+        # ====================================================
 
         await thread.send(
+
             f"👋 Вітаю, {message.author.mention}!\n\n"
+
             f"🤖 **Grox прийняв ваше замовлення.**\n"
-            f"💰 Орієнтовний бюджет: **${budget}**\n\n"
+
+            f"💰 Орієнтовний бюджет: "
+            f"**${budget}**\n\n"
+
             f"📋 Надішліть сюди детальне ТЗ:\n"
+
             f"• що саме потрібно створити;\n"
             f"• які функції потрібні;\n"
             f"• який дизайн ви хочете;\n"
             f"• інші важливі вимоги.\n\n"
-            f"Після отримання ТЗ я запущу автоматичну обробку."
+
+            f"Після отримання ТЗ я запущу "
+            f"автоматичну обробку."
         )
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # WAIT FOR CLIENT
-        # ----------------------------------------------------
+        # ====================================================
 
         def check(
             msg: discord.Message
         ):
 
             return (
+
                 msg.author.id
                 == message.author.id
-                and msg.channel.id
+
+                and
+
+                msg.channel.id
                 == thread.id
-                and not msg.author.bot
+
+                and
+
+                not msg.author.bot
             )
+
 
         try:
 
             client_message = await bot.wait_for(
+
                 "message",
+
                 check=check,
+
                 timeout=CLIENT_TIMEOUT
             )
+
 
         except asyncio.TimeoutError:
 
             await thread.send(
+
                 "⏰ Час очікування ТЗ минув.\n"
-                "Якщо ви все ще хочете продовжити замовлення — "
-                "надішліть повідомлення в цьому thread."
+
+                "Якщо ви все ще хочете "
+                "продовжити замовлення — "
+                "надішліть повідомлення "
+                "в цьому thread."
             )
+
 
             print(
                 f"[TIMEOUT] "
@@ -498,22 +654,33 @@ async def process_order(
 
             return
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # START GENERATION
-        # ----------------------------------------------------
+        # ====================================================
 
         await thread.send(
+
             "📋 **ТЗ отримано!**\n\n"
+
             "🤖 Аналізую вимоги...\n"
             "💻 Генерую сайт...\n"
             "🚀 Готую деплой..."
         )
 
+
+        # ====================================================
+        # GENERATE HTML
+        # ====================================================
+
         try:
 
-            html_code = await generate_site_code(
-                client_message.content
+            html_code = (
+                await generate_site_code(
+                    client_message.content
+                )
             )
+
 
         except Exception as error:
 
@@ -522,65 +689,103 @@ async def process_order(
                 repr(error)
             )
 
+
             await thread.send(
-                "❌ Не вдалося згенерувати сайт.\n"
-                "Спробуйте ще раз або зверніться до адміністратора."
+
+                "❌ Не вдалося згенерувати сайт.\n\n"
+
+                "Технічна причина вже записана "
+                "в Render Logs.\n"
+
+                "Спробуємо виправити проблему."
             )
 
             return
 
-        # ----------------------------------------------------
-        # VERCEL DEPLOY
-        # ----------------------------------------------------
+
+        # ====================================================
+        # VERCEL PROJECT
+        # ====================================================
 
         project_name = (
+
             f"grox-job-"
+
             f"{message.author.id}-"
+
             f"{uuid.uuid4().hex[:8]}"
         )
 
+
         await thread.send(
+
             "🚀 Код готовий.\n"
-            "Виконую автоматичний деплой на Vercel..."
+
+            "Виконую автоматичний деплой "
+            "на Vercel..."
         )
 
-        live_url = await deploy_to_vercel(
-            project_name,
-            html_code
+
+        # ====================================================
+        # DEPLOY
+        # ====================================================
+
+        live_url = (
+            await deploy_to_vercel(
+                project_name,
+                html_code
+            )
         )
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # RESULT
-        # ----------------------------------------------------
+        # ====================================================
 
         if live_url:
 
             await thread.send(
+
                 "🎉 **ЗАМОВЛЕННЯ ГОТОВЕ!**\n\n"
+
                 "✅ Сайт успішно згенерований.\n"
                 "✅ Код підготовлений.\n"
                 "✅ Проєкт відправлений на Vercel.\n\n"
-                f"🔗 **Ваш сайт:** {live_url}\n\n"
+
+                f"🔗 **Ваш сайт:** "
+                f"{live_url}\n\n"
+
                 "Дякую за замовлення! 🤖"
             )
 
+
             print(
+
                 f"[SUCCESS] "
                 f"{message.author} -> "
                 f"{live_url}"
             )
 
+
         else:
 
             await thread.send(
-                "⚠️ Код сайту успішно згенерований, "
-                "але Vercel не повернув адресу деплою.\n\n"
-                "Адміністратор повинен перевірити Vercel."
+
+                "⚠️ Код сайту успішно "
+                "згенерований, "
+
+                "але Vercel не повернув "
+                "адресу деплою.\n\n"
+
+                "Адміністратор повинен "
+                "перевірити Vercel."
             )
+
 
             print(
                 "[DEPLOY FAILED]"
             )
+
 
     except Exception as error:
 
@@ -589,16 +794,21 @@ async def process_order(
             repr(error)
         )
 
+
         try:
 
             await message.channel.send(
+
                 f"{message.author.mention}, "
-                f"під час обробки замовлення сталася "
-                f"технічна помилка."
+                f"під час обробки замовлення "
+                f"сталася технічна помилка."
             )
 
+
         except Exception:
+
             pass
+
 
     finally:
 
@@ -631,7 +841,8 @@ async def on_ready():
     )
 
     print(
-        f"📡 Client channel: {CLIENT_CHANNEL_ID}"
+        f"📡 Client channel: "
+        f"{CLIENT_CHANNEL_ID}"
     )
 
     print(
@@ -652,9 +863,14 @@ async def on_message(
     message: discord.Message
 ):
 
-    # Ігноруємо ботів
+    # --------------------------------------------------------
+    # IGNORE BOTS
+    # --------------------------------------------------------
+
     if message.author.bot:
+
         return
+
 
     # --------------------------------------------------------
     # COMMANDS
@@ -664,12 +880,18 @@ async def on_message(
         message
     )
 
+
     # --------------------------------------------------------
     # ONLY CLIENT CHANNEL
     # --------------------------------------------------------
 
-    if message.channel.id != CLIENT_CHANNEL_ID:
+    if (
+        message.channel.id
+        != CLIENT_CHANNEL_ID
+    ):
+
         return
+
 
     # --------------------------------------------------------
     # CHECK ORDER
@@ -678,18 +900,29 @@ async def on_message(
     if not is_order_message(
         message.content
     ):
+
         return
+
 
     # --------------------------------------------------------
     # PREVENT DUPLICATES
     # --------------------------------------------------------
 
     if message.id in active_orders:
+
         return
 
+
     # --------------------------------------------------------
-    # START ORDER AS SEPARATE TASK
+    # START ORDER
     # --------------------------------------------------------
+
+    print(
+        f"[ORDER DETECTED] "
+        f"{message.author}: "
+        f"{message.content}"
+    )
+
 
     asyncio.create_task(
         process_order(message)
@@ -713,29 +946,39 @@ async def start_health_server():
 
     app = web.Application()
 
+
     app.router.add_get(
         "/",
         health_handler
     )
 
+
     runner = web.AppRunner(
         app
     )
 
+
     await runner.setup()
 
+
     site = web.TCPSite(
+
         runner,
+
         "0.0.0.0",
+
         PORT
     )
 
+
     await site.start()
+
 
     print(
         f"[HEALTH] "
         f"Server listening on port {PORT}"
     )
+
 
     return runner
 
@@ -750,13 +993,18 @@ async def main():
         "🚀 Starting Grox..."
     )
 
-    health_runner = await start_health_server()
+
+    health_runner = (
+        await start_health_server()
+    )
+
 
     try:
 
         await bot.start(
             DISCORD_TOKEN
         )
+
 
     finally:
 
@@ -776,6 +1024,7 @@ if __name__ == "__main__":
         asyncio.run(
             main()
         )
+
 
     except KeyboardInterrupt:
 
