@@ -57,7 +57,9 @@ MAXIMUM_BUDGET = int(
     os.getenv("MAXIMUM_BUDGET", "10000")
 )
 
-MINIMUM_BUDGET = 200
+# Мінімальна можлива ціна автоматичної оцінки.
+# Це НЕ мінімальний бюджет замовлення.
+MINIMUM_PROJECT_PRICE = 50
 
 MAX_TASK_LENGTH = int(
     os.getenv("MAX_TASK_LENGTH", "12000")
@@ -190,15 +192,26 @@ class Order:
 
     client_name: str
 
-    budget: int
+    # Спочатку бюджет невідомий.
+    budget: int = 0
 
-    deposit: int
+    deposit: int = 0
 
-    remaining: int
+    remaining: int = 0
 
     thread_id: int = 0
 
     task: str = ""
+
+    project_type: str = ""
+
+    complexity: str = ""
+
+    price_reason: str = ""
+
+    client_budget: int | None = None
+
+    client_approved_price: bool = False
 
     payment1_confirmed: bool = False
 
@@ -206,7 +219,7 @@ class Order:
 
     site_url: str | None = None
 
-    status: str = "WAITING_DEPOSIT"
+    status: str = "WAITING_TZ"
 
 
 orders = {}
@@ -221,17 +234,12 @@ next_order_id = 1000
 # ============================================================
 
 def create_order(
-    message: discord.Message,
-    budget: int
+    message: discord.Message
 ):
 
     global next_order_id
 
     next_order_id += 1
-
-    deposit = (budget + 1) // 2
-
-    remaining = budget - deposit
 
     order = Order(
 
@@ -242,15 +250,11 @@ def create_order(
         client_id=message.author.id,
 
         client_name=message.author.name,
-
-        budget=budget,
-
-        deposit=deposit,
-
-        remaining=remaining
     )
 
-    orders[order.order_id] = order
+    orders[
+        order.order_id
+    ] = order
 
     return order
 
@@ -258,6 +262,50 @@ def create_order(
 # ============================================================
 # ORDER STATUS MESSAGES
 # ============================================================
+
+def price_status_message(
+    order: Order
+):
+
+    client_budget_text = ""
+
+    if order.client_budget is not None:
+
+        client_budget_text = (
+
+            f"📌 Ваш орієнтовний бюджет: "
+            f"**${order.client_budget}**\n\n"
+
+        )
+
+
+    return (
+
+        f"🟡 **Замовлення #{order.order_id}**\n\n"
+
+        f"🛠️ Тип проєкту: "
+        f"**{order.project_type}**\n"
+
+        f"📊 Складність: "
+        f"**{order.complexity}**\n\n"
+
+        f"{client_budget_text}"
+
+        f"💰 **Запропонована вартість: "
+        f"${order.budget}**\n\n"
+
+        f"💵 Передоплата: "
+        f"**${order.deposit}**\n"
+
+        f"💵 Після завершення: "
+        f"**${order.remaining}**\n\n"
+
+        f"📝 **Чому така ціна:**\n"
+        f"{order.price_reason}\n\n"
+
+        f"⏳ Очікую погодження ціни."
+    )
+
 
 def deposit_status_message(
     order: Order
@@ -267,9 +315,11 @@ def deposit_status_message(
 
         f"🟡 **Замовлення #{order.order_id}**\n\n"
 
-        f"💰 Загальна сума: **${order.budget}**\n"
+        f"💰 Загальна сума: "
+        f"**${order.budget}**\n"
 
-        f"💵 Передоплата: **${order.deposit}**\n\n"
+        f"💵 Передоплата: "
+        f"**${order.deposit}**\n\n"
 
         f"⏳ **Статус: Очікується передоплата**\n\n"
 
@@ -285,9 +335,11 @@ def deposit_confirmed_message(
 
         f"🟢 **Замовлення #{order.order_id}**\n\n"
 
-        f"💰 Загальна сума: **${order.budget}**\n"
+        f"💰 Загальна сума: "
+        f"**${order.budget}**\n"
 
-        f"✅ Передоплата **${order.deposit}** підтверджена.\n\n"
+        f"✅ Передоплата "
+        f"**${order.deposit}** підтверджена.\n\n"
 
         f"🛠️ **Можна починати роботу!**"
     )
@@ -303,7 +355,8 @@ def final_payment_message(
 
         f"🎉 **Проєкт готовий!**\n\n"
 
-        f"💰 Залишок: **${order.remaining}**\n\n"
+        f"💰 Залишок: "
+        f"**${order.remaining}**\n\n"
 
         f"🔒 **Фінальна передача заблокована.**\n\n"
 
@@ -319,7 +372,8 @@ def completed_message(
 
         f"🟢 **Замовлення #{order.order_id} завершене!**\n\n"
 
-        f"💰 Загальна сума: **${order.budget}**\n"
+        f"💰 Загальна сума: "
+        f"**${order.budget}**\n"
 
         f"✅ Передоплата підтверджена\n"
 
@@ -362,8 +416,40 @@ KEYWORDS = [
 
     "discord bot",
     "discord бот",
+
 ]
 
+
+def contains_service_keyword(
+    text: str
+) -> bool:
+
+    text = text.lower()
+
+    return any(
+
+        keyword in text
+
+        for keyword in KEYWORDS
+    )
+
+
+def is_order_message(
+    text: str
+) -> bool:
+
+    # Тепер бюджет НЕ потрібен.
+    # Достатньо, щоб у повідомленні
+    # була ознака IT-проєкту.
+
+    return contains_service_keyword(
+        text
+    )
+
+
+# ============================================================
+# OPTIONAL CLIENT BUDGET
+# ============================================================
 
 BUDGET_PATTERN = re.compile(
 
@@ -373,7 +459,8 @@ BUDGET_PATTERN = re.compile(
         |
         (\d[\d\s,\.]*)\s*\$
         |
-        (\d[\d\s,\.]*)\s*(?:usd|dollars?|долар(?:ів|и)?)
+        (\d[\d\s,\.]*)\s*
+        (?:usd|dollars?|долар(?:ів|и)?)
     )
     """,
 
@@ -401,6 +488,7 @@ def extract_budget(
             try:
 
                 cleaned = (
+
                     group
                     .replace(" ", "")
                     .replace(",", "")
@@ -417,46 +505,6 @@ def extract_budget(
 
 
     return None
-
-
-def contains_service_keyword(
-    text: str
-) -> bool:
-
-    text = text.lower()
-
-    return any(
-        keyword in text
-        for keyword in KEYWORDS
-    )
-
-
-def is_order_message(
-    text: str
-) -> bool:
-
-    if not contains_service_keyword(
-        text
-    ):
-
-        return False
-
-
-    budget = extract_budget(
-        text
-    )
-
-
-    if budget is None:
-
-        return False
-
-
-    return (
-        MINIMUM_BUDGET
-        <= budget
-        <= MAXIMUM_BUDGET
-    )
 
 
 # ============================================================
@@ -489,14 +537,16 @@ async def wait_for_test_payment(
     amount = (
 
         order.deposit
+
         if payment_number == 1
+
         else order.remaining
     )
 
 
     await thread.send(
 
-        f"💳 **Тестова оплата**\n\n"
+        f"💳 **Тестова оплата №{payment_number}**\n\n"
 
         f"Сума: **${amount}**\n\n"
 
@@ -540,6 +590,7 @@ async def confirm_payment(
     if ctx.author.id != ADMIN_USER_ID:
 
         await ctx.send(
+
             "❌ У вас немає прав "
             "для підтвердження платежу."
         )
@@ -550,6 +601,7 @@ async def confirm_payment(
     if not TEST_PAYMENT_MODE:
 
         await ctx.send(
+
             "❌ Тестове підтвердження "
             "вимкнене."
         )
@@ -563,6 +615,7 @@ async def confirm_payment(
     ):
 
         await ctx.send(
+
             "❌ Номер платежу має бути "
             "1 або 2."
         )
@@ -590,10 +643,23 @@ async def confirm_payment(
 
     if payment_number == 1:
 
+        if not order.client_approved_price:
+
+            await ctx.send(
+
+                "❌ Клієнт ще не погодив "
+                "ціну цього замовлення."
+            )
+
+            return
+
+
         if order.payment1_confirmed:
 
             await ctx.send(
-                "ℹ️ Перша оплата вже підтверджена."
+
+                "ℹ️ Перша оплата "
+                "вже підтверджена."
             )
 
             return
@@ -646,11 +712,13 @@ async def confirm_payment(
             return
 
 
-        if not order.site_url:
+        if order.status != "WAITING_FINAL_PAYMENT":
 
             await ctx.send(
 
-                "❌ Проєкт ще не готовий."
+                "❌ Проєкт ще не перейшов "
+                "у стан очікування "
+                "фінальної оплати."
             )
 
             return
@@ -686,11 +754,13 @@ async def confirm_payment(
             )
 
 
-            await thread.send(
+            if order.site_url:
 
-                f"🔗 **Фінальний сайт:**\n"
-                f"{order.site_url}"
-            )
+                await thread.send(
+
+                    f"🔗 **Фінальний сайт:**\n"
+                    f"{order.site_url}"
+                )
 
 
         await ctx.send(
@@ -700,6 +770,352 @@ async def confirm_payment(
             f"для #{order.order_id} "
             f"підтверджено."
         )
+
+
+# ============================================================
+# GEMINI REQUEST
+# ============================================================
+
+async def gemini_request(
+    prompt: str,
+    max_output_tokens: int
+):
+
+    last_error = None
+
+
+    for attempt in range(
+
+        1,
+
+        GEMINI_RETRIES + 1
+
+    ):
+
+        try:
+
+            print(
+
+                f"[GEMINI] Attempt "
+                f"{attempt}/{GEMINI_RETRIES}"
+            )
+
+
+            response = await asyncio.to_thread(
+
+                gemini_client.models.generate_content,
+
+                model=GEMINI_MODEL,
+
+                contents=prompt,
+
+                config=types.GenerateContentConfig(
+
+                    max_output_tokens=
+                    max_output_tokens
+                )
+            )
+
+
+            if response is None:
+
+                raise RuntimeError(
+                    "Gemini повернув None."
+                )
+
+
+            response_text = response.text
+
+
+            if not response_text:
+
+                raise RuntimeError(
+
+                    "Gemini повернув "
+                    "порожню відповідь."
+                )
+
+
+            return response_text.strip()
+
+
+        except Exception as error:
+
+            last_error = error
+
+
+            print(
+
+                f"[GEMINI ERROR] "
+                f"Attempt {attempt}: "
+                f"{type(error).__name__}: "
+                f"{error!r}"
+            )
+
+
+            error_text = str(
+                error
+            ).lower()
+
+
+            temporary = any(
+
+                code in error_text
+
+                for code in (
+
+                    "503",
+                    "unavailable",
+                    "temporarily",
+                    "deadline",
+                    "timeout",
+                    "429",
+                    "rate limit"
+
+                )
+            )
+
+
+            if not temporary:
+
+                traceback.print_exc()
+
+                break
+
+
+            if attempt >= GEMINI_RETRIES:
+
+                break
+
+
+            delay = (
+
+                2 ** attempt
+            ) + random.uniform(
+
+                0,
+
+                1
+
+            )
+
+
+            print(
+
+                f"[GEMINI] Повтор через "
+                f"{delay:.1f}s..."
+            )
+
+
+            await asyncio.sleep(
+                delay
+            )
+
+
+    if last_error:
+
+        raise last_error
+
+
+    raise RuntimeError(
+        "Gemini не зміг виконати запит."
+    )
+
+
+# ============================================================
+# PROJECT PRICE ESTIMATION
+# ============================================================
+
+async def estimate_project(
+    client_task: str
+):
+
+    prompt = f"""
+Ти — професійний менеджер IT-проєктів
+системи Grox.
+
+Проаналізуй технічне завдання клієнта
+та визнач справедливу вартість роботи.
+
+Ціна повинна залежати від реальної
+складності проєкту.
+
+ОЦІНЮЙ:
+
+- кількість функцій;
+- складність функцій;
+- дизайн;
+- frontend;
+- backend;
+- базу даних;
+- авторизацію;
+- API;
+- інтеграції;
+- платежі;
+- адміністративну панель;
+- автоматизацію;
+- Discord-функції;
+- приблизний обсяг програмування;
+- необхідність тестування.
+
+РІВНІ:
+
+VERY_SIMPLE = $50–$150
+
+SIMPLE = $150–$300
+
+MEDIUM = $300–$700
+
+HARD = $700–$1500
+
+VERY_HARD = $1500–$3000+
+
+ВАЖЛИВІ ПРАВИЛА:
+
+1. Не роби автоматично ціну $500.
+2. Не використовуй бюджет клієнта як автоматичну ціну.
+3. Якщо клієнт не вказав бюджет — це нормально.
+4. Якщо клієнт вказав бюджет — порівняй його
+   з реальною оцінкою, але не копіюй його автоматично.
+5. Не вигадуй функції, яких немає в ТЗ.
+6. Ціна повинна відповідати складності.
+7. Мінімальна ціна: ${MINIMUM_PROJECT_PRICE}.
+8. Максимальна ціна: ${MAXIMUM_BUDGET}.
+
+ПОВЕРНИ РІВНО ТАКИЙ ФОРМАТ:
+
+TYPE: ...
+COMPLEXITY: ...
+PRICE: ...
+REASON: ...
+
+ТЕХНІЧНЕ ЗАВДАННЯ:
+
+{client_task}
+"""
+
+
+    result = await gemini_request(
+
+        prompt,
+
+        max_output_tokens=3000
+    )
+
+
+    price_match = re.search(
+
+        r"PRICE\s*:\s*\$?\s*(\d+)",
+
+        result,
+
+        re.IGNORECASE
+    )
+
+
+    if not price_match:
+
+        raise RuntimeError(
+
+            "Gemini не повернув "
+            "коректну ціну."
+        )
+
+
+    price = int(
+        price_match.group(1)
+    )
+
+
+    price = max(
+
+        MINIMUM_PROJECT_PRICE,
+
+        price
+    )
+
+
+    price = min(
+
+        MAXIMUM_BUDGET,
+
+        price
+    )
+
+
+    type_match = re.search(
+
+        r"TYPE\s*:\s*(.+)",
+
+        result,
+
+        re.IGNORECASE
+    )
+
+
+    complexity_match = re.search(
+
+        r"COMPLEXITY\s*:\s*(.+)",
+
+        result,
+
+        re.IGNORECASE
+    )
+
+
+    reason_match = re.search(
+
+        r"REASON\s*:\s*(.+)",
+
+        result,
+
+        re.IGNORECASE
+    )
+
+
+    project_type = (
+
+        type_match.group(1).strip()
+
+        if type_match
+
+        else "IT Project"
+    )
+
+
+    complexity = (
+
+        complexity_match.group(1).strip()
+
+        if complexity_match
+
+        else "UNKNOWN"
+    )
+
+
+    reason = (
+
+        reason_match.group(1).strip()
+
+        if reason_match
+
+        else "Ціна визначена на основі складності ТЗ."
+    )
+
+
+    return {
+
+        "price": price,
+
+        "type": project_type,
+
+        "complexity": complexity,
+
+        "reason": reason,
+
+        "analysis": result,
+
+    }
 
 
 # ============================================================
@@ -720,7 +1136,9 @@ async def generate_site_code(
     if len(client_task) > MAX_TASK_LENGTH:
 
         raise ValueError(
-            "Технічне завдання занадто велике."
+
+            "Технічне завдання "
+            "занадто велике."
         )
 
 
@@ -764,194 +1182,11 @@ async def generate_site_code(
 """
 
 
-    last_error = None
+    return await gemini_request(
 
+        prompt,
 
-    for attempt in range(
-        1,
-        GEMINI_RETRIES + 1
-    ):
-
-        try:
-
-            print(
-                f"[GEMINI] Attempt "
-                f"{attempt}/{GEMINI_RETRIES}"
-            )
-
-
-            response = await asyncio.to_thread(
-
-                gemini_client.models.generate_content,
-
-                model=GEMINI_MODEL,
-
-                contents=prompt,
-
-                config=types.GenerateContentConfig(
-                    max_output_tokens=30000
-                )
-            )
-
-
-            if response is None:
-
-                raise RuntimeError(
-                    "Gemini повернув None."
-                )
-
-
-            response_text = response.text
-
-
-            if not response_text:
-
-                raise RuntimeError(
-                    "Gemini повернув порожню відповідь."
-                )
-
-
-            html = response_text.strip()
-
-
-            html = re.sub(
-                r"^```html\s*",
-                "",
-                html,
-                flags=re.IGNORECASE
-            )
-
-
-            html = re.sub(
-                r"^```\s*",
-                "",
-                html
-            )
-
-
-            html = re.sub(
-                r"\s*```$",
-                "",
-                html
-            )
-
-
-            html = html.strip()
-
-
-            html_lower = html.lower()
-
-
-            if "<html" not in html_lower:
-
-                raise RuntimeError(
-                    "Gemini повернув некоректний HTML."
-                )
-
-
-            if "<head" not in html_lower:
-
-                raise RuntimeError(
-                    "У HTML немає head."
-                )
-
-
-            if "<body" not in html_lower:
-
-                raise RuntimeError(
-                    "У HTML немає body."
-                )
-
-
-            if len(html) < 300:
-
-                raise RuntimeError(
-                    "HTML занадто короткий."
-                )
-
-
-            print(
-                f"[GEMINI] HTML готовий. "
-                f"Довжина: {len(html)}"
-            )
-
-
-            return html
-
-
-        except Exception as error:
-
-            last_error = error
-
-
-            print(
-                f"[GEMINI ERROR] "
-                f"Attempt {attempt}: "
-                f"{type(error).__name__}: "
-                f"{error!r}"
-            )
-
-
-            error_text = str(
-                error
-            ).lower()
-
-
-            temporary = any(
-
-                code in error_text
-
-                for code in (
-                    "503",
-                    "unavailable",
-                    "temporarily",
-                    "deadline",
-                    "timeout",
-                    "429",
-                    "rate limit"
-                )
-            )
-
-
-            if not temporary:
-
-                traceback.print_exc()
-
-                break
-
-
-            if attempt >= GEMINI_RETRIES:
-
-                break
-
-
-            delay = (
-
-                2 ** attempt
-            ) + random.uniform(
-                0,
-                1
-            )
-
-
-            print(
-                f"[GEMINI] Повтор через "
-                f"{delay:.1f}s..."
-            )
-
-
-            await asyncio.sleep(
-                delay
-            )
-
-
-    if last_error:
-
-        raise last_error
-
-
-    raise RuntimeError(
-        "Gemini не зміг згенерувати сайт."
+        max_output_tokens=30000
     )
 
 
@@ -987,11 +1222,13 @@ async def deploy_to_vercel(
         "files": [
 
             {
+
                 "file":
                     "index.html",
 
                 "data":
                     html_content,
+
             }
 
         ],
@@ -1000,7 +1237,9 @@ async def deploy_to_vercel(
 
             "framework":
                 None
+
         }
+
     }
 
 
@@ -1010,6 +1249,7 @@ async def deploy_to_vercel(
 
 
     print(
+
         f"[VERCEL] Starting deployment: "
         f"{project_name}"
     )
@@ -1018,7 +1258,9 @@ async def deploy_to_vercel(
     try:
 
         async with aiohttp.ClientSession(
+
             timeout=timeout
+
         ) as session:
 
             async with session.post(
@@ -1032,6 +1274,7 @@ async def deploy_to_vercel(
             ) as response:
 
                 response_text = (
+
                     await response.text()
                 )
 
@@ -1039,7 +1282,9 @@ async def deploy_to_vercel(
                 try:
 
                     data = await response.json(
+
                         content_type=None
+
                     )
 
                 except Exception:
@@ -1048,11 +1293,15 @@ async def deploy_to_vercel(
 
 
                 if response.status in (
+
                     200,
+
                     201
+
                 ):
 
                     deployment_url = data.get(
+
                         "url"
                     )
 
@@ -1060,17 +1309,23 @@ async def deploy_to_vercel(
                     if deployment_url:
 
                         if not deployment_url.startswith(
+
                             "http"
+
                         ):
 
                             deployment_url = (
+
                                 "https://"
+
                                 + deployment_url
                             )
 
 
                         print(
-                            f"[VERCEL] Deployment successful: "
+
+                            f"[VERCEL] "
+                            f"Deployment successful: "
                             f"{deployment_url}"
                         )
 
@@ -1079,6 +1334,7 @@ async def deploy_to_vercel(
 
 
                 print(
+
                     f"[VERCEL ERROR] "
                     f"HTTP {response.status}: "
                     f"{response_text}"
@@ -1091,6 +1347,7 @@ async def deploy_to_vercel(
     except Exception as error:
 
         print(
+
             f"[VERCEL EXCEPTION] "
             f"{type(error).__name__}: "
             f"{error!r}"
@@ -1099,6 +1356,111 @@ async def deploy_to_vercel(
         traceback.print_exc()
 
         return None
+
+
+# ============================================================
+# WAIT FOR PRICE APPROVAL
+# ============================================================
+
+async def wait_for_price_approval(
+    thread: discord.Thread,
+    order: Order
+):
+
+    await thread.send(
+
+        "💬 Якщо вас влаштовує запропонована "
+        "вартість, напишіть:\n\n"
+
+        "**ПОГОДЖУЮСЬ**\n\n"
+
+        "Якщо хочете змінити вимоги — "
+        "напишіть нове ТЗ."
+    )
+
+
+    def check(
+        msg: discord.Message
+    ):
+
+        return (
+
+            msg.author.id
+            == order.client_id
+
+            and
+
+            msg.channel.id
+            == order.thread_id
+
+            and
+
+            not msg.author.bot
+        )
+
+
+    try:
+
+        approval_message = await bot.wait_for(
+
+            "message",
+
+            check=check,
+
+            timeout=CLIENT_TIMEOUT
+        )
+
+
+    except asyncio.TimeoutError:
+
+        await thread.send(
+
+            "⏰ Час очікування "
+            "погодження ціни минув."
+        )
+
+        return False
+
+
+    text = (
+
+        approval_message.content
+        .strip()
+        .lower()
+    )
+
+
+    approval_words = [
+
+        "погоджуюсь",
+        "погоджуюся",
+        "згоден",
+        "згодна",
+        "agree",
+        "approved",
+        "yes",
+
+    ]
+
+
+    if text in approval_words:
+
+        order.client_approved_price = True
+
+        return True
+
+
+    await thread.send(
+
+        "ℹ️ Ціну не було підтверджено.\n\n"
+
+        "Щоб погодити ціну, напишіть:\n"
+
+        "**ПОГОДЖУЮСЬ**"
+    )
+
+
+    return False
 
 
 # ============================================================
@@ -1121,47 +1483,28 @@ async def process_order(
 
     try:
 
-        budget = extract_budget(
-            message.content
-        )
-
-
-        if budget is None:
-
-            return
-
-
-        if budget < MINIMUM_BUDGET:
-
-            return
-
-
-        if budget > MAXIMUM_BUDGET:
-
-            await message.channel.send(
-
-                f"{message.author.mention}, "
-                f"максимальний бюджет через Grox "
-                f"зараз ${MAXIMUM_BUDGET}."
-            )
-
-            return
-
+        # ----------------------------------------------------
+        # CREATE ORDER WITHOUT BUDGET
+        # ----------------------------------------------------
 
         order = create_order(
-            message,
-            budget
+            message
         )
 
+
+        # ----------------------------------------------------
+        # CREATE THREAD
+        # ----------------------------------------------------
 
         try:
 
             thread = await message.create_thread(
 
                 name=(
+
                     f"Grox Order #"
-                    f"{order.order_id} | "
-                    f"${budget}"
+                    f"{order.order_id}"
+
                 ),
 
                 auto_archive_duration=1440
@@ -1184,6 +1527,7 @@ async def process_order(
         except Exception as error:
 
             print(
+
                 f"[THREAD ERROR] "
                 f"{type(error).__name__}: "
                 f"{error!r}"
@@ -1204,6 +1548,10 @@ async def process_order(
         order.thread_id = thread.id
 
 
+        # ----------------------------------------------------
+        # GREETING
+        # ----------------------------------------------------
+
         await thread.send(
 
             f"👋 Вітаю, "
@@ -1212,21 +1560,22 @@ async def process_order(
             f"🤖 **Grox прийняв ваше замовлення.**\n\n"
 
             f"🆔 Замовлення: "
-            f"**#{order.order_id}**\n"
+            f"**#{order.order_id}**\n\n"
 
-            f"💰 Загальна сума: "
-            f"**${order.budget}**\n"
+            f"💡 Вам не потрібно "
+            f"заздалегідь визначати ціну.\n\n"
 
-            f"💵 Передоплата: "
-            f"**${order.deposit}**\n\n"
+            f"📋 Надішліть детальне ТЗ.\n\n"
 
-            f"📋 Спочатку надішліть "
-            f"детальне ТЗ.\n\n"
-
-            f"Після погодження та підтвердження "
-            f"передоплати Grox почне роботу."
+            f"🧠 Grox проаналізує "
+            f"складність проєкту "
+            f"та запропонує справедливу ціну."
         )
 
+
+        # ----------------------------------------------------
+        # WAIT FOR TЗ
+        # ----------------------------------------------------
 
         def check(
             msg: discord.Message
@@ -1235,7 +1584,7 @@ async def process_order(
             return (
 
                 msg.author.id
-                == message.author.id
+                == order.client_id
 
                 and
 
@@ -1268,7 +1617,7 @@ async def process_order(
 
                 "Якщо ви все ще хочете "
                 "продовжити замовлення — "
-                "напишіть нове повідомлення."
+                "створіть нове замовлення."
             )
 
             return
@@ -1277,9 +1626,14 @@ async def process_order(
         task = client_message.content.strip()
 
 
+        # ----------------------------------------------------
+        # TASK VALIDATION
+        # ----------------------------------------------------
+
         if not task:
 
             await thread.send(
+
                 "❌ ТЗ не може бути порожнім."
             )
 
@@ -1302,10 +1656,156 @@ async def process_order(
         order.task = task
 
 
+        # ----------------------------------------------------
+        # OPTIONAL CLIENT BUDGET
+        # ----------------------------------------------------
+
+        order.client_budget = extract_budget(
+            task
+        )
+
+
+        # ----------------------------------------------------
+        # ANALYZE PROJECT
+        # ----------------------------------------------------
+
         await thread.send(
-            deposit_status_message(
+
+            "🧠 **Аналізую технічне завдання...**\n\n"
+
+            "📊 Визначаю складність, "
+            "обсяг роботи та справедливу ціну."
+        )
+
+
+        try:
+
+            estimation = await estimate_project(
+                order.task
+            )
+
+
+        except Exception as error:
+
+            print(
+                "========================================"
+            )
+
+            print(
+                "[ORDER → PRICE ESTIMATION ERROR]"
+            )
+
+            print(
+                f"Type: {type(error).__name__}"
+            )
+
+            print(
+                f"Message: {error!r}"
+            )
+
+            traceback.print_exc()
+
+            print(
+                "========================================"
+            )
+
+
+            await thread.send(
+
+                "❌ **Не вдалося оцінити "
+                "вартість проєкту.**\n\n"
+
+                "Спробуйте надіслати "
+                "детальніше ТЗ."
+            )
+
+            return
+
+
+        # ----------------------------------------------------
+        # SAVE ESTIMATION
+        # ----------------------------------------------------
+
+        order.project_type = (
+            estimation["type"]
+        )
+
+        order.complexity = (
+            estimation["complexity"]
+        )
+
+        order.price_reason = (
+            estimation["reason"]
+        )
+
+        order.budget = (
+            estimation["price"]
+        )
+
+        order.deposit = (
+            order.budget + 1
+        ) // 2
+
+        order.remaining = (
+            order.budget
+            - order.deposit
+        )
+
+        order.status = (
+            "WAITING_PRICE_APPROVAL"
+        )
+
+
+        # ----------------------------------------------------
+        # SHOW PRICE
+        # ----------------------------------------------------
+
+        await thread.send(
+
+            price_status_message(
                 order
             )
+        )
+
+
+        # ----------------------------------------------------
+        # WAIT FOR CLIENT APPROVAL
+        # ----------------------------------------------------
+
+        approved = await wait_for_price_approval(
+
+            thread,
+
+            order
+        )
+
+
+        if not approved:
+
+            return
+
+
+        # ----------------------------------------------------
+        # PRICE APPROVED
+        # ----------------------------------------------------
+
+        order.status = (
+            "WAITING_DEPOSIT"
+        )
+
+
+        await thread.send(
+
+            f"✅ **Ціну погоджено!**\n\n"
+
+            f"💰 Загальна сума: "
+            f"**${order.budget}**\n"
+
+            f"💵 Передоплата: "
+            f"**${order.deposit}**\n"
+
+            f"💵 Після завершення: "
+            f"**${order.remaining}**"
         )
 
 
@@ -1337,118 +1837,226 @@ async def process_order(
             )
 
 
+        # ----------------------------------------------------
+        # START WORK
+        # ----------------------------------------------------
+
         await thread.send(
 
-            "📋 **ТЗ отримано!**\n\n"
+            "🟢 **Передоплату підтверджено!**\n\n"
 
-            "💳 Передоплату підтверджено.\n"
-
-            "🤖 Аналізую вимоги...\n"
-
-            "💻 Генерую сайт..."
+            "🤖 Grox починає виконання "
+            "проєкту..."
         )
 
 
         # ----------------------------------------------------
-        # GEMINI
+        # PROJECT TYPE DETECTION
         # ----------------------------------------------------
 
-        try:
+        task_lower = task.lower()
 
-            html_code = await generate_site_code(
-                order.task
+
+        website_project = any(
+
+            keyword in task_lower
+
+            for keyword in (
+
+                "сайт",
+                "website",
+                "web",
+                "лендинг",
+                "landing",
+                "вебсайт",
+
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # WEBSITE GENERATION
+        # ----------------------------------------------------
+
+        if website_project:
+
+            await thread.send(
+
+                "💻 **Генерую сайт...**"
             )
 
 
-        except Exception as error:
+            try:
 
-            print(
-                "========================================"
-            )
+                html_code = await generate_site_code(
 
-            print(
-                "[ORDER → GEMINI ERROR]"
-            )
+                    order.task
+                )
 
-            print(
-                f"Type: {type(error).__name__}"
-            )
 
-            print(
-                f"Message: {error!r}"
-            )
+            except Exception as error:
 
-            traceback.print_exc()
+                print(
+                    "========================================"
+                )
 
-            print(
-                "========================================"
+                print(
+                    "[WEBSITE GENERATION ERROR]"
+                )
+
+                print(
+                    f"Type: {type(error).__name__}"
+                )
+
+                print(
+                    f"Message: {error!r}"
+                )
+
+                traceback.print_exc()
+
+                print(
+                    "========================================"
+                )
+
+
+                await thread.send(
+
+                    "❌ **Не вдалося "
+                    "згенерувати сайт.**\n\n"
+
+                    "Технічна помилка записана "
+                    "в Render Logs."
+                )
+
+                return
+
+
+            # ------------------------------------------------
+            # VERCEL
+            # ------------------------------------------------
+
+            project_name = (
+
+                f"grox-job-"
+                f"{uuid.uuid4().hex[:12]}"
+
             )
 
 
             await thread.send(
 
-                "❌ **Не вдалося згенерувати сайт.**\n\n"
+                "🚀 **Код готовий.**\n\n"
 
-                "Технічна помилка записана "
-                "в Render Logs."
+                "☁️ Виконую автоматичний "
+                "деплой на Vercel..."
             )
 
-            return
+
+            live_url = await deploy_to_vercel(
+
+                project_name,
+
+                html_code
+            )
+
+
+            if not live_url:
+
+                await thread.send(
+
+                    "⚠️ Код сайту згенерований, "
+                    "але Vercel не повернув "
+                    "адресу деплою.\n\n"
+
+                    "Фінальна передача "
+                    "залишається заблокованою."
+                )
+
+                return
+
+
+            order.site_url = live_url
 
 
         # ----------------------------------------------------
-        # VERCEL
+        # DISCORD BOT
         # ----------------------------------------------------
 
-        project_name = (
+        elif any(
 
-            f"grox-job-"
-            f"{uuid.uuid4().hex[:12]}"
-        )
+            keyword in task_lower
 
+            for keyword in (
 
-        await thread.send(
+                "discord bot",
+                "discord бот",
+                "бот",
+                "bot",
 
-            "🚀 **Код готовий.**\n\n"
+            )
 
-            "Виконую автоматичний деплой "
-            "на Vercel..."
-        )
-
-
-        live_url = await deploy_to_vercel(
-
-            project_name,
-
-            html_code
-        )
-
-
-        if not live_url:
+        ):
 
             await thread.send(
 
-                "⚠️ Код сайту згенерований, "
-                "але Vercel не повернув "
-                "адресу деплою.\n\n"
+                "🤖 **Проєкт Discord-бота "
+                "підготовлений до розробки.**\n\n"
 
-                "Фінальна передача "
-                "залишається заблокованою."
+                "Для складних ботів потрібне "
+                "окреме тестування та налаштування "
+                "середовища."
             )
 
-            return
+
+            # У старій версії Grox не мав
+            # безпечного автоматичного деплою
+            # Discord-ботів.
+            #
+            # Тому НЕ будемо брехати клієнту,
+            # що бот вже запущений.
 
 
-        order.site_url = live_url
+        # ----------------------------------------------------
+        # OTHER PROJECT
+        # ----------------------------------------------------
 
-        order.status = "WAITING_FINAL_PAYMENT"
+        else:
+
+            await thread.send(
+
+                "🛠️ **Виконую проєкт "
+                "відповідно до ТЗ...**"
+            )
+
+
+        # ----------------------------------------------------
+        # PROJECT READY
+        # ----------------------------------------------------
+
+        order.status = (
+            "WAITING_FINAL_PAYMENT"
+        )
 
 
         await thread.send(
+
             final_payment_message(
                 order
             )
         )
+
+
+        # ----------------------------------------------------
+        # SITE PREVIEW
+        # ----------------------------------------------------
+
+        if order.site_url:
+
+            await thread.send(
+
+                f"🌐 **Попередній результат:**\n"
+                f"{order.site_url}"
+            )
 
 
         # ----------------------------------------------------
@@ -1479,12 +2087,33 @@ async def process_order(
             )
 
 
+        # ----------------------------------------------------
+        # COMPLETED
+        # ----------------------------------------------------
+
         print(
 
             f"[SUCCESS] "
             f"Order #{order.order_id} "
             f"completed."
         )
+
+
+        await thread.send(
+
+            completed_message(
+                order
+            )
+        )
+
+
+        if order.site_url:
+
+            await thread.send(
+
+                f"🔗 **Фінальний сайт:**\n"
+                f"{order.site_url}"
+            )
 
 
     except Exception as error:
@@ -1567,12 +2196,12 @@ async def on_ready():
     )
 
     print(
-        f"💰 Min budget: "
-        f"${MINIMUM_BUDGET}"
+        f"💰 Minimum project price: "
+        f"${MINIMUM_PROJECT_PRICE}"
     )
 
     print(
-        f"💰 Max budget: "
+        f"💰 Maximum project price: "
         f"${MAXIMUM_BUDGET}"
     )
 
@@ -1625,8 +2254,8 @@ async def on_message(
 
         f"[ORDER DETECTED] "
         f"{message.author} | "
-        f"Budget: "
-        f"${extract_budget(message.content)}"
+        f"Message: "
+        f"{message.content[:200]}"
     )
 
 
@@ -1708,6 +2337,7 @@ async def main():
 
 
     health_runner = (
+
         await start_health_server()
     )
 
@@ -1743,4 +2373,4 @@ if __name__ == "__main__":
 
         print(
             "🛑 Grox stopped."
-            )
+    )
