@@ -39,34 +39,30 @@ PORT = int(
     os.getenv("PORT", "10000")
 )
 
-# ------------------------------------------------------------
-# PAYMENT SETTINGS
-# ------------------------------------------------------------
 
-# true = TEST MODE ONLY
-# false = production mode, but requires real payment integration
+# ============================================================
+# PAYMENT / SECURITY SETTINGS
+# ============================================================
+
 TEST_PAYMENT_MODE = os.getenv(
     "TEST_PAYMENT_MODE",
     "true"
 ).lower() == "true"
 
-# Discord user ID of the administrator/owner.
-# Put your own Discord user ID into Render.
-ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
+ADMIN_USER_ID = os.getenv(
+    "ADMIN_USER_ID"
+)
 
-# Maximum allowed order budget.
 MAXIMUM_BUDGET = int(
     os.getenv("MAXIMUM_BUDGET", "10000")
 )
 
 MINIMUM_BUDGET = 200
 
-# Maximum TЗ length.
 MAX_TASK_LENGTH = int(
     os.getenv("MAX_TASK_LENGTH", "12000")
 )
 
-# Number of Gemini retries for temporary errors.
 GEMINI_RETRIES = int(
     os.getenv("GEMINI_RETRIES", "4")
 )
@@ -141,7 +137,9 @@ try:
 
 except Exception as error:
 
-    print("========== GEMINI CLIENT ERROR ==========")
+    print(
+        "========== GEMINI CLIENT ERROR =========="
+    )
 
     print(
         f"Type: {type(error).__name__}"
@@ -289,7 +287,7 @@ def deposit_confirmed_message(
 
         f"💰 Загальна сума: **${order.budget}**\n"
 
-        f"✅ Передоплата **${order.deposit}** отримана.\n\n"
+        f"✅ Передоплата **${order.deposit}** підтверджена.\n\n"
 
         f"🛠️ **Можна починати роботу!**"
     )
@@ -303,11 +301,11 @@ def final_payment_message(
 
         f"🔵 **Замовлення #{order.order_id}**\n\n"
 
-        f"🎉 Проєкт готовий!\n\n"
+        f"🎉 **Проєкт готовий!**\n\n"
 
-        f"💰 Залишок: **${order.remaining}**\n"
+        f"💰 Залишок: **${order.remaining}**\n\n"
 
-        f"🔒 Фінальна передача: **ЗАБЛОКОВАНА**\n\n"
+        f"🔒 **Фінальна передача заблокована.**\n\n"
 
         f"⏳ Очікується друга оплата."
     )
@@ -323,9 +321,9 @@ def completed_message(
 
         f"💰 Загальна сума: **${order.budget}**\n"
 
-        f"✅ Передоплата отримана\n"
+        f"✅ Передоплата підтверджена\n"
 
-        f"✅ Фінальна оплата отримана\n"
+        f"✅ Фінальна оплата підтверджена\n"
 
         f"🔓 Фінальна передача дозволена."
     )
@@ -383,12 +381,18 @@ BUDGET_PATTERN = re.compile(
 )
 
 
-def extract_budget(text: str):
+def extract_budget(
+    text: str
+):
 
-    match = BUDGET_PATTERN.search(text)
+    match = BUDGET_PATTERN.search(
+        text
+    )
 
     if not match:
+
         return None
+
 
     for group in match.groups():
 
@@ -397,30 +401,20 @@ def extract_budget(text: str):
             try:
 
                 cleaned = (
-
                     group
-
-                    .replace(
-                        " ",
-                        ""
-                    )
-
-                    .replace(
-                        ",",
-                        ""
-                    )
-
-                    .replace(
-                        ".",
-                        ""
-                    )
+                    .replace(" ", "")
+                    .replace(",", "")
+                    .replace(".", "")
                 )
 
-                return int(cleaned)
+                return int(
+                    cleaned
+                )
 
             except ValueError:
 
                 return None
+
 
     return None
 
@@ -432,9 +426,7 @@ def contains_service_keyword(
     text = text.lower()
 
     return any(
-
         keyword in text
-
         for keyword in KEYWORDS
     )
 
@@ -449,16 +441,18 @@ def is_order_message(
 
         return False
 
+
     budget = extract_budget(
         text
     )
+
 
     if budget is None:
 
         return False
 
-    return (
 
+    return (
         MINIMUM_BUDGET
         <= budget
         <= MAXIMUM_BUDGET
@@ -495,9 +489,7 @@ async def wait_for_test_payment(
     amount = (
 
         order.deposit
-
         if payment_number == 1
-
         else order.remaining
     )
 
@@ -508,32 +500,33 @@ async def wait_for_test_payment(
 
         f"Сума: **${amount}**\n\n"
 
-        f"⏳ У реальному режимі тут "
-        f"буде очікування підтвердження "
-        f"платіжного сервісу.\n\n"
+        f"⏳ Це тестовий режим.\n\n"
 
         f"Для тесту адміністратор може "
         f"підтвердити оплату командою:\n"
 
-        f"`!confirm {order.order_id} {payment_number}`"
+        f"`!confirm "
+        f"{order.order_id} "
+        f"{payment_number}`"
     )
 
 
     return True
 
 
+# ============================================================
+# ADMIN PAYMENT CONFIRMATION
+# ============================================================
+
 @bot.command(
     name="confirm"
 )
+@commands.guild_only()
 async def confirm_payment(
     ctx,
     order_id: int,
     payment_number: int
 ):
-
-    # --------------------------------------------------------
-    # ONLY ADMIN
-    # --------------------------------------------------------
 
     if ADMIN_USER_ID is None:
 
@@ -554,14 +547,9 @@ async def confirm_payment(
         return
 
 
-    # --------------------------------------------------------
-    # ONLY TEST MODE
-    # --------------------------------------------------------
-
     if not TEST_PAYMENT_MODE:
 
         await ctx.send(
-
             "❌ Тестове підтвердження "
             "вимкнене."
         )
@@ -569,17 +557,12 @@ async def confirm_payment(
         return
 
 
-    # --------------------------------------------------------
-    # VALIDATE PAYMENT NUMBER
-    # --------------------------------------------------------
-
     if payment_number not in (
         1,
         2
     ):
 
         await ctx.send(
-
             "❌ Номер платежу має бути "
             "1 або 2."
         )
@@ -636,6 +619,7 @@ async def confirm_payment(
 
 
         await ctx.send(
+
             f"✅ Передоплату "
             f"${order.deposit} "
             f"для #{order.order_id} "
@@ -702,4 +686,1061 @@ async def confirm_payment(
             )
 
 
-            await
+            await thread.send(
+
+                f"🔗 **Фінальний сайт:**\n"
+                f"{order.site_url}"
+            )
+
+
+        await ctx.send(
+
+            f"✅ Фінальну оплату "
+            f"${order.remaining} "
+            f"для #{order.order_id} "
+            f"підтверджено."
+        )
+
+
+# ============================================================
+# GEMINI WEBSITE GENERATION
+# ============================================================
+
+async def generate_site_code(
+    client_task: str
+) -> str:
+
+    if not client_task.strip():
+
+        raise ValueError(
+            "Порожнє технічне завдання."
+        )
+
+
+    if len(client_task) > MAX_TASK_LENGTH:
+
+        raise ValueError(
+            "Технічне завдання занадто велике."
+        )
+
+
+    prompt = f"""
+Ти — професійний веб-розробник системи Grox.
+
+Створи повністю готовий до запуску
+односторінковий вебсайт за технічним
+завданням клієнта.
+
+ВАЖЛИВІ ВИМОГИ:
+
+1. Поверни ТІЛЬКИ HTML-код.
+2. Не використовуй Markdown.
+3. Не використовуй ```html.
+4. CSS повинен бути всередині HTML.
+5. JavaScript повинен бути всередині HTML.
+6. Сайт повинен бути адаптивним.
+7. Дизайн повинен виглядати професійно.
+8. Використовуй сучасний UI/UX.
+9. Якщо клієнт не вказав кольори —
+   вибери професійну кольорову схему.
+10. Не додавай пояснення перед або після HTML.
+11. Код повинен бути одним повним index.html.
+12. Не залишай TODO.
+13. Не використовуй зовнішні CSS/JS файли.
+14. Сайт повинен працювати після відкриття.
+15. HTML повинен мати DOCTYPE, html,
+    head та body.
+16. НЕ вигадуй реальних клієнтів,
+    компаній, відгуків або результатів.
+17. Якщо потрібні відгуки, використовуй
+    нейтральні placeholder-и або познач
+    їх як демонстраційні.
+18. Не використовуй фальшиві testimonials
+    від імені реальних людей.
+
+Технічне завдання клієнта:
+
+{client_task}
+"""
+
+
+    last_error = None
+
+
+    for attempt in range(
+        1,
+        GEMINI_RETRIES + 1
+    ):
+
+        try:
+
+            print(
+                f"[GEMINI] Attempt "
+                f"{attempt}/{GEMINI_RETRIES}"
+            )
+
+
+            response = await asyncio.to_thread(
+
+                gemini_client.models.generate_content,
+
+                model=GEMINI_MODEL,
+
+                contents=prompt,
+
+                config=types.GenerateContentConfig(
+                    max_output_tokens=30000
+                )
+            )
+
+
+            if response is None:
+
+                raise RuntimeError(
+                    "Gemini повернув None."
+                )
+
+
+            response_text = response.text
+
+
+            if not response_text:
+
+                raise RuntimeError(
+                    "Gemini повернув порожню відповідь."
+                )
+
+
+            html = response_text.strip()
+
+
+            html = re.sub(
+                r"^```html\s*",
+                "",
+                html,
+                flags=re.IGNORECASE
+            )
+
+
+            html = re.sub(
+                r"^```\s*",
+                "",
+                html
+            )
+
+
+            html = re.sub(
+                r"\s*```$",
+                "",
+                html
+            )
+
+
+            html = html.strip()
+
+
+            html_lower = html.lower()
+
+
+            if "<html" not in html_lower:
+
+                raise RuntimeError(
+                    "Gemini повернув некоректний HTML."
+                )
+
+
+            if "<head" not in html_lower:
+
+                raise RuntimeError(
+                    "У HTML немає head."
+                )
+
+
+            if "<body" not in html_lower:
+
+                raise RuntimeError(
+                    "У HTML немає body."
+                )
+
+
+            if len(html) < 300:
+
+                raise RuntimeError(
+                    "HTML занадто короткий."
+                )
+
+
+            print(
+                f"[GEMINI] HTML готовий. "
+                f"Довжина: {len(html)}"
+            )
+
+
+            return html
+
+
+        except Exception as error:
+
+            last_error = error
+
+
+            print(
+                f"[GEMINI ERROR] "
+                f"Attempt {attempt}: "
+                f"{type(error).__name__}: "
+                f"{error!r}"
+            )
+
+
+            error_text = str(
+                error
+            ).lower()
+
+
+            temporary = any(
+
+                code in error_text
+
+                for code in (
+                    "503",
+                    "unavailable",
+                    "temporarily",
+                    "deadline",
+                    "timeout",
+                    "429",
+                    "rate limit"
+                )
+            )
+
+
+            if not temporary:
+
+                traceback.print_exc()
+
+                break
+
+
+            if attempt >= GEMINI_RETRIES:
+
+                break
+
+
+            delay = (
+
+                2 ** attempt
+            ) + random.uniform(
+                0,
+                1
+            )
+
+
+            print(
+                f"[GEMINI] Повтор через "
+                f"{delay:.1f}s..."
+            )
+
+
+            await asyncio.sleep(
+                delay
+            )
+
+
+    if last_error:
+
+        raise last_error
+
+
+    raise RuntimeError(
+        "Gemini не зміг згенерувати сайт."
+    )
+
+
+# ============================================================
+# VERCEL DEPLOY
+# ============================================================
+
+async def deploy_to_vercel(
+    project_name: str,
+    html_content: str
+):
+
+    url = (
+        "https://api.vercel.com/v13/deployments"
+    )
+
+
+    headers = {
+
+        "Authorization":
+            f"Bearer {VERCEL_TOKEN}",
+
+        "Content-Type":
+            "application/json",
+    }
+
+
+    payload = {
+
+        "name":
+            project_name,
+
+        "files": [
+
+            {
+                "file":
+                    "index.html",
+
+                "data":
+                    html_content,
+            }
+
+        ],
+
+        "projectSettings": {
+
+            "framework":
+                None
+        }
+    }
+
+
+    timeout = aiohttp.ClientTimeout(
+        total=120
+    )
+
+
+    print(
+        f"[VERCEL] Starting deployment: "
+        f"{project_name}"
+    )
+
+
+    try:
+
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
+
+            async with session.post(
+
+                url,
+
+                headers=headers,
+
+                json=payload
+
+            ) as response:
+
+                response_text = (
+                    await response.text()
+                )
+
+
+                try:
+
+                    data = await response.json(
+                        content_type=None
+                    )
+
+                except Exception:
+
+                    data = {}
+
+
+                if response.status in (
+                    200,
+                    201
+                ):
+
+                    deployment_url = data.get(
+                        "url"
+                    )
+
+
+                    if deployment_url:
+
+                        if not deployment_url.startswith(
+                            "http"
+                        ):
+
+                            deployment_url = (
+                                "https://"
+                                + deployment_url
+                            )
+
+
+                        print(
+                            f"[VERCEL] Deployment successful: "
+                            f"{deployment_url}"
+                        )
+
+
+                        return deployment_url
+
+
+                print(
+                    f"[VERCEL ERROR] "
+                    f"HTTP {response.status}: "
+                    f"{response_text}"
+                )
+
+
+                return None
+
+
+    except Exception as error:
+
+        print(
+            f"[VERCEL EXCEPTION] "
+            f"{type(error).__name__}: "
+            f"{error!r}"
+        )
+
+        traceback.print_exc()
+
+        return None
+
+
+# ============================================================
+# PROCESS ONE ORDER
+# ============================================================
+
+async def process_order(
+    message: discord.Message
+):
+
+    if message.id in active_orders:
+
+        return
+
+
+    active_orders.add(
+        message.id
+    )
+
+
+    try:
+
+        budget = extract_budget(
+            message.content
+        )
+
+
+        if budget is None:
+
+            return
+
+
+        if budget < MINIMUM_BUDGET:
+
+            return
+
+
+        if budget > MAXIMUM_BUDGET:
+
+            await message.channel.send(
+
+                f"{message.author.mention}, "
+                f"максимальний бюджет через Grox "
+                f"зараз ${MAXIMUM_BUDGET}."
+            )
+
+            return
+
+
+        order = create_order(
+            message,
+            budget
+        )
+
+
+        try:
+
+            thread = await message.create_thread(
+
+                name=(
+                    f"Grox Order #"
+                    f"{order.order_id} | "
+                    f"${budget}"
+                ),
+
+                auto_archive_duration=1440
+            )
+
+
+        except discord.Forbidden:
+
+            await message.channel.send(
+
+                f"{message.author.mention}, "
+                f"я знайшов ваше замовлення, "
+                f"але мені не вистачає прав "
+                f"для створення thread."
+            )
+
+            return
+
+
+        except Exception as error:
+
+            print(
+                f"[THREAD ERROR] "
+                f"{type(error).__name__}: "
+                f"{error!r}"
+            )
+
+            traceback.print_exc()
+
+
+            await message.channel.send(
+
+                f"{message.author.mention}, "
+                f"виникла технічна помилка."
+            )
+
+            return
+
+
+        order.thread_id = thread.id
+
+
+        await thread.send(
+
+            f"👋 Вітаю, "
+            f"{message.author.mention}!\n\n"
+
+            f"🤖 **Grox прийняв ваше замовлення.**\n\n"
+
+            f"🆔 Замовлення: "
+            f"**#{order.order_id}**\n"
+
+            f"💰 Загальна сума: "
+            f"**${order.budget}**\n"
+
+            f"💵 Передоплата: "
+            f"**${order.deposit}**\n\n"
+
+            f"📋 Спочатку надішліть "
+            f"детальне ТЗ.\n\n"
+
+            f"Після погодження та підтвердження "
+            f"передоплати Grox почне роботу."
+        )
+
+
+        def check(
+            msg: discord.Message
+        ):
+
+            return (
+
+                msg.author.id
+                == message.author.id
+
+                and
+
+                msg.channel.id
+                == thread.id
+
+                and
+
+                not msg.author.bot
+            )
+
+
+        try:
+
+            client_message = await bot.wait_for(
+
+                "message",
+
+                check=check,
+
+                timeout=CLIENT_TIMEOUT
+            )
+
+
+        except asyncio.TimeoutError:
+
+            await thread.send(
+
+                "⏰ Час очікування ТЗ минув.\n\n"
+
+                "Якщо ви все ще хочете "
+                "продовжити замовлення — "
+                "напишіть нове повідомлення."
+            )
+
+            return
+
+
+        task = client_message.content.strip()
+
+
+        if not task:
+
+            await thread.send(
+                "❌ ТЗ не може бути порожнім."
+            )
+
+            return
+
+
+        if len(task) > MAX_TASK_LENGTH:
+
+            await thread.send(
+
+                "❌ ТЗ занадто велике.\n"
+
+                f"Максимум: "
+                f"{MAX_TASK_LENGTH} символів."
+            )
+
+            return
+
+
+        order.task = task
+
+
+        await thread.send(
+            deposit_status_message(
+                order
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # FIRST PAYMENT
+        # ----------------------------------------------------
+
+        await wait_for_test_payment(
+
+            thread,
+
+            order,
+
+            1
+        )
+
+
+        await thread.send(
+
+            "⏳ **Очікую підтвердження "
+            "передоплати.**"
+        )
+
+
+        while not order.payment1_confirmed:
+
+            await asyncio.sleep(
+                2
+            )
+
+
+        await thread.send(
+
+            "📋 **ТЗ отримано!**\n\n"
+
+            "💳 Передоплату підтверджено.\n"
+
+            "🤖 Аналізую вимоги...\n"
+
+            "💻 Генерую сайт..."
+        )
+
+
+        # ----------------------------------------------------
+        # GEMINI
+        # ----------------------------------------------------
+
+        try:
+
+            html_code = await generate_site_code(
+                order.task
+            )
+
+
+        except Exception as error:
+
+            print(
+                "========================================"
+            )
+
+            print(
+                "[ORDER → GEMINI ERROR]"
+            )
+
+            print(
+                f"Type: {type(error).__name__}"
+            )
+
+            print(
+                f"Message: {error!r}"
+            )
+
+            traceback.print_exc()
+
+            print(
+                "========================================"
+            )
+
+
+            await thread.send(
+
+                "❌ **Не вдалося згенерувати сайт.**\n\n"
+
+                "Технічна помилка записана "
+                "в Render Logs."
+            )
+
+            return
+
+
+        # ----------------------------------------------------
+        # VERCEL
+        # ----------------------------------------------------
+
+        project_name = (
+
+            f"grox-job-"
+            f"{uuid.uuid4().hex[:12]}"
+        )
+
+
+        await thread.send(
+
+            "🚀 **Код готовий.**\n\n"
+
+            "Виконую автоматичний деплой "
+            "на Vercel..."
+        )
+
+
+        live_url = await deploy_to_vercel(
+
+            project_name,
+
+            html_code
+        )
+
+
+        if not live_url:
+
+            await thread.send(
+
+                "⚠️ Код сайту згенерований, "
+                "але Vercel не повернув "
+                "адресу деплою.\n\n"
+
+                "Фінальна передача "
+                "залишається заблокованою."
+            )
+
+            return
+
+
+        order.site_url = live_url
+
+        order.status = "WAITING_FINAL_PAYMENT"
+
+
+        await thread.send(
+            final_payment_message(
+                order
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # SECOND PAYMENT
+        # ----------------------------------------------------
+
+        await wait_for_test_payment(
+
+            thread,
+
+            order,
+
+            2
+        )
+
+
+        await thread.send(
+
+            "⏳ **Очікую підтвердження "
+            "другої оплати.**"
+        )
+
+
+        while not order.payment2_confirmed:
+
+            await asyncio.sleep(
+                2
+            )
+
+
+        print(
+
+            f"[SUCCESS] "
+            f"Order #{order.order_id} "
+            f"completed."
+        )
+
+
+    except Exception as error:
+
+        print(
+            "========================================"
+        )
+
+        print(
+            "🔥 ORDER ERROR"
+        )
+
+        print(
+            f"Type: {type(error).__name__}"
+        )
+
+        print(
+            f"Message: {error!r}"
+        )
+
+        traceback.print_exc()
+
+        print(
+            "========================================"
+        )
+
+
+        try:
+
+            await message.channel.send(
+
+                f"{message.author.mention}, "
+                f"під час обробки замовлення "
+                f"сталася технічна помилка."
+            )
+
+        except Exception:
+
+            pass
+
+
+    finally:
+
+        active_orders.discard(
+            message.id
+        )
+
+
+# ============================================================
+# BOT READY
+# ============================================================
+
+@bot.event
+async def on_ready():
+
+    print(
+        "========================================"
+    )
+
+    print(
+        f"🤖 Grox ONLINE: {bot.user}"
+    )
+
+    print(
+        f"🆔 Bot ID: {bot.user.id}"
+    )
+
+    print(
+        f"🧠 Gemini model: {GEMINI_MODEL}"
+    )
+
+    print(
+        f"📡 Client channel: "
+        f"{CLIENT_CHANNEL_ID}"
+    )
+
+    print(
+        f"💳 Test payment mode: "
+        f"{TEST_PAYMENT_MODE}"
+    )
+
+    print(
+        f"💰 Min budget: "
+        f"${MINIMUM_BUDGET}"
+    )
+
+    print(
+        f"💰 Max budget: "
+        f"${MAXIMUM_BUDGET}"
+    )
+
+    print(
+        "🚀 Grox готовий!"
+    )
+
+    print(
+        "========================================"
+    )
+
+
+# ============================================================
+# MESSAGE HANDLER
+# ============================================================
+
+@bot.event
+async def on_message(
+    message: discord.Message
+):
+
+    if message.author.bot:
+
+        return
+
+
+    await bot.process_commands(
+        message
+    )
+
+
+    if message.channel.id != CLIENT_CHANNEL_ID:
+
+        return
+
+
+    if not is_order_message(
+        message.content
+    ):
+
+        return
+
+
+    if message.id in active_orders:
+
+        return
+
+
+    print(
+
+        f"[ORDER DETECTED] "
+        f"{message.author} | "
+        f"Budget: "
+        f"${extract_budget(message.content)}"
+    )
+
+
+    asyncio.create_task(
+
+        process_order(
+            message
+        )
+    )
+
+
+# ============================================================
+# HEALTH SERVER FOR RENDER
+# ============================================================
+
+async def health_handler(
+    request
+):
+
+    return web.Response(
+
+        text="Grox is running! 🤖"
+    )
+
+
+async def start_health_server():
+
+    app = web.Application()
+
+
+    app.router.add_get(
+
+        "/",
+
+        health_handler
+    )
+
+
+    runner = web.AppRunner(
+        app
+    )
+
+
+    await runner.setup()
+
+
+    site = web.TCPSite(
+
+        runner,
+
+        "0.0.0.0",
+
+        PORT
+    )
+
+
+    await site.start()
+
+
+    print(
+
+        f"[HEALTH] Server listening "
+        f"on port {PORT}"
+    )
+
+
+    return runner
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+
+    print(
+        "🚀 Starting Grox..."
+    )
+
+
+    health_runner = (
+        await start_health_server()
+    )
+
+
+    try:
+
+        await bot.start(
+            DISCORD_TOKEN
+        )
+
+
+    finally:
+
+        await bot.close()
+
+        await health_runner.cleanup()
+
+
+# ============================================================
+# START
+# ============================================================
+
+if __name__ == "__main__":
+
+    try:
+
+        asyncio.run(
+            main()
+        )
+
+
+    except KeyboardInterrupt:
+
+        print(
+            "🛑 Grox stopped."
+            )
