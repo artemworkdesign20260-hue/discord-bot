@@ -15,6 +15,8 @@ from discord.ext import commands
 from google import genai
 from google.genai import types
 
+from playwright.async_api import async_playwright
+
 
 # ============================================================
 # ENVIRONMENT VARIABLES
@@ -23,6 +25,12 @@ from google.genai import types
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 VERCEL_TOKEN = os.getenv("VERCEL_TOKEN")
+
+# ============================================================
+# PAYMENT WALLET
+# ============================================================
+
+CRYPTO_WALLET = os.getenv("CRYPTO_WALLET")
 
 CLIENT_CHANNEL_ID = os.getenv("CLIENT_CHANNEL_ID")
 
@@ -57,8 +65,6 @@ MAXIMUM_BUDGET = int(
     os.getenv("MAXIMUM_BUDGET", "10000")
 )
 
-# Мінімальна можлива ціна автоматичної оцінки.
-# Це НЕ мінімальний бюджет замовлення.
 MINIMUM_PROJECT_PRICE = 50
 
 MAX_TASK_LENGTH = int(
@@ -68,6 +74,9 @@ MAX_TASK_LENGTH = int(
 GEMINI_RETRIES = int(
     os.getenv("GEMINI_RETRIES", "4")
 )
+
+# Максимальна кількість автоматичних виправлень сайту.
+MAX_WEBSITE_FIX_ATTEMPTS = 3
 
 
 # ============================================================
@@ -79,6 +88,7 @@ required_variables = {
     "GEMINI_API_KEY": GEMINI_API_KEY,
     "VERCEL_TOKEN": VERCEL_TOKEN,
     "CLIENT_CHANNEL_ID": CLIENT_CHANNEL_ID,
+    "CRYPTO_WALLET": CRYPTO_WALLET,
 }
 
 missing_variables = [
@@ -192,7 +202,6 @@ class Order:
 
     client_name: str
 
-    # Спочатку бюджет невідомий.
     budget: int = 0
 
     deposit: int = 0
@@ -218,6 +227,8 @@ class Order:
     payment2_confirmed: bool = False
 
     site_url: str | None = None
+
+    site_code: str | None = None
 
     status: str = "WAITING_TZ"
 
@@ -321,6 +332,9 @@ def deposit_status_message(
         f"💵 Передоплата: "
         f"**${order.deposit}**\n\n"
 
+        f"🏦 **Адреса для оплати:**\n"
+        f"`{CRYPTO_WALLET}`\n\n"
+
         f"⏳ **Статус: Очікується передоплата**\n\n"
 
         f"🔒 Робота ще не розпочата."
@@ -355,10 +369,18 @@ def final_payment_message(
 
         f"🎉 **Проєкт готовий!**\n\n"
 
-        f"💰 Залишок: "
+        f"💰 Залишок до оплати: "
         f"**${order.remaining}**\n\n"
 
+        f"🏦 **Адреса для фінальної оплати:**\n"
+        f"`{CRYPTO_WALLET}`\n\n"
+
+        f"💳 **До оплати: "
+        f"${order.remaining}**\n\n"
+
         f"🔒 **Фінальна передача заблокована.**\n\n"
+
+        f"📋 Після оплати надішліть підтвердження.\n\n"
 
         f"⏳ Очікується друга оплата."
     )
@@ -437,10 +459,6 @@ def contains_service_keyword(
 def is_order_message(
     text: str
 ) -> bool:
-
-    # Тепер бюджет НЕ потрібен.
-    # Достатньо, щоб у повідомленні
-    # була ознака IT-проєкту.
 
     return contains_service_keyword(
         text
@@ -537,23 +555,36 @@ async def wait_for_test_payment(
     amount = (
 
         order.deposit
-
         if payment_number == 1
-
         else order.remaining
+    )
+
+
+    payment_name = (
+
+        "передоплати"
+        if payment_number == 1
+        else "фінальної оплати"
     )
 
 
     await thread.send(
 
-        f"💳 **Тестова оплата №{payment_number}**\n\n"
+        f"💳 **Оплата №{payment_number} — "
+        f"{payment_name}**\n\n"
 
-        f"Сума: **${amount}**\n\n"
+        f"💰 **Сума до оплати: ${amount}**\n\n"
+
+        f"🏦 **Адреса для оплати:**\n"
+        f"`{CRYPTO_WALLET}`\n\n"
+
+        f"📋 Після здійснення оплати "
+        f"надішліть підтвердження.\n\n"
 
         f"⏳ Це тестовий режим.\n\n"
 
         f"Для тесту адміністратор може "
-        f"підтвердити оплату командою:\n"
+        f"підтвердити оплату командою:\n\n"
 
         f"`!confirm "
         f"{order.order_id} "
@@ -609,10 +640,7 @@ async def confirm_payment(
         return
 
 
-    if payment_number not in (
-        1,
-        2
-    ):
+    if payment_number not in (1, 2):
 
         await ctx.send(
 
@@ -637,9 +665,9 @@ async def confirm_payment(
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # FIRST PAYMENT
-    # --------------------------------------------------------
+    # ========================================================
 
     if payment_number == 1:
 
@@ -695,9 +723,9 @@ async def confirm_payment(
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # SECOND PAYMENT
-    # --------------------------------------------------------
+    # ========================================================
 
     if payment_number == 2:
 
@@ -716,9 +744,8 @@ async def confirm_payment(
 
             await ctx.send(
 
-                "❌ Проєкт ще не перейшов "
-                "у стан очікування "
-                "фінальної оплати."
+                "❌ Проєкт ще не пройшов "
+                "усі необхідні перевірки."
             )
 
             return
@@ -785,17 +812,13 @@ async def gemini_request(
 
 
     for attempt in range(
-
         1,
-
         GEMINI_RETRIES + 1
-
     ):
 
         try:
 
             print(
-
                 f"[GEMINI] Attempt "
                 f"{attempt}/{GEMINI_RETRIES}"
             )
@@ -830,9 +853,7 @@ async def gemini_request(
             if not response_text:
 
                 raise RuntimeError(
-
-                    "Gemini повернув "
-                    "порожню відповідь."
+                    "Gemini повернув порожню відповідь."
                 )
 
 
@@ -892,11 +913,8 @@ async def gemini_request(
 
                 2 ** attempt
             ) + random.uniform(
-
                 0,
-
                 1
-
             )
 
 
@@ -961,13 +979,9 @@ async def estimate_project(
 РІВНІ:
 
 VERY_SIMPLE = $50–$150
-
 SIMPLE = $150–$300
-
 MEDIUM = $300–$700
-
 HARD = $700–$1500
-
 VERY_HARD = $1500–$3000+
 
 ВАЖЛИВІ ПРАВИЛА:
@@ -976,7 +990,7 @@ VERY_HARD = $1500–$3000+
 2. Не використовуй бюджет клієнта як автоматичну ціну.
 3. Якщо клієнт не вказав бюджет — це нормально.
 4. Якщо клієнт вказав бюджет — порівняй його
-   з реальною оцінкою, але не копіюй його автоматично.
+   з реальною оцінкою.
 5. Не вигадуй функції, яких немає в ТЗ.
 6. Ціна повинна відповідати складності.
 7. Мінімальна ціна: ${MINIMUM_PROJECT_PRICE}.
@@ -996,19 +1010,14 @@ REASON: ...
 
 
     result = await gemini_request(
-
         prompt,
-
         max_output_tokens=3000
     )
 
 
     price_match = re.search(
-
         r"PRICE\s*:\s*\$?\s*(\d+)",
-
         result,
-
         re.IGNORECASE
     )
 
@@ -1016,9 +1025,7 @@ REASON: ...
     if not price_match:
 
         raise RuntimeError(
-
-            "Gemini не повернув "
-            "коректну ціну."
+            "Gemini не повернув коректну ціну."
         )
 
 
@@ -1028,77 +1035,55 @@ REASON: ...
 
 
     price = max(
-
         MINIMUM_PROJECT_PRICE,
-
         price
     )
 
 
     price = min(
-
         MAXIMUM_BUDGET,
-
         price
     )
 
 
     type_match = re.search(
-
         r"TYPE\s*:\s*(.+)",
-
         result,
-
         re.IGNORECASE
     )
 
 
     complexity_match = re.search(
-
         r"COMPLEXITY\s*:\s*(.+)",
-
         result,
-
         re.IGNORECASE
     )
 
 
     reason_match = re.search(
-
         r"REASON\s*:\s*(.+)",
-
         result,
-
         re.IGNORECASE
     )
 
 
     project_type = (
-
         type_match.group(1).strip()
-
         if type_match
-
         else "IT Project"
     )
 
 
     complexity = (
-
         complexity_match.group(1).strip()
-
         if complexity_match
-
         else "UNKNOWN"
     )
 
 
     reason = (
-
         reason_match.group(1).strip()
-
         if reason_match
-
         else "Ціна визначена на основі складності ТЗ."
     )
 
@@ -1136,9 +1121,7 @@ async def generate_site_code(
     if len(client_task) > MAX_TASK_LENGTH:
 
         raise ValueError(
-
-            "Технічне завдання "
-            "занадто велике."
+            "Технічне завдання занадто велике."
         )
 
 
@@ -1149,43 +1132,117 @@ async def generate_site_code(
 односторінковий вебсайт за технічним
 завданням клієнта.
 
-ВАЖЛИВІ ВИМОГИ:
+КРИТИЧНО ВАЖЛИВО:
+
+ЦЕ НЕ МАКЕТ І НЕ ФОТО.
+
+УСІ ФУНКЦІЇ, ЯКІ ВКАЗАНІ В ТЗ,
+ПОВИННІ РЕАЛЬНО ПРАЦЮВАТИ.
+
+Кнопки не повинні бути декоративними,
+якщо за ТЗ вони повинні виконувати дію.
+
+Форми повинні мати реальну поведінку.
+
+JavaScript повинен бути робочим.
+
+Не створюй кнопку, яка нічого не робить,
+якщо клієнт очікує функціональність.
+
+ПРАВИЛА:
 
 1. Поверни ТІЛЬКИ HTML-код.
 2. Не використовуй Markdown.
 3. Не використовуй ```html.
-4. CSS повинен бути всередині HTML.
-5. JavaScript повинен бути всередині HTML.
-6. Сайт повинен бути адаптивним.
-7. Дизайн повинен виглядати професійно.
-8. Використовуй сучасний UI/UX.
-9. Якщо клієнт не вказав кольори —
-   вибери професійну кольорову схему.
-10. Не додавай пояснення перед або після HTML.
-11. Код повинен бути одним повним index.html.
-12. Не залишай TODO.
-13. Не використовуй зовнішні CSS/JS файли.
-14. Сайт повинен працювати після відкриття.
-15. HTML повинен мати DOCTYPE, html,
-    head та body.
-16. НЕ вигадуй реальних клієнтів,
+4. CSS всередині HTML.
+5. JavaScript всередині HTML.
+6. Сайт адаптивний.
+7. Сучасний UI/UX.
+8. Якщо клієнт не вказав кольори —
+   вибери професійну схему.
+9. Не додавай пояснення.
+10. Один повний index.html.
+11. Не залишай TODO.
+12. Не залишай фальшиві кнопки.
+13. Не залишай фальшиві форми.
+14. Не залишай очевидно незавершені функції.
+15. HTML має DOCTYPE, html, head та body.
+16. Не вигадуй реальних клієнтів,
     компаній, відгуків або результатів.
-17. Якщо потрібні відгуки, використовуй
-    нейтральні placeholder-и або познач
-    їх як демонстраційні.
-18. Не використовуй фальшиві testimonials
+17. Не використовуй фальшиві testimonials
     від імені реальних людей.
+18. Якщо потрібен backend/API, а ТЗ його
+    вимагає, не вдавай, що frontend сам
+    по собі є backend.
+19. Якщо функцію неможливо реалізувати
+    тільки frontend-ом, реалізуй безпечну
+    демонстраційну поведінку або чітко
+    врахуй необхідність backend у коді.
+20. Перед відповіддю сам перевір логіку
+    JavaScript та взаємодію елементів.
 
-Технічне завдання клієнта:
+Технічне завдання:
 
 {client_task}
 """
 
 
     return await gemini_request(
-
         prompt,
+        max_output_tokens=30000
+    )
 
+
+# ============================================================
+# GEMINI WEBSITE FIX
+# ============================================================
+
+async def fix_site_code(
+    html_code: str,
+    test_report: str,
+    client_task: str
+) -> str:
+
+    prompt = f"""
+Ти — senior frontend developer системи Grox.
+
+Тобі потрібно ВИПРАВИТИ існуючий HTML-сайт.
+
+Клієнтське ТЗ:
+
+{client_task}
+
+РЕЗУЛЬТАТ АВТОМАТИЧНОЇ ПЕРЕВІРКИ:
+
+{test_report}
+
+ВИМОГИ:
+
+1. Виправ усі знайдені проблеми.
+2. Не прибирай функції, які потрібні за ТЗ.
+3. Не замінюй функціональність картинкою
+   або декоративним елементом.
+4. Кнопки повинні виконувати свої дії.
+5. JavaScript повинен працювати.
+6. Форми повинні працювати відповідно до ТЗ.
+7. Не залишай TODO.
+8. Не додавай Markdown.
+9. Поверни ТІЛЬКИ повний готовий HTML.
+10. CSS всередині HTML.
+11. JavaScript всередині HTML.
+12. Не пояснюй зміни.
+13. Збережи професійний дизайн.
+14. Не вигадуй нові функції, яких немає
+    в ТЗ, якщо вони не потрібні для виправлення.
+
+ПОТОЧНИЙ HTML:
+
+{html_code}
+"""
+
+
+    return await gemini_request(
+        prompt,
         max_output_tokens=30000
     )
 
@@ -1249,7 +1306,6 @@ async def deploy_to_vercel(
 
 
     print(
-
         f"[VERCEL] Starting deployment: "
         f"{project_name}"
     )
@@ -1258,23 +1314,16 @@ async def deploy_to_vercel(
     try:
 
         async with aiohttp.ClientSession(
-
             timeout=timeout
-
         ) as session:
 
             async with session.post(
-
                 url,
-
                 headers=headers,
-
                 json=payload
-
             ) as response:
 
                 response_text = (
-
                     await response.text()
                 )
 
@@ -1282,9 +1331,7 @@ async def deploy_to_vercel(
                 try:
 
                     data = await response.json(
-
                         content_type=None
-
                     )
 
                 except Exception:
@@ -1293,15 +1340,11 @@ async def deploy_to_vercel(
 
 
                 if response.status in (
-
                     200,
-
                     201
-
                 ):
 
                     deployment_url = data.get(
-
                         "url"
                     )
 
@@ -1309,21 +1352,16 @@ async def deploy_to_vercel(
                     if deployment_url:
 
                         if not deployment_url.startswith(
-
                             "http"
-
                         ):
 
                             deployment_url = (
-
                                 "https://"
-
                                 + deployment_url
                             )
 
 
                         print(
-
                             f"[VERCEL] "
                             f"Deployment successful: "
                             f"{deployment_url}"
@@ -1334,7 +1372,6 @@ async def deploy_to_vercel(
 
 
                 print(
-
                     f"[VERCEL ERROR] "
                     f"HTTP {response.status}: "
                     f"{response_text}"
@@ -1347,7 +1384,6 @@ async def deploy_to_vercel(
     except Exception as error:
 
         print(
-
             f"[VERCEL EXCEPTION] "
             f"{type(error).__name__}: "
             f"{error!r}"
@@ -1356,6 +1392,706 @@ async def deploy_to_vercel(
         traceback.print_exc()
 
         return None
+
+
+# ============================================================
+# WEBSITE QA TEST
+# ============================================================
+
+async def test_website(
+    url: str
+):
+
+    print(
+        f"[QA] Starting website test: {url}"
+    )
+
+
+    errors = []
+
+    warnings = []
+
+    console_errors = []
+
+    failed_requests = []
+
+    clicked_elements = 0
+
+
+    try:
+
+        async with async_playwright() as playwright:
+
+            browser = await playwright.chromium.launch(
+                headless=True
+            )
+
+
+            page = await browser.new_page()
+
+
+            # ------------------------------------------------
+            # JavaScript console errors
+            # ------------------------------------------------
+
+            def handle_console(msg):
+
+                if msg.type == "error":
+
+                    console_errors.append(
+                        msg.text
+                    )
+
+
+            page.on(
+                "console",
+                handle_console
+            )
+
+
+            # ------------------------------------------------
+            # Failed network requests
+            # ------------------------------------------------
+
+            def handle_request_failed(request):
+
+                failed_requests.append(
+                    f"{request.method} {request.url} "
+                    f"-> {request.failure}"
+                )
+
+
+            page.on(
+                "requestfailed",
+                handle_request_failed
+            )
+
+
+            # ------------------------------------------------
+            # PAGE ERROR
+            # ------------------------------------------------
+
+            def handle_page_error(error):
+
+                errors.append(
+                    f"JavaScript page error: {error}"
+                )
+
+
+            page.on(
+                "pageerror",
+                handle_page_error
+            )
+
+
+            # ------------------------------------------------
+            # OPEN WEBSITE
+            # ------------------------------------------------
+
+            try:
+
+                response = await page.goto(
+                    url,
+                    wait_until="networkidle",
+                    timeout=30000
+                )
+
+            except Exception as error:
+
+                await browser.close()
+
+                return {
+
+                    "success": False,
+
+                    "report": (
+                        "Сайт не вдалося відкрити.\n"
+                        f"Помилка: {error}"
+                    )
+                }
+
+
+            if response is None:
+
+                errors.append(
+                    "Сторінка не повернула HTTP response."
+                )
+
+            elif response.status >= 400:
+
+                errors.append(
+                    f"HTTP помилка: {response.status}"
+                )
+
+
+            # ------------------------------------------------
+            # BASIC HTML CHECK
+            # ------------------------------------------------
+
+            title = await page.title()
+
+            html = await page.locator(
+                "html"
+            ).count()
+
+
+            body = await page.locator(
+                "body"
+            ).count()
+
+
+            if html == 0:
+
+                errors.append(
+                    "Відсутній <html>."
+                )
+
+
+            if body == 0:
+
+                errors.append(
+                    "Відсутній <body>."
+                )
+
+
+            # ------------------------------------------------
+            # JAVASCRIPT ERRORS
+            # ------------------------------------------------
+
+            for console_error in console_errors:
+
+                errors.append(
+                    f"Console error: {console_error}"
+                )
+
+
+            # ------------------------------------------------
+            # FAILED REQUESTS
+            # ------------------------------------------------
+
+            for failed_request in failed_requests:
+
+                warnings.append(
+                    f"Неуспішний network request: "
+                    f"{failed_request}"
+                )
+
+
+            # ------------------------------------------------
+            # FIND BUTTONS
+            # ------------------------------------------------
+
+            buttons = page.locator(
+                "button"
+            )
+
+            button_count = await buttons.count()
+
+
+            print(
+                f"[QA] Buttons found: "
+                f"{button_count}"
+            )
+
+
+            # ------------------------------------------------
+            # TEST BUTTONS
+            # ------------------------------------------------
+
+            for index in range(
+                min(button_count, 30)
+            ):
+
+                try:
+
+                    button = buttons.nth(
+                        index
+                    )
+
+
+                    if not await button.is_visible():
+
+                        continue
+
+
+                    disabled = await button.is_disabled()
+
+                    if disabled:
+
+                        continue
+
+
+                    before_url = page.url
+
+                    before_text = await page.locator(
+                        "body"
+                    ).inner_text(
+                        timeout=3000
+                    )
+
+
+                    await button.scroll_into_view_if_needed()
+
+                    await button.click(
+                        timeout=5000
+                    )
+
+
+                    clicked_elements += 1
+
+
+                    await page.wait_for_timeout(
+                        500
+                    )
+
+
+                    after_text = await page.locator(
+                        "body"
+                    ).inner_text(
+                        timeout=3000
+                    )
+
+
+                    after_url = page.url
+
+
+                    if (
+                        before_url == after_url
+                        and before_text == after_text
+                    ):
+
+                        warnings.append(
+                            f"Кнопка #{index + 1} "
+                            f"не показала очевидної зміни "
+                            f"після натискання."
+                        )
+
+
+                    if before_url != after_url:
+
+                        try:
+
+                            await page.go_back(
+                                wait_until="networkidle",
+                                timeout=10000
+                            )
+
+                        except Exception:
+
+                            pass
+
+
+                except Exception as error:
+
+                    errors.append(
+                        f"Кнопка #{index + 1} "
+                        f"спричинила помилку: {error}"
+                    )
+
+
+            # ------------------------------------------------
+            # TEST LINKS
+            # ------------------------------------------------
+
+            links = page.locator(
+                "a"
+            )
+
+            link_count = await links.count()
+
+
+            print(
+                f"[QA] Links found: "
+                f"{link_count}"
+            )
+
+
+            for index in range(
+                min(link_count, 30)
+            ):
+
+                try:
+
+                    link = links.nth(
+                        index
+                    )
+
+
+                    if not await link.is_visible():
+
+                        continue
+
+
+                    href = await link.get_attribute(
+                        "href"
+                    )
+
+
+                    if not href:
+
+                        warnings.append(
+                            f"Посилання #{index + 1} "
+                            f"не має href."
+                        )
+
+
+                except Exception as error:
+
+                    warnings.append(
+                        f"Не вдалося перевірити "
+                        f"посилання #{index + 1}: "
+                        f"{error}"
+                    )
+
+
+            # ------------------------------------------------
+            # TEST FORMS
+            # ------------------------------------------------
+
+            forms = page.locator(
+                "form"
+            )
+
+            form_count = await forms.count()
+
+
+            print(
+                f"[QA] Forms found: "
+                f"{form_count}"
+            )
+
+
+            for index in range(
+                form_count
+            ):
+
+                try:
+
+                    form = forms.nth(
+                        index
+                    )
+
+
+                    inputs = form.locator(
+                        "input"
+                    )
+
+                    input_count = await inputs.count()
+
+
+                    if input_count == 0:
+
+                        warnings.append(
+                            f"Форма #{index + 1} "
+                            f"не має input."
+                        )
+
+
+                except Exception as error:
+
+                    errors.append(
+                        f"Помилка перевірки "
+                        f"форми #{index + 1}: "
+                        f"{error}"
+                    )
+
+
+            await browser.close()
+
+
+    except Exception as error:
+
+        traceback.print_exc()
+
+        return {
+
+            "success": False,
+
+            "report": (
+                "QA-система не змогла завершити "
+                "перевірку.\n"
+                f"Помилка: {type(error).__name__}: "
+                f"{error}"
+            )
+
+        }
+
+
+    # ========================================================
+    # RESULT
+    # ========================================================
+
+    success = (
+        len(errors) == 0
+    )
+
+
+    report_lines = [
+
+        f"URL: {url}",
+
+        f"Title: {title}",
+
+        f"Кнопок знайдено: {button_count}",
+
+        f"Кнопок натиснуто: {clicked_elements}",
+
+        f"Посилань знайдено: {link_count}",
+
+        f"Форм знайдено: {form_count}",
+
+    ]
+
+
+    if errors:
+
+        report_lines.append(
+            "\n❌ ПОМИЛКИ:"
+        )
+
+        for error in errors[:50]:
+
+            report_lines.append(
+                f"- {error}"
+            )
+
+
+    if warnings:
+
+        report_lines.append(
+            "\n⚠️ ПОПЕРЕДЖЕННЯ:"
+        )
+
+        for warning in warnings[:50]:
+
+            report_lines.append(
+                f"- {warning}"
+            )
+
+
+    if success:
+
+        report_lines.append(
+            "\n✅ Критичних помилок не знайдено."
+        )
+
+    else:
+
+        report_lines.append(
+            "\n❌ Сайт НЕ пройшов QA."
+        )
+
+
+    report = "\n".join(
+        report_lines
+    )
+
+
+    print(
+        "[QA RESULT]"
+    )
+
+    print(
+        report
+    )
+
+
+    return {
+
+        "success": success,
+
+        "report": report,
+
+        "errors": errors,
+
+        "warnings": warnings,
+
+    }
+
+
+# ============================================================
+# WEBSITE GENERATE + TEST + FIX
+# ============================================================
+
+async def generate_test_and_fix_website(
+    order: Order,
+    thread: discord.Thread
+):
+
+    # --------------------------------------------------------
+    # FIRST GENERATION
+    # --------------------------------------------------------
+
+    await thread.send(
+        "💻 **Генерую сайт...**"
+    )
+
+
+    html_code = await generate_site_code(
+        order.task
+    )
+
+
+    # --------------------------------------------------------
+    # AUTOMATIC QA LOOP
+    # --------------------------------------------------------
+
+    for attempt in range(
+        1,
+        MAX_WEBSITE_FIX_ATTEMPTS + 1
+    ):
+
+        await thread.send(
+
+            f"🧪 **Перевірка сайту "
+            f"{attempt}/{MAX_WEBSITE_FIX_ATTEMPTS}...**\n\n"
+
+            "🔍 Перевіряю завантаження, "
+            "JavaScript, кнопки, посилання "
+            "та форми."
+        )
+
+
+        # ----------------------------------------------------
+        # DEPLOY TEST VERSION
+        # ----------------------------------------------------
+
+        project_name = (
+
+            f"grox-job-"
+            f"{uuid.uuid4().hex[:12]}"
+
+        )
+
+
+        live_url = await deploy_to_vercel(
+
+            project_name,
+
+            html_code
+        )
+
+
+        if not live_url:
+
+            if attempt >= MAX_WEBSITE_FIX_ATTEMPTS:
+
+                raise RuntimeError(
+                    "Vercel не зміг виконати "
+                    "тестовий деплой."
+                )
+
+
+            await thread.send(
+                "⚠️ Тестовий деплой не вдався. "
+                "Повторюю."
+            )
+
+            continue
+
+
+        # ----------------------------------------------------
+        # RUN QA
+        # ----------------------------------------------------
+
+        qa_result = await test_website(
+            live_url
+        )
+
+
+        if qa_result["success"]:
+
+            await thread.send(
+
+                "✅ **QA-перевірку пройдено!**\n\n"
+
+                "Сайт відкривається, "
+                "критичних JavaScript-помилок "
+                "не знайдено.\n\n"
+
+                "🔒 Тепер сайт можна вважати "
+                "готовим до фінальної передачі."
+            )
+
+
+            order.site_url = live_url
+
+            order.site_code = html_code
+
+            return True
+
+
+        # ----------------------------------------------------
+        # FAILED
+        # ----------------------------------------------------
+
+        await thread.send(
+
+            f"❌ **QA знайшов проблеми.**\n\n"
+
+            f"🔧 Grox автоматично виправляє "
+            f"сайт через Gemini.\n\n"
+
+            f"Спроба: "
+            f"**{attempt}/{MAX_WEBSITE_FIX_ATTEMPTS}**"
+        )
+
+
+        if attempt >= MAX_WEBSITE_FIX_ATTEMPTS:
+
+            await thread.send(
+
+                "❌ **Сайт не пройшов автоматичну "
+                "перевірку після максимальної "
+                "кількості спроб.**\n\n"
+
+                "Фінальна передача заблокована."
+            )
+
+            return False
+
+
+        # ----------------------------------------------------
+        # GEMINI FIX
+        # ----------------------------------------------------
+
+        try:
+
+            html_code = await fix_site_code(
+
+                html_code,
+
+                qa_result["report"],
+
+                order.task
+            )
+
+
+        except Exception as error:
+
+            print(
+                "[WEBSITE FIX ERROR]"
+            )
+
+            print(
+                f"{type(error).__name__}: {error}"
+            )
+
+            traceback.print_exc()
+
+
+            await thread.send(
+
+                "❌ Gemini не зміг виправити "
+                "сайт автоматично.\n\n"
+
+                "Фінальна передача заблокована."
+            )
+
+            return False
+
+
+    return False
 
 
 # ============================================================
@@ -1423,7 +2159,6 @@ async def wait_for_price_approval(
 
 
     text = (
-
         approval_message.content
         .strip()
         .lower()
@@ -1483,28 +2218,26 @@ async def process_order(
 
     try:
 
-        # ----------------------------------------------------
-        # CREATE ORDER WITHOUT BUDGET
-        # ----------------------------------------------------
+        # ====================================================
+        # CREATE ORDER
+        # ====================================================
 
         order = create_order(
             message
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # CREATE THREAD
-        # ----------------------------------------------------
+        # ====================================================
 
         try:
 
             thread = await message.create_thread(
 
                 name=(
-
                     f"Grox Order #"
                     f"{order.order_id}"
-
                 ),
 
                 auto_archive_duration=1440
@@ -1527,7 +2260,6 @@ async def process_order(
         except Exception as error:
 
             print(
-
                 f"[THREAD ERROR] "
                 f"{type(error).__name__}: "
                 f"{error!r}"
@@ -1548,9 +2280,9 @@ async def process_order(
         order.thread_id = thread.id
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # GREETING
-        # ----------------------------------------------------
+        # ====================================================
 
         await thread.send(
 
@@ -1573,9 +2305,9 @@ async def process_order(
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # WAIT FOR TЗ
-        # ----------------------------------------------------
+        # ====================================================
 
         def check(
             msg: discord.Message
@@ -1626,14 +2358,13 @@ async def process_order(
         task = client_message.content.strip()
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # TASK VALIDATION
-        # ----------------------------------------------------
+        # ====================================================
 
         if not task:
 
             await thread.send(
-
                 "❌ ТЗ не може бути порожнім."
             )
 
@@ -1656,18 +2387,18 @@ async def process_order(
         order.task = task
 
 
-        # ----------------------------------------------------
-        # OPTIONAL CLIENT BUDGET
-        # ----------------------------------------------------
+        # ====================================================
+        # CLIENT BUDGET
+        # ====================================================
 
         order.client_budget = extract_budget(
             task
         )
 
 
-        # ----------------------------------------------------
-        # ANALYZE PROJECT
-        # ----------------------------------------------------
+        # ====================================================
+        # ANALYZE
+        # ====================================================
 
         await thread.send(
 
@@ -1722,9 +2453,9 @@ async def process_order(
             return
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # SAVE ESTIMATION
-        # ----------------------------------------------------
+        # ====================================================
 
         order.project_type = (
             estimation["type"]
@@ -1756,21 +2487,20 @@ async def process_order(
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # SHOW PRICE
-        # ----------------------------------------------------
+        # ====================================================
 
         await thread.send(
-
             price_status_message(
                 order
             )
         )
 
 
-        # ----------------------------------------------------
-        # WAIT FOR CLIENT APPROVAL
-        # ----------------------------------------------------
+        # ====================================================
+        # PRICE APPROVAL
+        # ====================================================
 
         approved = await wait_for_price_approval(
 
@@ -1785,14 +2515,14 @@ async def process_order(
             return
 
 
-        # ----------------------------------------------------
-        # PRICE APPROVED
-        # ----------------------------------------------------
-
         order.status = (
             "WAITING_DEPOSIT"
         )
 
+
+        # ====================================================
+        # PRICE APPROVED + PAYMENT ADDRESS
+        # ====================================================
 
         await thread.send(
 
@@ -1805,13 +2535,25 @@ async def process_order(
             f"**${order.deposit}**\n"
 
             f"💵 Після завершення: "
-            f"**${order.remaining}**"
+            f"**${order.remaining}**\n\n"
+
+            f"💳 **Для початку роботи "
+            f"необхідна передоплата.**\n\n"
+
+            f"🏦 **Адреса для оплати:**\n"
+            f"`{CRYPTO_WALLET}`\n\n"
+
+            f"💰 **До оплати зараз: "
+            f"${order.deposit}**\n\n"
+
+            f"📋 Після оплати надішліть "
+            f"підтвердження."
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # FIRST PAYMENT
-        # ----------------------------------------------------
+        # ====================================================
 
         await wait_for_test_payment(
 
@@ -1837,9 +2579,9 @@ async def process_order(
             )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # START WORK
-        # ----------------------------------------------------
+        # ====================================================
 
         await thread.send(
 
@@ -1850,9 +2592,9 @@ async def process_order(
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # PROJECT TYPE DETECTION
-        # ----------------------------------------------------
+        # ====================================================
 
         task_lower = task.lower()
 
@@ -1874,23 +2616,19 @@ async def process_order(
         )
 
 
-        # ----------------------------------------------------
-        # WEBSITE GENERATION
-        # ----------------------------------------------------
+        # ====================================================
+        # WEBSITE
+        # ====================================================
 
         if website_project:
 
-            await thread.send(
-
-                "💻 **Генерую сайт...**"
-            )
-
-
             try:
 
-                html_code = await generate_site_code(
-
-                    order.task
+                success = await (
+                    generate_test_and_fix_website(
+                        order,
+                        thread
+                    )
                 )
 
 
@@ -1901,7 +2639,7 @@ async def process_order(
                 )
 
                 print(
-                    "[WEBSITE GENERATION ERROR]"
+                    "[WEBSITE PROCESS ERROR]"
                 )
 
                 print(
@@ -1921,66 +2659,23 @@ async def process_order(
 
                 await thread.send(
 
-                    "❌ **Не вдалося "
-                    "згенерувати сайт.**\n\n"
+                    "❌ **Не вдалося завершити "
+                    "генерацію або перевірку сайту.**\n\n"
 
-                    "Технічна помилка записана "
-                    "в Render Logs."
+                    "🔒 Фінальна передача заблокована."
                 )
 
                 return
 
 
-            # ------------------------------------------------
-            # VERCEL
-            # ------------------------------------------------
-
-            project_name = (
-
-                f"grox-job-"
-                f"{uuid.uuid4().hex[:12]}"
-
-            )
-
-
-            await thread.send(
-
-                "🚀 **Код готовий.**\n\n"
-
-                "☁️ Виконую автоматичний "
-                "деплой на Vercel..."
-            )
-
-
-            live_url = await deploy_to_vercel(
-
-                project_name,
-
-                html_code
-            )
-
-
-            if not live_url:
-
-                await thread.send(
-
-                    "⚠️ Код сайту згенерований, "
-                    "але Vercel не повернув "
-                    "адресу деплою.\n\n"
-
-                    "Фінальна передача "
-                    "залишається заблокованою."
-                )
+            if not success:
 
                 return
 
 
-            order.site_url = live_url
-
-
-        # ----------------------------------------------------
+        # ====================================================
         # DISCORD BOT
-        # ----------------------------------------------------
+        # ====================================================
 
         elif any(
 
@@ -1999,26 +2694,22 @@ async def process_order(
 
             await thread.send(
 
-                "🤖 **Проєкт Discord-бота "
-                "підготовлений до розробки.**\n\n"
+                "🤖 **Замовлення Discord-бота "
+                "прийнято в роботу.**\n\n"
 
-                "Для складних ботів потрібне "
-                "окреме тестування та налаштування "
-                "середовища."
+                "⚠️ У цій версії Grox ще не "
+                "запускає сторонній згенерований "
+                "бот у своєму середовищі.\n\n"
+
+                "🔒 Фінальна передача буде "
+                "дозволена тільки після "
+                "завершення доступної перевірки."
             )
 
 
-            # У старій версії Grox не мав
-            # безпечного автоматичного деплою
-            # Discord-ботів.
-            #
-            # Тому НЕ будемо брехати клієнту,
-            # що бот вже запущений.
-
-
-        # ----------------------------------------------------
+        # ====================================================
         # OTHER PROJECT
-        # ----------------------------------------------------
+        # ====================================================
 
         else:
 
@@ -2029,9 +2720,9 @@ async def process_order(
             )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # PROJECT READY
-        # ----------------------------------------------------
+        # ====================================================
 
         order.status = (
             "WAITING_FINAL_PAYMENT"
@@ -2046,22 +2737,22 @@ async def process_order(
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # SITE PREVIEW
-        # ----------------------------------------------------
+        # ====================================================
 
         if order.site_url:
 
             await thread.send(
 
-                f"🌐 **Попередній результат:**\n"
+                f"🌐 **Перевірений результат:**\n"
                 f"{order.site_url}"
             )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # SECOND PAYMENT
-        # ----------------------------------------------------
+        # ====================================================
 
         await wait_for_test_payment(
 
@@ -2087,9 +2778,9 @@ async def process_order(
             )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # COMPLETED
-        # ----------------------------------------------------
+        # ====================================================
 
         print(
 
@@ -2196,6 +2887,11 @@ async def on_ready():
     )
 
     print(
+        f"🏦 Payment wallet: "
+        f"{CRYPTO_WALLET}"
+    )
+
+    print(
         f"💰 Minimum project price: "
         f"${MINIMUM_PROJECT_PRICE}"
     )
@@ -2203,6 +2899,16 @@ async def on_ready():
     print(
         f"💰 Maximum project price: "
         f"${MAXIMUM_BUDGET}"
+    )
+
+    print(
+        f"🧪 Website QA enabled: "
+        f"YES"
+    )
+
+    print(
+        f"🔧 Max website fix attempts: "
+        f"{MAX_WEBSITE_FIX_ATTEMPTS}"
     )
 
     print(
@@ -2276,7 +2982,6 @@ async def health_handler(
 ):
 
     return web.Response(
-
         text="Grox is running! 🤖"
     )
 
@@ -2287,9 +2992,7 @@ async def start_health_server():
 
 
     app.router.add_get(
-
         "/",
-
         health_handler
     )
 
@@ -2337,7 +3040,6 @@ async def main():
 
 
     health_runner = (
-
         await start_health_server()
     )
 
