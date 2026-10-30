@@ -2,7 +2,6 @@ import asyncio
 import os
 import re
 import uuid
-import traceback
 import random
 import base64
 import json
@@ -15,6 +14,18 @@ import discord
 from discord.ext import commands
 
 from playwright.async_api import async_playwright
+from grox_core import (
+    classify_project_type,
+    contains_secret_like_value,
+    extract_budget,
+    has_budget_information,
+    is_infrastructure_qa_failure,
+    is_retryable_deploy_status,
+    is_retryable_status,
+    retry_delay,
+    sanitize_sensitive_text,
+    validate_generated_files,
+)
 
 
 
@@ -85,6 +96,10 @@ GROQ_RETRIES = int(
     os.getenv("GROQ_RETRIES", os.getenv("GEMINI_RETRIES", "4"))
 )
 
+GROQ_CONCURRENCY = max(1, int(os.getenv("GROQ_CONCURRENCY", "2")))
+VERCEL_RETRIES = max(0, int(os.getenv("VERCEL_RETRIES", "2")))
+RENDER_HEALTH_TIMEOUT = int(os.getenv("RENDER_HEALTH_TIMEOUT", "300"))
+
 MAX_WEBSITE_FIX_ATTEMPTS = 10
 
 # How often the approval/payment state is checked.
@@ -98,7 +113,6 @@ STATE_CHECK_INTERVAL = 1
 required_variables = {
     "DISCORD_TOKEN": DISCORD_TOKEN,
     "GROQ_API_KEY": GROQ_API_KEY,
-    "VERCEL_TOKEN": VERCEL_TOKEN,
     "CLIENT_CHANNEL_ID": CLIENT_CHANNEL_ID,
 }
 
@@ -168,7 +182,7 @@ class Order:
     complexity: str = ""
     price_reason: str = ""
 
-    client_budget: int | None = None
+    client_budget: str | None = None
     client_approved_price: bool = False
 
     site_url: str | None = None
@@ -378,45 +392,6 @@ def is_order_message(text: str) -> bool:
 # OPTIONAL CLIENT BUDGET
 # ============================================================
 
-BUDGET_PATTERN = re.compile(
-    r"""
-    (?:
-        \$\s*(\d[\d\s,\.]*)
-        |
-        (\d[\d\s,\.]*)\s*\$
-        |
-        (\d[\d\s,\.]*)\s*
-        (?:usd|dollars?|долар(?:ів|и)?)
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE
-)
-
-
-def extract_budget(text: str):
-    match = BUDGET_PATTERN.search(text)
-
-    if not match:
-        return None
-
-    for group in match.groups():
-        if group:
-            try:
-                cleaned = (
-                    group
-                    .replace(" ", "")
-                    .replace(",", "")
-                    .replace(".", "")
-                )
-
-                return int(cleaned)
-
-            except ValueError:
-                return None
-
-    return None
-
-
 # ============================================================
 # PAYMENT TEST SYSTEM
 # ============================================================
@@ -433,12 +408,47 @@ def extract_budget(text: str):
 # GROQ REQUEST
 # ============================================================
 
+class ProviderHTTPError(RuntimeError):
+    def __init__(
+        self,
+        provider: str,
+        status: int,
+        message: str,
+        retry_after: str | None = None,
+    ):
+        self.provider = provider
+        self.status = status
+        self.retry_after = retry_after
+        safe_message = sanitize_sensitive_text(message)[:500]
+        super().__init__(
+            f"{provider} API HTTP {status}: {safe_message}"
+        )
+
+
+def provider_retry_delay(
+    retry_after: str | None,
+    attempt: int
+) -> float:
+    delay = retry_delay(retry_after, attempt)
+    if retry_after:
+        return delay
+    return min(60.0, delay + random.uniform(0.1, min(1.0, delay * 0.25)))
+
+
+_groq_semaphore: asyncio.Semaphore | None = None
+
+
 async def groq_request(
     prompt: str,
     max_output_tokens: int
 ):
+    global _groq_semaphore
+
     last_error = None
     total_attempts = max(1, GROQ_RETRIES + 1)
+
+    if _groq_semaphore is None:
+        _groq_semaphore = asyncio.Semaphore(GROQ_CONCURRENCY)
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -451,66 +461,89 @@ async def groq_request(
     }
     timeout = aiohttp.ClientTimeout(total=CLIENT_TIMEOUT)
 
-    for attempt in range(1, total_attempts + 1):
-        try:
-            print(
-                f"[GROQ] Attempt {attempt}/{total_attempts} "
-                f"model={GROQ_MODEL}"
-            )
+    async with _groq_semaphore:
+        for attempt in range(1, total_attempts + 1):
+            retry_after = None
+            try:
+                print(
+                    f"[GROQ] Attempt {attempt}/{total_attempts} "
+                    f"model={GROQ_MODEL}"
+                )
 
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                ) as response:
-                    response_text = await response.text()
-                    try:
-                        data = json.loads(response_text)
-                    except json.JSONDecodeError:
-                        data = {}
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    ) as response:
+                        response_text = await response.text()
+                        try:
+                            data = json.loads(response_text)
+                        except json.JSONDecodeError:
+                            data = {}
 
-                    if response.status >= 400:
-                        error_message = data.get("error", {}).get("message", response_text)
-                        raise RuntimeError(
-                            f"Groq API HTTP {response.status}: {error_message}"
+                        if response.status >= 400:
+                            provider_error = data.get("error")
+                            if isinstance(provider_error, dict):
+                                error_message = provider_error.get(
+                                    "message",
+                                    response_text
+                                )
+                            else:
+                                error_message = response_text
+                            raise ProviderHTTPError(
+                                "Groq",
+                                response.status,
+                                str(error_message),
+                                response.headers.get("Retry-After"),
+                            )
+
+                        choices = data.get("choices") or []
+                        content = (
+                            choices[0].get("message", {}).get("content")
+                            if choices else None
                         )
+                        if not content or not content.strip():
+                            raise RuntimeError(
+                                "Groq повернув порожню відповідь."
+                            )
 
-                    choices = data.get("choices") or []
-                    content = (
-                        choices[0].get("message", {}).get("content")
-                        if choices else None
+                        return content.strip()
+
+            except Exception as error:
+                last_error = error
+                safe_error = sanitize_sensitive_text(error)
+                print(
+                    f"[GROQ ERROR] Attempt {attempt}/{total_attempts}: "
+                    f"{type(error).__name__}: {safe_error}"
+                )
+
+                if isinstance(error, ProviderHTTPError):
+                    temporary = is_retryable_status(error.status)
+                    retry_after = error.retry_after
+                else:
+                    temporary = isinstance(
+                        error,
+                        (asyncio.TimeoutError, aiohttp.ClientError)
                     )
-                    if not content or not content.strip():
-                        raise RuntimeError("Groq повернув порожню відповідь.")
 
-                    return content.strip()
+                if not temporary:
+                    raise
+                if attempt >= total_attempts:
+                    break
 
-        except Exception as error:
-            last_error = error
-            print(
-                f"[GROQ ERROR] Attempt {attempt}/{total_attempts}: "
-                f"{type(error).__name__}: {error!r}"
-            )
-            error_text = str(error).lower()
-            temporary = any(code in error_text for code in (
-                "429", "rate limit", "resource exhausted", "503",
-                "unavailable", "temporarily", "deadline", "timeout",
-                "overloaded", "service unavailable", "502", "504",
-            ))
-            if not temporary:
-                traceback.print_exc()
-                raise
-            if attempt >= total_attempts:
-                break
-            delay = min(60, (2 ** (attempt - 1)) + random.uniform(0.5, 2.0))
-            print(f"[GROQ] Тимчасова помилка. Повтор через {delay:.1f}s...")
-            await asyncio.sleep(delay)
+                delay = provider_retry_delay(retry_after, attempt)
+                print(
+                    f"[GROQ] Тимчасова помилка. "
+                    f"Повтор через {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
 
     raise RuntimeError(
         f"Groq тимчасово недоступний після {total_attempts} спроб. "
-        f"Остання помилка: {type(last_error).__name__}: {last_error}"
-    )
+        f"Остання помилка: {type(last_error).__name__}: "
+        f"{sanitize_sensitive_text(last_error)}"
+    ) from None
 
 
 # ============================================================
@@ -605,8 +638,10 @@ async def discover_requirements(
     await thread.send(
         "🧠 **Добре, спочатку розберімося із завданням.**\n\n"
         "Я поставлю кілька коротких уточнень, якщо вони будуть потрібні. "
-        "Після цього сформую фінальне ТЗ і покажу вам ціну."
+        "Після цього сформую фінальне ТЗ і уточню бюджет."
     )
+
+    final_tz = ""
 
     for round_number in range(1, MAX_REQUIREMENT_ROUNDS + 1):
         analysis = await analyze_requirements(
@@ -614,7 +649,8 @@ async def discover_requirements(
         )
 
         if analysis["ready"] and analysis["final_tz"]:
-            return analysis["final_tz"]
+            final_tz = analysis["final_tz"]
+            break
 
         question = analysis["question"]
 
@@ -672,16 +708,64 @@ async def discover_requirements(
             "✅ **Зрозумів.**"
         )
 
-    # After the maximum number of rounds, ask Groq to create the
-    # best TЗ from information the client actually provided.
-    final_analysis = await analyze_requirements(
-        conversation
+    if not final_tz:
+        # After the maximum number of rounds, ask Groq to create the
+        # best TЗ from information the client actually provided.
+        final_analysis = await analyze_requirements(
+            conversation
+        )
+
+        final_tz = final_analysis["final_tz"]
+
+    if not final_tz:
+        final_tz = conversation
+
+    if has_budget_information(conversation):
+        order.client_budget = extract_budget(conversation)
+    else:
+        await thread.send(
+            "💰 **Ще одне уточнення:** який орієнтовний бюджет "
+            "ви плануєте на цей проєкт? Можна вказати суму й валюту "
+            "або відповісти, що бюджет поки не визначений."
+        )
+
+        def budget_check(msg: discord.Message):
+            return (
+                msg.author.id == order.client_id
+                and msg.channel.id == order.thread_id
+                and not msg.author.bot
+            )
+
+        try:
+            budget_reply = await bot.wait_for(
+                "message",
+                check=budget_check,
+                timeout=CLIENT_TIMEOUT
+            )
+            budget_answer = sanitize_sensitive_text(
+                budget_reply.content.strip()[:500]
+            )
+            order.client_budget = (
+                extract_budget(budget_answer)
+                or budget_answer
+                or "не зазначений"
+            )
+            conversation += (
+                f"\n\nКлієнт уточнив бюджет: "
+                f"{budget_answer or 'не зазначений'}"
+            )
+        except asyncio.TimeoutError:
+            order.client_budget = "не зазначений"
+            await thread.send(
+                "⏰ Не отримав відповідь про бюджет. "
+                "Продовжую з позначкою «не зазначений»."
+            )
+
+    final_tz += (
+        "\n\nБюджетний орієнтир клієнта: "
+        f"{order.client_budget or 'не зазначений'}"
     )
-
-    if final_analysis["final_tz"]:
-        return final_analysis["final_tz"]
-
-    return conversation
+    return final_tz
 
 
 
@@ -761,10 +845,16 @@ JavaScript повинен бути робочим.
 {client_task}
 """
 
-    return await groq_request(
+    html_code = await groq_request(
         prompt,
         max_output_tokens=30000
     )
+    if contains_secret_like_value(html_code):
+        raise RuntimeError(
+            "Згенерований HTML схожий на такий, що містить секрет; "
+            "деплой зупинено."
+        )
+    return html_code
 
 
 # ============================================================
@@ -813,10 +903,16 @@ async def fix_site_code(
 {html_code}
 """
 
-    return await groq_request(
+    html_code = await groq_request(
         prompt,
         max_output_tokens=30000
     )
+    if contains_secret_like_value(html_code):
+        raise RuntimeError(
+            "Виправлений HTML схожий на такий, що містить секрет; "
+            "деплой зупинено."
+        )
+    return html_code
 
 
 
@@ -873,10 +969,16 @@ async def revise_site_code(
 ПОВЕРНИ ПОВНУ ОНОВЛЕНУ ВЕРСІЮ САЙТУ.
 """
 
-    return await groq_request(
+    html_code = await groq_request(
         prompt,
         max_output_tokens=30000
     )
+    if contains_secret_like_value(html_code):
+        raise RuntimeError(
+            "Оновлений HTML схожий на такий, що містить секрет; "
+            "деплой зупинено."
+        )
+    return html_code
 
 
 async def revise_and_test_website(
@@ -900,10 +1002,23 @@ async def revise_and_test_website(
             f"{uuid.uuid4().hex[:12]}"
         )
 
-        live_url = await deploy_to_vercel(
-            project_name,
-            html_code
-        )
+        try:
+            live_url = await deploy_to_vercel(
+                project_name,
+                html_code
+            )
+        except Exception as error:
+            order.status = "DEPLOY_FAILED"
+            print(
+                f"[SITE REVISION DEPLOY ERROR] "
+                f"{type(error).__name__}: "
+                f"{sanitize_sensitive_text(error)}"
+            )
+            await thread.send(
+                "❌ Vercel не зміг розгорнути правку. Це помилка деплою, "
+                "а не коду сайту; повтори QA не витрачаю."
+            )
+            return False
 
         if not live_url:
             if attempt >= MAX_WEBSITE_FIX_ATTEMPTS:
@@ -915,6 +1030,16 @@ async def revise_and_test_website(
             continue
 
         qa_result = await test_website(live_url)
+
+        if is_infrastructure_qa_failure(qa_result):
+            await thread.send(
+                "⚠️ Не вдалося запустити браузерну QA через проблему "
+                "середовища або деплою. Код сайту не переписую і не "
+                "витрачаю спробу виправлення; перевірте Vercel/Render "
+                "і встановлення Chromium."
+            )
+            order.status = "QA_BLOCKED"
+            return False
 
         if qa_result["success"]:
             order.site_url = live_url
@@ -932,6 +1057,7 @@ async def revise_and_test_website(
         )
 
         if attempt >= MAX_WEBSITE_FIX_ATTEMPTS:
+            order.status = "QA_FAILED"
             await thread.send(
                 "❌ **Не вдалося стабільно завершити правку "
                 "після максимальної кількості спроб.**\n\n"
@@ -942,15 +1068,16 @@ async def revise_and_test_website(
         try:
             html_code = await fix_site_code(
                 html_code,
-                qa_result["report"],
+                sanitize_sensitive_text(qa_result["report"]),
                 order.task
             )
         except Exception as error:
+            order.status = "GENERATION_FAILED"
             print(
                 f"[REVISION FIX ERROR] "
-                f"{type(error).__name__}: {error!r}"
+                f"{type(error).__name__}: "
+                f"{sanitize_sensitive_text(error)}"
             )
-            traceback.print_exc()
             await thread.send(
                 "❌ Не вдалося автоматично виправити "
                 "сайт після правки."
@@ -1051,7 +1178,7 @@ async def post_delivery_conversation(
         print(
             f"[CLIENT FOLLOW-UP] "
             f"order=#{order.order_id} "
-            f"content={text!r}"
+            f"client={order.client_id}"
         )
 
         if order.site_code and is_revision_request(text):
@@ -1093,9 +1220,9 @@ async def post_delivery_conversation(
             except Exception as error:
                 print(
                     f"[CLIENT REVISION ERROR] "
-                    f"{type(error).__name__}: {error!r}"
+                    f"{type(error).__name__}: "
+                    f"{sanitize_sensitive_text(error)}"
                 )
-                traceback.print_exc()
                 await thread.send(
                     "❌ Сталася технічна помилка під час внесення правки. "
                     "Можете описати її ще раз."
@@ -1109,14 +1236,16 @@ async def post_delivery_conversation(
                 order,
                 text
             )
-            await thread.send(f"🤖 {reply}")
+            await thread.send(
+                f"🤖 {sanitize_sensitive_text(reply)}"
+            )
 
         except Exception as error:
             print(
                 f"[CLIENT CHAT ERROR] "
-                f"{type(error).__name__}: {error!r}"
+                f"{type(error).__name__}: "
+                f"{sanitize_sensitive_text(error)}"
             )
-            traceback.print_exc()
             await thread.send(
                 "🤖 Я тут. Уточніть, будь ласка, "
                 "що саме потрібно зробити або змінити."
@@ -1133,6 +1262,9 @@ async def deploy_to_vercel(
     project_name: str,
     html_content: str
 ):
+    if not VERCEL_TOKEN:
+        raise RuntimeError("VERCEL_TOKEN не налаштований.")
+
     url = (
         "https://api.vercel.com/v13/deployments"
     )
@@ -1170,69 +1302,84 @@ async def deploy_to_vercel(
         f"{project_name}"
     )
 
-    try:
-        async with aiohttp.ClientSession(
-            timeout=timeout
-        ) as session:
-            async with session.post(
-                url,
-                headers=headers,
-                json=payload
-            ) as response:
-                response_text = (
-                    await response.text()
-                )
+    total_attempts = max(1, VERCEL_RETRIES + 1)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt in range(1, total_attempts + 1):
+            try:
+                async with session.post(
+                    url,
+                    headers=headers,
+                    json=payload
+                ) as response:
+                    response_text = await response.text()
 
-                try:
-                    data = await response.json(
-                        content_type=None
-                    )
-                except Exception:
-                    data = {}
+                    if response.status in (200, 201):
+                        try:
+                            data = json.loads(response_text)
+                        except json.JSONDecodeError:
+                            data = {}
 
-                if response.status in (
-                    200,
-                    201
-                ):
-                    deployment_url = data.get(
-                        "url"
-                    )
-
-                    if deployment_url:
-                        if not deployment_url.startswith(
-                            "http"
-                        ):
-                            deployment_url = (
-                                "https://"
-                                + deployment_url
+                        deployment_url = data.get("url")
+                        if deployment_url:
+                            if not deployment_url.startswith("http"):
+                                deployment_url = "https://" + deployment_url
+                            print(
+                                f"[VERCEL] Deployment successful: "
+                                f"{deployment_url}"
                             )
+                            return deployment_url
 
-                        print(
-                            f"[VERCEL] "
-                            f"Deployment successful: "
-                            f"{deployment_url}"
+                        raise ProviderHTTPError(
+                            "Vercel",
+                            response.status,
+                            "Deployment response did not include a URL."
                         )
 
-                        return deployment_url
+                    error = ProviderHTTPError(
+                        "Vercel",
+                        response.status,
+                        response_text,
+                        response.headers.get("Retry-After"),
+                    )
+                    # A 429 is explicitly rejected and safe to retry.
+                    # Do not blindly repeat a deployment POST after a 5xx:
+                    # Vercel may have accepted it before returning an error.
+                    retryable = is_retryable_deploy_status(
+                        response.status
+                    )
+                    if not retryable or attempt >= total_attempts:
+                        raise error
 
-                print(
-                    f"[VERCEL ERROR] "
-                    f"HTTP {response.status}: "
-                    f"{response_text}"
-                )
+                    delay = provider_retry_delay(
+                        error.retry_after,
+                        attempt
+                    )
+                    print(
+                        f"[VERCEL] HTTP {response.status}; retry "
+                        f"{attempt + 1}/{total_attempts} in {delay:.1f}s."
+                    )
+                    await asyncio.sleep(delay)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                safe_error = sanitize_sensitive_text(error)
+                if (
+                    isinstance(error, aiohttp.ClientConnectorError)
+                    and attempt < total_attempts
+                ):
+                    delay = provider_retry_delay(None, attempt)
+                    print(
+                        f"[VERCEL] Connection failed before request; "
+                        f"retry {attempt + 1}/{total_attempts} "
+                        f"in {delay:.1f}s."
+                    )
+                    await asyncio.sleep(delay)
+                    continue
 
-                return None
+                raise RuntimeError(
+                    f"Vercel request failed; automatic retry stopped "
+                    f"to avoid duplicate deployments: {safe_error}"
+                ) from None
 
-    except Exception as error:
-        print(
-            f"[VERCEL EXCEPTION] "
-            f"{type(error).__name__}: "
-            f"{error!r}"
-        )
-
-        traceback.print_exc()
-
-        return None
+    return None
 
 
 # ============================================================
@@ -1254,12 +1401,25 @@ async def test_website(url: str):
     button_count = 0
     link_count = 0
     form_count = 0
+    infrastructure_failure = False
+    browser = None
 
     try:
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(
-                headless=True
-            )
+            try:
+                browser = await playwright.chromium.launch(
+                    headless=True
+                )
+            except Exception as error:
+                return {
+                    "success": False,
+                    "category": "infrastructure",
+                    "report": (
+                        "QA-браузер не запустився. Перевірте "
+                        "встановлення Chromium у середовищі Render. "
+                        f"Деталі: {sanitize_sensitive_text(error)}"
+                    ),
+                }
 
             page = await browser.new_page()
 
@@ -1270,7 +1430,7 @@ async def test_website(url: str):
             def handle_console(msg):
                 if msg.type == "error":
                     console_errors.append(
-                        msg.text
+                        sanitize_sensitive_text(msg.text)
                     )
 
             page.on(
@@ -1284,7 +1444,8 @@ async def test_website(url: str):
 
             def handle_request_failed(request):
                 failed_requests.append(
-                    f"{request.method} {request.url} "
+                    f"{request.method} "
+                    f"{sanitize_sensitive_text(request.url)} "
                     f"-> {request.failure}"
                 )
 
@@ -1299,7 +1460,8 @@ async def test_website(url: str):
 
             def handle_page_error(error):
                 errors.append(
-                    f"JavaScript page error: {error}"
+                    "JavaScript page error: "
+                    f"{sanitize_sensitive_text(error)}"
                 )
 
             page.on(
@@ -1314,18 +1476,24 @@ async def test_website(url: str):
             try:
                 response = await page.goto(
                     url,
-                    wait_until="networkidle",
+                    wait_until="domcontentloaded",
                     timeout=30000
                 )
+                try:
+                    await page.wait_for_load_state(
+                        "networkidle",
+                        timeout=5000
+                    )
+                except Exception:
+                    pass
 
             except Exception as error:
-                await browser.close()
-
                 return {
                     "success": False,
+                    "category": "infrastructure",
                     "report": (
                         "Сайт не вдалося відкрити.\n"
-                        f"Помилка: {error}"
+                        f"Помилка: {sanitize_sensitive_text(error)}"
                     )
                 }
 
@@ -1338,6 +1506,8 @@ async def test_website(url: str):
                 errors.append(
                     f"HTTP помилка: {response.status}"
                 )
+                if response.status >= 500:
+                    infrastructure_failure = True
 
             # ------------------------------------------------
             # BASIC HTML CHECK
@@ -1467,7 +1637,8 @@ async def test_website(url: str):
                 except Exception as error:
                     errors.append(
                         f"Кнопка #{index + 1} "
-                        f"спричинила помилку: {error}"
+                        f"спричинила помилку: "
+                        f"{sanitize_sensitive_text(error)}"
                     )
 
             # ------------------------------------------------
@@ -1510,7 +1681,7 @@ async def test_website(url: str):
                     warnings.append(
                         f"Не вдалося перевірити "
                         f"посилання #{index + 1}: "
-                        f"{error}"
+                        f"{sanitize_sensitive_text(error)}"
                     )
 
             # ------------------------------------------------
@@ -1552,23 +1723,26 @@ async def test_website(url: str):
                     errors.append(
                         f"Помилка перевірки "
                         f"форми #{index + 1}: "
-                        f"{error}"
+                        f"{sanitize_sensitive_text(error)}"
                     )
 
-            await browser.close()
-
     except Exception as error:
-        traceback.print_exc()
-
         return {
             "success": False,
+            "category": "infrastructure",
             "report": (
                 "QA-система не змогла завершити "
                 "перевірку.\n"
                 f"Помилка: {type(error).__name__}: "
-                f"{error}"
+                f"{sanitize_sensitive_text(error)}"
             )
         }
+    finally:
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
     # ========================================================
     # RESULT
@@ -1616,20 +1790,23 @@ async def test_website(url: str):
             "\n❌ Сайт НЕ пройшов QA."
         )
 
-    report = "\n".join(
-        report_lines
+    report = sanitize_sensitive_text(
+        "\n".join(report_lines)
     )
 
     print(
         "[QA RESULT]"
     )
 
-    print(
-        report
-    )
+    print(sanitize_sensitive_text(report))
 
     return {
         "success": success,
+        "category": (
+            "infrastructure"
+            if infrastructure_failure
+            else "code"
+        ),
         "report": report,
         "errors": errors,
         "warnings": warnings,
@@ -1652,9 +1829,20 @@ async def generate_test_and_fix_website(
         "💻 **Генерую сайт...**"
     )
 
-    html_code = await generate_site_code(
-        order.task
-    )
+    try:
+        html_code = await generate_site_code(order.task)
+    except Exception as error:
+        order.status = "GENERATION_FAILED"
+        print(
+            f"[SITE GENERATION ERROR] "
+            f"{type(error).__name__}: "
+            f"{sanitize_sensitive_text(error)}"
+        )
+        await thread.send(
+            "❌ Groq не зміг створити код сайту. Деплой і браузерну "
+            "QA не запускав; перевірте Groq credentials або ліміти."
+        )
+        return False
 
     # --------------------------------------------------------
     # AUTOMATIC QA LOOP
@@ -1681,10 +1869,24 @@ async def generate_test_and_fix_website(
             f"{uuid.uuid4().hex[:12]}"
         )
 
-        live_url = await deploy_to_vercel(
-            project_name,
-            html_code
-        )
+        try:
+            live_url = await deploy_to_vercel(
+                project_name,
+                html_code
+            )
+        except Exception as error:
+            order.status = "DEPLOY_FAILED"
+            print(
+                f"[SITE DEPLOY ERROR] "
+                f"{type(error).__name__}: "
+                f"{sanitize_sensitive_text(error)}"
+            )
+            await thread.send(
+                "❌ Vercel не зміг розгорнути сайт. Це помилка деплою, "
+                "а не згенерованого коду; QA/fix-спроби не витрачав. "
+                "Перевірте Vercel credentials або тимчасові ліміти."
+            )
+            return False
 
         if not live_url:
             if attempt >= MAX_WEBSITE_FIX_ATTEMPTS:
@@ -1707,6 +1909,16 @@ async def generate_test_and_fix_website(
         qa_result = await test_website(
             live_url
         )
+
+        if is_infrastructure_qa_failure(qa_result):
+            await thread.send(
+                "⚠️ Браузерна QA заблокована проблемою середовища "
+                "або деплою. Я не переписую код сайту й не витрачаю "
+                "спробу виправлення; перевірте Vercel/Render та "
+                "встановлення Chromium."
+            )
+            order.status = "QA_BLOCKED"
+            return False
 
         if qa_result["success"]:
             await thread.send(
@@ -1752,7 +1964,7 @@ async def generate_test_and_fix_website(
         try:
             html_code = await fix_site_code(
                 html_code,
-                qa_result["report"],
+                sanitize_sensitive_text(qa_result["report"]),
                 order.task
             )
 
@@ -1762,28 +1974,15 @@ async def generate_test_and_fix_website(
             )
 
             print(
-                f"{type(error).__name__}: {error}"
+                f"{type(error).__name__}: "
+                f"{sanitize_sensitive_text(error)}"
             )
-
-            traceback.print_exc()
-
-            if attempt >= MAX_WEBSITE_FIX_ATTEMPTS:
-                await thread.send(
-                    "❌ Groq не зміг виправити "
-                    "сайт після максимальної "
-                    "кількості спроб.\n\n"
-                    "Фінальна передача заблокована."
-                )
-                return False
-
+            order.status = "GENERATION_FAILED"
             await thread.send(
-                "⚠️ Groq не зміг виконати "
-                "виправлення на цій спробі.\n\n"
-                f"🔄 Повторюю. Наступна спроба: "
-                f"{attempt + 1}/{MAX_WEBSITE_FIX_ATTEMPTS}"
+                "❌ Groq не зміг згенерувати виправлений код. "
+                "Не витрачаю решту QA-спроб і не передаю сайт як готовий."
             )
-
-            continue
+            return False
 
     return False
 
@@ -1840,8 +2039,11 @@ def detect_bot_platform(task: str) -> str:
     return "Software bot"
 
 
-async def generate_software_project(client_task: str):
-    platform = detect_bot_platform(client_task)
+async def generate_software_project(
+    client_task: str,
+    platform_override: str | None = None
+):
+    platform = platform_override or detect_bot_platform(client_task)
 
     prompt = f"""
 Ти — senior software developer системи Grox.
@@ -1866,6 +2068,12 @@ async def generate_software_project(client_task: str):
 - Для Discord використовуй discord.py.
 - Для Discord-бота ОБОВЯЗКОВО читай токен тільки з `DISCORD_TOKEN`.
   Не вставляй токен у код, README, логи або GitHub.
+- Створи liveness endpoint `/healthz`, який повертає HTTP 200,
+  якщо HTTP-сервер працює, незалежно від тимчасового стану Discord.
+  Render повинен перевіряти саме `/healthz`, щоб не перезапускати процес
+  під час перепідключення до Discord.
+- Створи readiness endpoint `/readyz`: HTTP 200 лише після
+  `bot.is_ready()`, і HTTP 503 до підключення Discord.
 - Для Telegram використовуй Telegram Bot API/aiogram, якщо ТЗ стосується
   звичайного Telegram-бота. Якщо ТЗ прямо потребує пошуку публічних
   Telegram-спільнот через MTProto, використовуй Telethon і передбач
@@ -1935,6 +2143,16 @@ async def generate_software_project(client_task: str):
             "(main.py + requirements.txt)."
         )
 
+    validation_issues = validate_generated_files(
+        files,
+        expected_platform=platform
+    )
+    if validation_issues:
+        raise RuntimeError(
+            "Згенерований проєкт не пройшов статичну перевірку: "
+            + ", ".join(validation_issues)
+        )
+
     return files
 
 
@@ -1987,7 +2205,8 @@ async def github_upsert_file(
             elif response.status != 404:
                 body = await response.text()
                 raise RuntimeError(
-                    f"GitHub GET failed HTTP {response.status}: {body}"
+                    f"GitHub GET failed HTTP {response.status}: "
+                    f"{sanitize_sensitive_text(body)[:500]}"
                 )
 
         payload = {
@@ -2010,7 +2229,8 @@ async def github_upsert_file(
 
             if response.status not in (200, 201):
                 raise RuntimeError(
-                    f"GitHub PUT failed HTTP {response.status}: {body}"
+                    f"GitHub PUT failed HTTP {response.status}: "
+                    f"{sanitize_sensitive_text(body)[:500]}"
                 )
 
             data = json.loads(body)
@@ -2057,7 +2277,8 @@ async def deploy_project_to_render(
             if response.status != 200:
                 raise RuntimeError(
                     f"Render owners request failed "
-                    f"HTTP {response.status}: {owners_body}"
+                    f"HTTP {response.status}: "
+                    f"{sanitize_sensitive_text(owners_body)[:500]}"
                 )
 
             owners_data = json.loads(owners_body)
@@ -2098,7 +2319,7 @@ async def deploy_project_to_render(
                 "startCommand": "python main.py",
                 "plan": "free",
                 "region": "frankfurt",
-                "healthCheckPath": "/",
+                "healthCheckPath": "/healthz",
             },
         }
 
@@ -2139,7 +2360,8 @@ async def deploy_project_to_render(
             if response.status not in (200, 201):
                 raise RuntimeError(
                     f"Render service creation failed "
-                    f"HTTP {response.status}: {body}"
+                    f"HTTP {response.status}: "
+                    f"{sanitize_sensitive_text(body)[:500]}"
                 )
 
             data = json.loads(body)
@@ -2152,6 +2374,45 @@ async def deploy_project_to_render(
         "url": service.get("url"),
         "name": service.get("name", service_name),
     }
+
+
+async def wait_for_service_health(
+    service_url: str,
+    timeout_seconds: int = RENDER_HEALTH_TIMEOUT
+) -> bool:
+    if not service_url:
+        return False
+
+    readiness_url = (
+        service_url.rstrip("/") + "/readyz"
+    )
+
+    deadline = (
+        asyncio.get_running_loop().time()
+        + max(1, timeout_seconds)
+    )
+    delay = 2.0
+
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            request_timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(
+                timeout=request_timeout
+            ) as session:
+                async with session.get(readiness_url) as response:
+                    if response.status == 200:
+                        return True
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+
+        await asyncio.sleep(min(delay, remaining))
+        delay = min(15.0, delay * 2)
+
+    return False
 
 
 async def build_and_deploy_software_bot(
@@ -2177,7 +2438,11 @@ async def build_and_deploy_software_bot(
     # A Discord bot cannot work after deployment without its own token.
     # Keep this token in Grox's Render Environment and inject it into the
     # generated Render service only when the generated project is Discord.
-    generated_platform = detect_bot_platform(order.task)
+    platform_override = {
+        "discord_bot": "Discord",
+        "telegram_bot": "Telegram",
+    }.get(order.project_type)
+    generated_platform = platform_override or detect_bot_platform(order.task)
 
     if generated_platform == "Discord" and not GENERATED_DISCORD_TOKEN:
         await thread.send(
@@ -2193,9 +2458,23 @@ async def build_and_deploy_software_bot(
         "🧠 Створюю код, залежності та інструкції."
     )
 
-    files = await generate_software_project(
-        order.task
-    )
+    try:
+        files = await generate_software_project(
+            order.task,
+            platform_override=platform_override
+        )
+    except Exception as error:
+        order.status = "GENERATION_FAILED"
+        print(
+            f"[SOFTWARE GENERATION ERROR] "
+            f"{type(error).__name__}: "
+            f"{sanitize_sensitive_text(error)}"
+        )
+        await thread.send(
+            "❌ Не вдалося згенерувати або статично перевірити код. "
+            "GitHub і Render не змінював; готовий результат не передаю."
+        )
+        return False
 
     root_dir = (
         f"generated_projects/"
@@ -2206,13 +2485,26 @@ async def build_and_deploy_software_bot(
         "📦 **Публікую проєкт у GitHub...**"
     )
 
-    for filename, content in files.items():
-        await github_upsert_file(
-            root_dir,
-            f"{root_dir}/{filename}",
-            content,
-            f"Grox: generate order #{order.order_id} - {filename}"
+    try:
+        for filename, content in files.items():
+            await github_upsert_file(
+                root_dir,
+                f"{root_dir}/{filename}",
+                content,
+                f"Grox: generate order #{order.order_id} - {filename}"
+            )
+    except Exception as error:
+        order.status = "PUBLISH_FAILED"
+        print(
+            f"[GITHUB PUBLISH ERROR] "
+            f"{type(error).__name__}: "
+            f"{sanitize_sensitive_text(error)}"
         )
+        await thread.send(
+            "❌ Не вдалося повністю опублікувати проєкт у GitHub. "
+            "Render не запускав; передача результату заблокована."
+        )
+        return False
 
     order.project_repo_path = root_dir
 
@@ -2224,17 +2516,39 @@ async def build_and_deploy_software_bot(
     if generated_platform == "Discord":
         render_env["DISCORD_TOKEN"] = GENERATED_DISCORD_TOKEN
 
-    render_info = await deploy_project_to_render(
-        f"grox-order-{order.order_id}",
-        root_dir,
-        extra_env=render_env
-    )
+    try:
+        render_info = await deploy_project_to_render(
+            f"grox-order-{order.order_id}",
+            root_dir,
+            extra_env=render_env
+        )
+    except Exception as error:
+        order.status = "DEPLOY_FAILED"
+        print(
+            f"[RENDER DEPLOY ERROR] "
+            f"{type(error).__name__}: "
+            f"{sanitize_sensitive_text(error)}"
+        )
+        await thread.send(
+            "❌ Код опубліковано в GitHub, але Render не створив сервіс. "
+            "Це збій деплою, а не генерації коду; передачу не виконую."
+        )
+        return False
 
     order.render_service_id = render_info.get("id")
     order.deployment_url = render_info.get("url")
 
+    if not await wait_for_service_health(order.deployment_url or ""):
+        order.status = "QA_BLOCKED"
+        await thread.send(
+            "⚠️ Код опубліковано, але Render не підтвердив готовність "
+            "сервісу через health endpoint. Не позначаю замовлення "
+            "завершеним; перевірте deploy logs і конфігурацію Discord-токена."
+        )
+        return False
+
     message = (
-        "✅ **Програмний бот створений і відправлений у Render.**\n\n"
+        "✅ **Проєкт створений, перевірений і запущений у Render.**\n\n"
         f"📁 GitHub: `{GITHUB_REPO}/{root_dir}`\n"
     )
 
@@ -2305,10 +2619,8 @@ async def process_order(
             print(
                 f"[THREAD ERROR] "
                 f"{type(error).__name__}: "
-                f"{error!r}"
+                f"{sanitize_sensitive_text(error)}"
             )
-
-            traceback.print_exc()
 
             await message.channel.send(
                 f"{message.author.mention}, "
@@ -2336,12 +2648,10 @@ async def process_order(
             f"🤖 **Grox прийняв ваше замовлення.**\n\n"
             f"🆔 Замовлення: "
             f"**#{order.order_id}**\n\n"
-            f"💡 Вам не потрібно "
-            f"заздалегідь визначати ціну.\n\n"
+            f"💰 Ви можете вказати бюджет або сказати, що він "
+            f"ще не визначений.\n\n"
             f"📋 Надішліть детальне ТЗ.\n\n"
-            f"🧠 Grox проаналізує "
-            f"складність проєкту "
-            f"та запропонує справедливу ціну."
+            f"🧠 Grox уточнить вимоги й створить потрібний продукт."
         )
 
         # ====================================================
@@ -2391,6 +2701,57 @@ async def process_order(
             order.status = "ERROR"
             return
 
+        project_type = classify_project_type(first_task)
+
+        if project_type in ("mixed", "unsupported"):
+            if project_type == "mixed":
+                question = (
+                    "У запиті є і сайт, і бот. Який один продукт "
+                    "потрібно створити в цьому замовленні: сайт чи бот? "
+                    "Для обох продуктів створіть окремі замовлення."
+                )
+            else:
+                question = (
+                    "Зараз Grox створює сайти та програмних ботів. "
+                    "Що саме потрібно для цього замовлення: сайт чи бот?"
+                )
+
+            await thread.send(question)
+
+            def project_type_check(msg: discord.Message):
+                return (
+                    msg.author.id == order.client_id
+                    and msg.channel.id == order.thread_id
+                    and not msg.author.bot
+                )
+
+            try:
+                type_reply = await bot.wait_for(
+                    "message",
+                    check=project_type_check,
+                    timeout=CLIENT_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                await thread.send(
+                    "⏰ Не отримав уточнення типу продукту. "
+                    "Створіть нове замовлення, коли будете готові."
+                )
+                order.status = "EXPIRED"
+                return
+
+            project_type = classify_project_type(type_reply.content)
+            if project_type in ("mixed", "unsupported"):
+                await thread.send(
+                    "❌ Не вдалося однозначно визначити один продукт. "
+                    "Не запускаю генерацію й не позначаю замовлення "
+                    "завершеним. Створіть окреме замовлення для сайту "
+                    "або для бота."
+                )
+                order.status = "ERROR"
+                return
+
+        order.project_type = project_type
+
         # ====================================================
         # CONVERSATIONAL REQUIREMENT DISCOVERY
         # ====================================================
@@ -2412,32 +2773,33 @@ async def process_order(
 
         await thread.send(
             "📋 **Фінальне ТЗ сформовано.**\n\n"
-            "🧠 Тепер я оціню складність проєкту та "
-            "запропоную ціну."
+            "🧠 Тепер запускаю створення продукту "
+            "відповідно до обраного типу."
         )
 
         # ====================================================
         # CLIENT BUDGET
         # ====================================================
 
-        order.client_budget = extract_budget(
-            order.task
+        order.client_budget = (
+            order.client_budget
+            or extract_budget(order.task)
         )
 
         # ====================================================
         # START WORK — PRICE ESTIMATION DISABLED
         # ====================================================
 
-        order.project_type = "IT-проєкт"
         order.complexity = "Не оцінюється"
         order.price_reason = ""
         order.budget = 0
-        order.client_approved_price = True
+        order.client_approved_price = False
         order.status = "IN_PROGRESS"
 
         await thread.send(
             "✅ **Технічне завдання прийнято!**\n\n"
-            "💰 Grox не оцінює вартість і не запитує погодження ціни.\n"
+            "💰 Бюджет зафіксовано в ТЗ; автоматичну ціну Grox не "
+            "виставляє й не позначає її погодженою.\n"
             "🤖 Починаю виконання проєкту..."
         )
 
@@ -2445,25 +2807,20 @@ async def process_order(
         # PROJECT TYPE DETECTION
         # ====================================================
 
-        task_lower = order.task.casefold()
-
-        website_project = any(
-            keyword in task_lower
-            for keyword in (
-                "сайт",
-                "website",
-                "web",
-                "лендинг",
-                "landing",
-                "вебсайт",
-            )
-        )
-
         # ====================================================
         # WEBSITE
         # ====================================================
 
-        if website_project:
+        if order.project_type == "website":
+            if not VERCEL_TOKEN:
+                await thread.send(
+                    "❌ Для створення та перевірки сайту потрібен "
+                    "VERCEL_TOKEN у середовищі Grox. Інші типи "
+                    "замовлень від цієї змінної не залежать."
+                )
+                order.status = "ERROR"
+                return
+
             try:
                 success = await (
                     generate_test_and_fix_website(
@@ -2486,10 +2843,8 @@ async def process_order(
                 )
 
                 print(
-                    f"Message: {error!r}"
+                    f"Message: {sanitize_sensitive_text(error)}"
                 )
-
-                traceback.print_exc()
 
                 print(
                     "========================================"
@@ -2505,14 +2860,23 @@ async def process_order(
                 return
 
             if not success:
-                order.status = "QA_FAILED"
+                if order.status not in (
+                    "QA_BLOCKED",
+                    "DEPLOY_FAILED",
+                    "GENERATION_FAILED",
+                ):
+                    order.status = "QA_FAILED"
                 return
 
         # ====================================================
         # SOFTWARE BOT
         # ====================================================
 
-        elif is_software_bot_project(order.task):
+        elif order.project_type in (
+            "discord_bot",
+            "telegram_bot",
+            "software_bot",
+        ):
             try:
                 success = await build_and_deploy_software_bot(
                     order,
@@ -2530,14 +2894,15 @@ async def process_order(
                     f"Type: {type(error).__name__}"
                 )
                 print(
-                    f"Message: {error!r}"
+                    f"Message: {sanitize_sensitive_text(error)}"
                 )
-                traceback.print_exc()
                 print(
                     "========================================"
                 )
 
-                safe_error = str(error).replace("```", "'")[:1500]
+                safe_error = sanitize_sensitive_text(
+                    str(error).replace("```", "'")
+                )[:1500]
                 await thread.send(
                     "❌ **Не вдалося завершити створення "
                     "програмного бота.**\n\n"
@@ -2549,7 +2914,13 @@ async def process_order(
                 return
 
             if not success:
-                order.status = "ERROR"
+                if order.status not in (
+                    "GENERATION_FAILED",
+                    "PUBLISH_FAILED",
+                    "DEPLOY_FAILED",
+                    "QA_BLOCKED",
+                ):
+                    order.status = "ERROR"
                 return
 
         # ====================================================
@@ -2558,9 +2929,11 @@ async def process_order(
 
         else:
             await thread.send(
-                "🛠️ **Виконую проєкт "
-                "відповідно до ТЗ...**"
+                "❌ Grox не має перевіреного маршруту для цього типу "
+                "проєкту. Замовлення не позначаю завершеним."
             )
+            order.status = "ERROR"
+            return
 
         # ====================================================
         # PROJECT READY — PAYMENT TEMPORARILY DISABLED
@@ -2625,10 +2998,8 @@ async def process_order(
         )
 
         print(
-            f"Message: {error!r}"
+            f"Message: {sanitize_sensitive_text(error)}"
         )
-
-        traceback.print_exc()
 
         print(
             "========================================"
@@ -2643,6 +3014,8 @@ async def process_order(
 
         except Exception:
             pass
+
+        order.status = "ERROR"
 
     finally:
         active_orders.discard(
@@ -2735,9 +3108,8 @@ async def on_message(
 
     print(
         f"[ORDER DETECTED] "
-        f"{message.author} | "
-        f"Message: "
-        f"{message.content[:200]}"
+        f"client={message.author.id} "
+        f"message={message.id}"
     )
 
     asyncio.create_task(
@@ -2755,7 +3127,21 @@ async def health_handler(
     request
 ):
     return web.Response(
-        text="Grox is running! 🤖"
+        text="Grox process is running."
+    )
+
+
+async def readiness_handler(
+    request
+):
+    if not bot.is_ready():
+        return web.Response(
+            text="Grox is not connected to Discord yet.",
+            status=503
+        )
+
+    return web.Response(
+        text="Grox is ready."
     )
 
 
@@ -2765,6 +3151,14 @@ async def start_health_server():
     app.router.add_get(
         "/",
         health_handler
+    )
+    app.router.add_get(
+        "/healthz",
+        health_handler
+    )
+    app.router.add_get(
+        "/readyz",
+        readiness_handler
     )
 
     runner = web.AppRunner(
