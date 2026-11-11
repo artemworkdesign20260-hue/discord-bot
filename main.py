@@ -16,6 +16,11 @@ from discord.ext import commands
 
 from playwright.async_api import async_playwright
 
+from grox_core import (
+    generated_code_issues,
+    run_discord_start_with_retries,
+)
+
 
 
 # ============================================================
@@ -109,7 +114,6 @@ STATE_CHECK_INTERVAL = 1
 required_variables = {
     "DISCORD_TOKEN": DISCORD_TOKEN,
     "GROQ_API_KEY": GROQ_API_KEY,
-    "VERCEL_TOKEN": VERCEL_TOKEN,
     "CLIENT_CHANNEL_ID": CLIENT_CHANNEL_ID,
 }
 
@@ -1920,6 +1924,8 @@ def validate_generated_project(files: dict[str, str], bot2: bool = False) -> lis
                 f"Синтаксична помилка main.py: рядок {error.lineno}: {error.msg}."
             )
 
+    errors.extend(generated_code_issues(files, bot2=bot2))
+
     if not bot2 or not main_code:
         return errors
 
@@ -1981,6 +1987,8 @@ async def generate_software_project(client_task: str):
 - main.py має запускати health server паралельно з основним ботом.
 - Якщо credentials відсутні, повідомляй про це зрозуміло й без витоку секретів.
 - Якщо це Bot 2, суворо дотримуйся Discord-only вимог вище; не додавай інші платформи.
+- Не видавай mock/demo-дані, вигадані ID чи фальшиві URL за справжню функціональність.
+- Якщо потрібної API-доступності або дозволів немає, поясни обмеження й не публікуй недіючий результат.
 
 ПОВЕРНИ РІВНО ТРИ ФАЙЛИ В ТАКОМУ ФОРМАТІ:
 
@@ -2657,6 +2665,14 @@ async def process_order(
         # ====================================================
 
         if website_project:
+            if not VERCEL_TOKEN:
+                await thread.send(
+                    "❌ Для розгортання сайту потрібен VERCEL_TOKEN у Render Environment. "
+                    "Запити на створення ботів від цієї змінної не залежать."
+                )
+                order.status = "DEPLOY_FAILED"
+                return
+
             try:
                 success = await (
                     generate_test_and_fix_website(
@@ -2952,12 +2968,34 @@ async def health_handler(
     )
 
 
+async def readiness_handler(
+    request
+):
+    if not bot.is_ready():
+        return web.Response(
+            text="Grox is not connected to Discord yet.",
+            status=503,
+        )
+
+    return web.Response(
+        text="Grox is ready."
+    )
+
+
 async def start_health_server():
     app = web.Application()
 
     app.router.add_get(
         "/",
         health_handler
+    )
+    app.router.add_get(
+        "/healthz",
+        health_handler
+    )
+    app.router.add_get(
+        "/readyz",
+        readiness_handler
     )
 
     runner = web.AppRunner(
@@ -2986,6 +3024,24 @@ async def start_health_server():
 # MAIN
 # ============================================================
 
+async def start_discord_with_retries():
+    """Keep the HTTP health server alive while retrying transient login failures."""
+    await run_discord_start_with_retries(
+        bot.start,
+        DISCORD_TOKEN,
+        sleep=asyncio.sleep,
+        network_error=lambda error: isinstance(
+            error,
+            (aiohttp.ClientError, asyncio.TimeoutError, OSError),
+        ),
+        on_retry=lambda category, status, attempt, delay: print(
+            f"[DISCORD] Initial login failed ({category}, status={status}); "
+            f"retry {attempt} in {delay:.0f}s."
+        ),
+        jitter=lambda maximum: random.uniform(0, maximum),
+    )
+
+
 async def main():
     print(
         "🚀 Starting Grox..."
@@ -2996,9 +3052,7 @@ async def main():
     )
 
     try:
-        await bot.start(
-            DISCORD_TOKEN
-        )
+        await start_discord_with_retries()
 
     finally:
         await bot.close()
