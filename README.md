@@ -68,8 +68,8 @@ Grox ignores messages from every Discord account except the configured owner ID.
 
 - Build command: `pip install -r requirements.txt && playwright install chromium`
 - Start command: `python main.py`
-- Health endpoint: `/health`
-- Readiness endpoint: `/ready`
+- Liveness endpoints: `/` and `/healthz`
+- Readiness endpoint: `/readyz`
 
 ## Data persistence limitation
 
