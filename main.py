@@ -1559,77 +1559,33 @@ async def test_website(url: str):
             )
 
             # ------------------------------------------------
-            # TEST BUTTONS
+            # INSPECT BUTTONS WITHOUT CLICKING
+            #
+            # Clicking arbitrary buttons during QA can submit forms,
+            # purchase items, send messages, delete data, or trigger
+            # external side effects. Only inspect their presence and
+            # accessibility; never activate them automatically.
             # ------------------------------------------------
 
-            for index in range(
-                min(button_count, 30)
-            ):
+            visible_button_count = 0
+            for index in range(min(button_count, 100)):
                 try:
-                    button = buttons.nth(
-                        index
-                    )
-
-                    if not await button.is_visible():
-                        continue
-
-                    disabled = await button.is_disabled()
-
-                    if disabled:
-                        continue
-
-                    before_url = page.url
-
-                    before_text = await page.locator(
-                        "body"
-                    ).inner_text(
-                        timeout=3000
-                    )
-
-                    await button.scroll_into_view_if_needed()
-
-                    await button.click(
-                        timeout=5000
-                    )
-
-                    clicked_elements += 1
-
-                    await page.wait_for_timeout(
-                        500
-                    )
-
-                    after_text = await page.locator(
-                        "body"
-                    ).inner_text(
-                        timeout=3000
-                    )
-
-                    after_url = page.url
-
-                    if (
-                        before_url == after_url
-                        and before_text == after_text
-                    ):
-                        warnings.append(
-                            f"Кнопка #{index + 1} "
-                            f"не показала очевидної зміни "
-                            f"після натискання."
-                        )
-
-                    if before_url != after_url:
-                        try:
-                            await page.go_back(
-                                wait_until="networkidle",
-                                timeout=10000
+                    button = buttons.nth(index)
+                    if await button.is_visible():
+                        visible_button_count += 1
+                        if await button.is_disabled():
+                            warnings.append(
+                                f"Кнопка #{index + 1} вимкнена."
                             )
-                        except Exception:
-                            pass
-
                 except Exception as error:
-                    errors.append(
-                        f"Кнопка #{index + 1} "
-                        f"спричинила помилку: {error}"
+                    warnings.append(
+                        f"Не вдалося перевірити кнопку #{index + 1}: {error}"
                     )
+
+            print(
+                f"[QA] Visible buttons inspected without activation: "
+                f"{visible_button_count}"
+            )
 
             # ------------------------------------------------
             # TEST LINKS
