@@ -97,7 +97,7 @@ GROQ_RETRIES = int(
     os.getenv("GROQ_RETRIES", os.getenv("GEMINI_RETRIES", "4"))
 )
 
-MAX_WEBSITE_FIX_ATTEMPTS = 10
+MAX_WEBSITE_FIX_ATTEMPTS = 4
 
 # How often the approval/payment state is checked.
 STATE_CHECK_INTERVAL = 1
@@ -1420,7 +1420,6 @@ async def test_website(url: str):
     warnings = []
     console_errors = []
     failed_requests = []
-    clicked_elements = 0
 
     title = ""
     button_count = 0
@@ -1675,9 +1674,7 @@ async def test_website(url: str):
             # ------------------------------------------------
             # JAVASCRIPT CONSOLE ERRORS
             #
-            # Collected only AFTER the buttons were clicked, so errors
-            # raised by clicks are counted too (previously the list was
-            # copied once, right after page load).
+            # Collected after read-only inspection; no page controls are activated.
             # ------------------------------------------------
 
             for console_error in dict.fromkeys(console_errors):
@@ -1722,7 +1719,7 @@ async def test_website(url: str):
         f"URL: {url}",
         f"Title: {title}",
         f"Кнопок знайдено: {button_count}",
-        f"Кнопок натиснуто: {clicked_elements}",
+        "Кнопки автоматично не натискалися (безпечна read-only перевірка).",
         f"Посилань знайдено: {link_count}",
         f"Форм знайдено: {form_count}",
     ]
@@ -1808,8 +1805,8 @@ async def generate_test_and_fix_website(
             f"🧪 **Перевірка сайту "
             f"{attempt}/{MAX_WEBSITE_FIX_ATTEMPTS}...**\n\n"
             "🔍 Перевіряю завантаження, "
-            "JavaScript, кнопки, посилання "
-            "та форми."
+            "JavaScript, доступність кнопок, посилання "
+            "та структуру форм без натискання елементів."
         )
 
         # ----------------------------------------------------
