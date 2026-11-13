@@ -58,6 +58,7 @@ BOT2_DEPLOY_WAIT_SECONDS = int(os.getenv("BOT2_DEPLOY_WAIT_SECONDS", "600"))
 BOT2_HEALTH_POLL_INTERVAL = int(os.getenv("BOT2_HEALTH_POLL_INTERVAL", "15"))
 
 CLIENT_CHANNEL_ID = os.getenv("CLIENT_CHANNEL_ID")
+GROX_OWNER_ID = os.getenv("GROX_OWNER_ID", "").strip()
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
@@ -107,17 +108,8 @@ MAX_ACTIVE_ORDERS_PER_USER = int(
     os.getenv("MAX_ACTIVE_ORDERS_PER_USER", "3")
 )
 
-# Optional allow-list of Discord user IDs (comma/space separated) who may
-# trigger automatic GitHub + Render deployment of generated software bots.
-# If empty, automatic deployments are DENIED. This must be explicitly
-# configured because deployment uses the owner's GitHub/Render accounts.
-DEPLOY_ALLOWED_USER_IDS = {
-    int(item)
-    for item in re.findall(
-        r"\d+",
-        os.getenv("DEPLOY_ALLOWED_USER_IDS", "")
-    )
-}
+# Grox is a private, owner-only developer assistant. Every Discord action
+# and every deployment must originate from this single configured account.
 
 
 # ============================================================
@@ -128,6 +120,7 @@ required_variables = {
     "DISCORD_TOKEN": DISCORD_TOKEN,
     "GROQ_API_KEY": GROQ_API_KEY,
     "CLIENT_CHANNEL_ID": CLIENT_CHANNEL_ID,
+    "GROX_OWNER_ID": GROX_OWNER_ID,
 }
 
 missing_variables = [
@@ -150,6 +143,13 @@ except ValueError:
         "CLIENT_CHANNEL_ID повинен бути числом."
     )
 
+try:
+    GROX_OWNER_ID = int(GROX_OWNER_ID)
+except ValueError:
+    raise RuntimeError(
+        "GROX_OWNER_ID повинен бути Discord ID власника (лише цифри)."
+    )
+
 
 # ============================================================
 # GROQ CLIENT CONFIGURATION
@@ -160,11 +160,7 @@ if not GROQ_API_KEY:
 
 print(f"[GROQ] API configured. Model: {GROQ_MODEL}")
 
-if not DEPLOY_ALLOWED_USER_IDS:
-    print(
-        "[SECURITY] DEPLOY_ALLOWED_USER_IDS не задано: автоматичний "
-        "деплой програмних ботів заблоковано до явного налаштування allow-list."
-    )
+print(f"[SECURITY] Owner-only mode enabled for Discord user {GROX_OWNER_ID}.")
 
 
 # ============================================================
@@ -2613,16 +2609,10 @@ async def build_and_deploy_software_bot(
         )
         return False
 
-    if (
-        not DEPLOY_ALLOWED_USER_IDS
-        or order.client_id not in DEPLOY_ALLOWED_USER_IDS
-    ):
+    if order.client_id != GROX_OWNER_ID:
         await thread.send(
-            "🔒 **Автоматичне розгортання програмних ботів зараз закрите.**\n\n"
-            "Адміністратор Grox має налаштувати "
-            "`DEPLOY_ALLOWED_USER_IDS` і додати ваш Discord ID "
-            "до списку дозволених користувачів. "
-            "ТЗ збережено, але GitHub/Render не будуть змінюватися."
+            "🔒 Розгортання дозволене лише власнику Grox. "
+            "GitHub і Render не змінювалися."
         )
         return False
 
@@ -2734,6 +2724,9 @@ async def build_and_deploy_software_bot(
 async def process_order(
     message: discord.Message
 ):
+    if message.author.id != GROX_OWNER_ID:
+        return
+
     if message.id in active_orders:
         return
 
@@ -3214,6 +3207,12 @@ async def on_message(
     message: discord.Message
 ):
     if message.author.bot:
+        return
+
+    # Grox is a private assistant for its owner only. Ignore everyone else
+    # before command processing or order detection, so outsiders cannot use
+    # Groq, Vercel, GitHub, or Render resources.
+    if message.author.id != GROX_OWNER_ID:
         return
 
     # Always process commands first.
