@@ -109,8 +109,8 @@ MAX_ACTIVE_ORDERS_PER_USER = int(
 
 # Optional allow-list of Discord user IDs (comma/space separated) who may
 # trigger automatic GitHub + Render deployment of generated software bots.
-# If empty, ANY client can trigger it (old behaviour) — setting it is
-# strongly recommended because deployment uses your GitHub/Render accounts.
+# If empty, automatic deployments are DENIED. This must be explicitly
+# configured because deployment uses the owner's GitHub/Render accounts.
 DEPLOY_ALLOWED_USER_IDS = {
     int(item)
     for item in re.findall(
@@ -162,9 +162,8 @@ print(f"[GROQ] API configured. Model: {GROQ_MODEL}")
 
 if not DEPLOY_ALLOWED_USER_IDS:
     print(
-        "[SECURITY] DEPLOY_ALLOWED_USER_IDS не задано: будь-який клієнт "
-        "може запустити автоматичний деплой ботів у ваші GitHub/Render. "
-        "Рекомендується задати список довірених Discord ID."
+        "[SECURITY] DEPLOY_ALLOWED_USER_IDS не задано: автоматичний "
+        "деплой програмних ботів заблоковано до явного налаштування allow-list."
     )
 
 
@@ -2615,13 +2614,15 @@ async def build_and_deploy_software_bot(
         return False
 
     if (
-        DEPLOY_ALLOWED_USER_IDS
-        and order.client_id not in DEPLOY_ALLOWED_USER_IDS
+        not DEPLOY_ALLOWED_USER_IDS
+        or order.client_id not in DEPLOY_ALLOWED_USER_IDS
     ):
         await thread.send(
-            "🔒 **Автоматичне розгортання ботів доступне лише "
-            "довіреним користувачам.**\n\n"
-            "ТЗ збережено. Зверніться до адміністратора Grox."
+            "🔒 **Автоматичне розгортання програмних ботів зараз закрите.**\n\n"
+            "Адміністратор Grox має налаштувати "
+            "`DEPLOY_ALLOWED_USER_IDS` і додати ваш Discord ID "
+            "до списку дозволених користувачів. "
+            "ТЗ збережено, але GitHub/Render не будуть змінюватися."
         )
         return False
 
