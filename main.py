@@ -2,7 +2,6 @@ import asyncio
 import os
 import re
 import uuid
-import traceback
 import random
 import base64
 import json
@@ -64,6 +63,41 @@ BOT2_HEALTH_POLL_INTERVAL = int(os.getenv("BOT2_HEALTH_POLL_INTERVAL", "15"))
 
 CLIENT_CHANNEL_ID = os.getenv("CLIENT_CHANNEL_ID")
 GROX_OWNER_ID = os.getenv("GROX_OWNER_ID", "").strip()
+
+# ============================================================
+# SECRET REDACTION
+# ============================================================
+
+_SECRET_ENV_NAME_RE = re.compile(
+    r"(?:TOKEN|API_KEY|SECRET|PASSWORD|DATABASE_URL|API_HASH|PRIVATE_KEY)",
+    re.IGNORECASE,
+)
+_SECRET_VALUE_PATTERNS = (
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}", re.IGNORECASE),
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}", re.IGNORECASE),
+    re.compile(r"mfa\.[A-Za-z0-9_-]{20,}", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}(?![A-Za-z0-9])"),
+)
+
+
+def redact_sensitive_text(value) -> str:
+    """Remove configured secrets and common credential formats from diagnostics."""
+    result = str(value)
+    for name, secret in os.environ.items():
+        if _SECRET_ENV_NAME_RE.search(name) and secret and len(secret) >= 6:
+            result = result.replace(secret, "[REDACTED]")
+    for pattern in _SECRET_VALUE_PATTERNS:
+        result = pattern.sub("[REDACTED]", result)
+    return result
+
+
+def safe_exception(error: Exception) -> str:
+    """Return a diagnostic safe for logs and Discord; never dump raw exception data."""
+    return redact_sensitive_text(
+        safe_exception(error)
+    )[:1000]
+
+
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
@@ -682,7 +716,7 @@ async def groq_request(
             last_error = error
             print(
                 f"[GROQ ERROR] Attempt {attempt}/{total_attempts}: "
-                f"{type(error).__name__}: {error!r}"
+                safe_exception(error)
             )
             error_text = str(error).lower()
             # asyncio.TimeoutError and aiohttp network errors often have an
@@ -696,7 +730,7 @@ async def groq_request(
                 "overloaded", "service unavailable", "502", "504",
             ))
             if not temporary:
-                traceback.print_exc()
+                print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
                 raise
             if attempt >= total_attempts:
                 break
@@ -1205,9 +1239,9 @@ async def revise_and_test_website(
         except Exception as error:
             print(
                 f"[REVISION FIX ERROR] "
-                f"{type(error).__name__}: {error!r}"
+                safe_exception(error)
             )
-            traceback.print_exc()
+            print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
             await thread.send(
                 "❌ Не вдалося автоматично виправити "
                 "сайт після правки."
@@ -1351,9 +1385,9 @@ async def post_delivery_conversation(
             except Exception as error:
                 print(
                     f"[CLIENT REVISION ERROR] "
-                    f"{type(error).__name__}: {error!r}"
+                    safe_exception(error)
                 )
-                traceback.print_exc()
+                print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
                 await thread.send(
                     "❌ Сталася технічна помилка під час внесення правки. "
                     "Можете описати її ще раз."
@@ -1372,9 +1406,9 @@ async def post_delivery_conversation(
         except Exception as error:
             print(
                 f"[CLIENT CHAT ERROR] "
-                f"{type(error).__name__}: {error!r}"
+                safe_exception(error)
             )
-            traceback.print_exc()
+            print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
             await thread.send(
                 "🤖 Я тут. Уточніть, будь ласка, "
                 "що саме потрібно зробити або змінити."
@@ -1482,7 +1516,7 @@ async def deploy_to_vercel(
                 print(
                     f"[VERCEL ERROR] "
                     f"HTTP {response.status}: "
-                    f"{response_text}"
+                    redact_sensitive_text(response_text)
                 )
 
                 return None
@@ -1491,10 +1525,10 @@ async def deploy_to_vercel(
         print(
             f"[VERCEL EXCEPTION] "
             f"{type(error).__name__}: "
-            f"{error!r}"
+            redact_sensitive_text(error)
         )
 
-        traceback.print_exc()
+        print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
 
         return None
 
@@ -1718,7 +1752,7 @@ async def test_website(url: str):
                     warnings.append(
                         f"Не вдалося перевірити "
                         f"посилання #{index + 1}: "
-                        f"{error}"
+                        redact_sensitive_text(error)
                     )
 
             # ------------------------------------------------
@@ -1760,7 +1794,7 @@ async def test_website(url: str):
                     errors.append(
                         f"Помилка перевірки "
                         f"форми #{index + 1}: "
-                        f"{error}"
+                        redact_sensitive_text(error)
                     )
 
             # ------------------------------------------------
@@ -1787,7 +1821,7 @@ async def test_website(url: str):
             await browser.close()
 
     except Exception as error:
-        traceback.print_exc()
+        print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
 
         return {
             "success": False,
@@ -1795,7 +1829,7 @@ async def test_website(url: str):
                 "QA-система не змогла завершити "
                 "перевірку.\n"
                 f"Помилка: {type(error).__name__}: "
-                f"{error}"
+                redact_sensitive_text(error)
             )
         }
 
@@ -1992,10 +2026,10 @@ async def generate_test_and_fix_website(
             )
 
             print(
-                f"{type(error).__name__}: {error}"
+                safe_exception(error)
             )
 
-            traceback.print_exc()
+            print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
 
             if attempt >= MAX_WEBSITE_FIX_ATTEMPTS:
                 await thread.send(
@@ -2460,7 +2494,7 @@ async def github_upsert_file(
             elif response.status != 404:
                 body = await response.text()
                 raise RuntimeError(
-                    f"GitHub GET failed HTTP {response.status}: {body}"
+                    f"GitHub GET failed HTTP {response.status}; відповідь API приховано."
                 )
 
         payload = {
@@ -2483,7 +2517,7 @@ async def github_upsert_file(
             body = await response.text()
 
         if status not in (200, 201):
-            message = f"GitHub PUT failed HTTP {status}: {body}"
+            message = f"GitHub PUT failed HTTP {status}; відповідь API приховано."
 
             if status == 404:
                 # Для PUT 404 означає не "файл відсутній" (файл буде
@@ -2656,15 +2690,14 @@ async def deploy_project_to_render(
 
             if response.status not in (200, 201):
                 raise RuntimeError(
-                    f"Render service creation failed "
-                    f"HTTP {response.status}: {body}"
+                    f"Render service creation failed HTTP {response.status}; відповідь API приховано."
                 )
 
             try:
                 data = json.loads(body)
             except json.JSONDecodeError as error:
                 raise RuntimeError(
-                    f"Render service creation повернув некоректний JSON: {body[:500]}"
+                    "Render service creation повернув некоректний JSON; відповідь API приховано."
                 ) from error
 
     # Render may return a service object, a wrapped object, or a one-item list.
@@ -2679,7 +2712,7 @@ async def deploy_project_to_render(
 
     if not isinstance(service, dict):
         raise RuntimeError(
-            f"Render API повернув неочікувану відповідь сервісу: {str(data)[:500]}"
+            "Render API повернув неочікувану відповідь сервісу; вміст відповіді приховано."
         )
 
     return {
@@ -2877,10 +2910,10 @@ async def process_order(
             print(
                 f"[THREAD ERROR] "
                 f"{type(error).__name__}: "
-                f"{error!r}"
+                redact_sensitive_text(error)
             )
 
-            traceback.print_exc()
+            print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
 
             await message.channel.send(
                 f"{message.author.mention}, "
@@ -3063,10 +3096,10 @@ async def process_order(
                 )
 
                 print(
-                    f"Message: {error!r}"
+                    f"Message: {safe_exception(error)}"
                 )
 
-                traceback.print_exc()
+                print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
 
                 print(
                     "========================================"
@@ -3108,19 +3141,19 @@ async def process_order(
                     f"Type: {type(error).__name__}"
                 )
                 print(
-                    f"Message: {error!r}"
+                    f"Message: {safe_exception(error)}"
                 )
-                traceback.print_exc()
+                print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
                 print(
                     "========================================"
                 )
 
-                safe_error = str(error).replace("```", "'")[:1500]
+                safe_error = redact_sensitive_text(error).replace("```", "'")[:500]
                 await thread.send(
                     "❌ **Не вдалося завершити створення "
                     "програмного бота.**\n\n"
                     "🔒 Фінальна передача заблокована.\n\n"
-                    f"**Технічна причина:** `{type(error).__name__}: {safe_error}`"
+                    f"**Технічна причина:** `{safe_error}`"
                 )
 
                 order.status = "ERROR"
@@ -3213,10 +3246,10 @@ async def process_order(
         )
 
         print(
-            f"Message: {error!r}"
+            f"Message: {safe_exception(error)}"
         )
 
-        traceback.print_exc()
+        print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
 
         print(
             "========================================"
@@ -3534,7 +3567,7 @@ async def main():
                 delay = min(300, 15 * (2 ** min(attempt - 1, 4)))
                 print(
                     f"[DISCORD] Мережева помилка {type(error).__name__}: "
-                    f"{error!r}. Повтор через {delay} секунд."
+                    f"{redact_sensitive_text(error)}. Повтор через {delay} секунд."
                 )
                 await asyncio.sleep(delay)
 
@@ -3543,9 +3576,9 @@ async def main():
                 delay = min(300, 30 * (2 ** min(attempt - 1, 3)))
                 print(
                     f"[DISCORD] Непередбачена помилка {type(error).__name__}: "
-                    f"{error!r}. Повтор через {delay} секунд."
+                    f"{redact_sensitive_text(error)}. Повтор через {delay} секунд."
                 )
-                traceback.print_exc()
+                print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
                 await asyncio.sleep(delay)
 
     finally:
