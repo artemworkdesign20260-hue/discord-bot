@@ -21,6 +21,7 @@ Website QA checks page loading, HTML structure, JavaScript errors, network failu
 | `GROX_OWNER_ID` | Numeric Discord user ID of the only person allowed to use Grox |
 | `GROQ_API_KEY` | API key used for code generation and requirement analysis |
 | `CLIENT_CHANNEL_ID` | Numeric ID of the Discord text channel where the owner starts tasks |
+| `GROX_DATABASE_URL` | Dedicated Neon PostgreSQL connection string for Grox's saved tasks and order history |
 
 Do not post tokens or API keys in Discord, GitHub, or this README. Set them only in the Render service's private Environment settings.
 
@@ -71,9 +72,13 @@ Grox ignores messages from every Discord account except the configured owner ID.
 - Liveness endpoints: `/` and `/healthz`
 - Readiness endpoint: `/readyz`
 
-## Data persistence limitation
+## Grox data persistence
 
-The current order/task state is held in process memory. It is lost when the service restarts or is replaced. Configure a dedicated durable database for Grox before relying on it to preserve in-progress tasks. Do not assume the separate Bot 2 database setting automatically persists Grox tasks.
+Grox requires a dedicated `GROX_DATABASE_URL` connection string. The application creates its own `grox_orders` table in that database and saves task details, requirement conversations, status, thread IDs, and deployment metadata. Saved records are restored when Grox starts.
+
+Use a Neon PostgreSQL connection string from the Neon Console. Keep it private and add it only to the Grox Render service's Environment settings. Do not use Bot 2's `DATABASE_URL` or `BOT2_DATABASE_URL` for Grox.
+
+The database preserves the task record across restarts; it does not automatically resume a generation process that was interrupted while Grox was offline. Neon Free also has usage limits, and compute can be suspended when monthly quotas are exhausted.
 
 ## Local syntax check
 
