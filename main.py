@@ -94,7 +94,7 @@ def redact_sensitive_text(value) -> str:
 def safe_exception(error: Exception) -> str:
     """Return a diagnostic safe for logs and Discord; never dump raw exception data."""
     return redact_sensitive_text(
-        safe_exception(error)
+        f"{type(error).__name__}: {error}"
     )[:1000]
 
 
@@ -716,7 +716,7 @@ async def groq_request(
             last_error = error
             print(
                 f"[GROQ ERROR] Attempt {attempt}/{total_attempts}: "
-                safe_exception(error)
+                f"{safe_exception(error)}"
             )
             error_text = str(error).lower()
             # asyncio.TimeoutError and aiohttp network errors often have an
@@ -1239,7 +1239,7 @@ async def revise_and_test_website(
         except Exception as error:
             print(
                 f"[REVISION FIX ERROR] "
-                safe_exception(error)
+                f"{safe_exception(error)}"
             )
             print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
             await thread.send(
@@ -1385,7 +1385,7 @@ async def post_delivery_conversation(
             except Exception as error:
                 print(
                     f"[CLIENT REVISION ERROR] "
-                    safe_exception(error)
+                    f"{safe_exception(error)}"
                 )
                 print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
                 await thread.send(
@@ -1406,7 +1406,7 @@ async def post_delivery_conversation(
         except Exception as error:
             print(
                 f"[CLIENT CHAT ERROR] "
-                safe_exception(error)
+                f"{safe_exception(error)}"
             )
             print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
             await thread.send(
