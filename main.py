@@ -2910,7 +2910,7 @@ async def process_order(
             print(
                 f"[THREAD ERROR] "
                 f"{type(error).__name__}: "
-                redact_sensitive_text(error)
+                f"{redact_sensitive_text(error)}"
             )
 
             print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
