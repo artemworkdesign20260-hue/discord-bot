@@ -6,10 +6,11 @@ import traceback
 import random
 import base64
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from urllib.parse import quote
 
 import aiohttp
+import asyncpg
 from aiohttp import web
 
 import discord
@@ -46,6 +47,10 @@ GENERATED_DISCORD_TOKEN = (
     or os.getenv("BUILDER_DISCORD_TOKEN")
 )
 
+# Dedicated database for Grox's own persistent order history.
+# This is deliberately separate from Bot 2's DATABASE_URL.
+GROX_DATABASE_URL = os.getenv("GROX_DATABASE_URL")
+
 # Optional durable database connection for generated Bot 2 projects.
 # On Render, SQLite files may be lost when an instance is replaced unless
 # a persistent disk is configured. Prefer PostgreSQL via DATABASE_URL.
@@ -58,6 +63,7 @@ BOT2_DEPLOY_WAIT_SECONDS = int(os.getenv("BOT2_DEPLOY_WAIT_SECONDS", "600"))
 BOT2_HEALTH_POLL_INTERVAL = int(os.getenv("BOT2_HEALTH_POLL_INTERVAL", "15"))
 
 CLIENT_CHANNEL_ID = os.getenv("CLIENT_CHANNEL_ID")
+GROX_OWNER_ID = os.getenv("GROX_OWNER_ID", "").strip()
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
@@ -97,7 +103,7 @@ GROQ_RETRIES = int(
     os.getenv("GROQ_RETRIES", os.getenv("GEMINI_RETRIES", "4"))
 )
 
-MAX_WEBSITE_FIX_ATTEMPTS = 10
+MAX_WEBSITE_FIX_ATTEMPTS = 4
 
 # How often the approval/payment state is checked.
 STATE_CHECK_INTERVAL = 1
@@ -107,17 +113,8 @@ MAX_ACTIVE_ORDERS_PER_USER = int(
     os.getenv("MAX_ACTIVE_ORDERS_PER_USER", "3")
 )
 
-# Optional allow-list of Discord user IDs (comma/space separated) who may
-# trigger automatic GitHub + Render deployment of generated software bots.
-# If empty, ANY client can trigger it (old behaviour) — setting it is
-# strongly recommended because deployment uses your GitHub/Render accounts.
-DEPLOY_ALLOWED_USER_IDS = {
-    int(item)
-    for item in re.findall(
-        r"\d+",
-        os.getenv("DEPLOY_ALLOWED_USER_IDS", "")
-    )
-}
+# Grox is a private, owner-only developer assistant. Every Discord action
+# and every deployment must originate from this single configured account.
 
 
 # ============================================================
@@ -128,6 +125,8 @@ required_variables = {
     "DISCORD_TOKEN": DISCORD_TOKEN,
     "GROQ_API_KEY": GROQ_API_KEY,
     "CLIENT_CHANNEL_ID": CLIENT_CHANNEL_ID,
+    "GROX_OWNER_ID": GROX_OWNER_ID,
+    "GROX_DATABASE_URL": GROX_DATABASE_URL,
 }
 
 missing_variables = [
@@ -150,6 +149,13 @@ except ValueError:
         "CLIENT_CHANNEL_ID повинен бути числом."
     )
 
+try:
+    GROX_OWNER_ID = int(GROX_OWNER_ID)
+except ValueError:
+    raise RuntimeError(
+        "GROX_OWNER_ID повинен бути Discord ID власника (лише цифри)."
+    )
+
 
 # ============================================================
 # GROQ CLIENT CONFIGURATION
@@ -160,12 +166,7 @@ if not GROQ_API_KEY:
 
 print(f"[GROQ] API configured. Model: {GROQ_MODEL}")
 
-if not DEPLOY_ALLOWED_USER_IDS:
-    print(
-        "[SECURITY] DEPLOY_ALLOWED_USER_IDS не задано: будь-який клієнт "
-        "може запустити автоматичний деплой ботів у ваші GitHub/Render. "
-        "Рекомендується задати список довірених Discord ID."
-    )
+print(f"[SECURITY] Owner-only mode enabled for Discord user {GROX_OWNER_ID}.")
 
 
 # ============================================================
@@ -230,6 +231,91 @@ active_clients: dict[int, int] = {}
 builder_token_services: list[str] = []
 
 next_order_id = 1000
+db_pool: asyncpg.Pool | None = None
+
+
+async def initialize_database():
+    """Create Grox's own tables and restore saved order records."""
+    global db_pool, next_order_id
+
+    if not GROX_DATABASE_URL:
+        raise RuntimeError("Відсутня Environment Variable: GROX_DATABASE_URL")
+
+    # Neon connection strings include libpq query parameters such as
+    # sslmode/channel_binding. asyncpg uses ssl=True instead.
+    database_dsn = GROX_DATABASE_URL.split("?", 1)[0]
+    db_pool = await asyncpg.create_pool(
+        dsn=database_dsn,
+        ssl=True,
+        min_size=0,
+        max_size=3,
+        max_inactive_connection_lifetime=240,
+        command_timeout=30,
+    )
+
+    async with db_pool.acquire() as connection:
+        await connection.execute("""
+            CREATE TABLE IF NOT EXISTS grox_orders (
+                order_id BIGINT PRIMARY KEY,
+                discord_message_id BIGINT NOT NULL UNIQUE,
+                client_id BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        rows = await connection.fetch(
+            "SELECT payload FROM grox_orders ORDER BY order_id"
+        )
+
+    restored = 0
+    for row in rows:
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        order = Order(**payload)
+        orders[order.order_id] = order
+        restored += 1
+
+    if orders:
+        next_order_id = max(orders)
+
+    print(f"[DATABASE] Neon connected; restored {restored} saved order(s).")
+
+
+async def close_database():
+    global db_pool
+    if db_pool is not None:
+        await db_pool.close()
+        db_pool = None
+
+
+async def save_order(order: Order):
+    """Persist a complete order snapshot; fail loudly if storage is unavailable."""
+    if db_pool is None:
+        raise RuntimeError("Grox database is not initialized.")
+
+    payload = json.dumps(asdict(order), ensure_ascii=False)
+    async with db_pool.acquire() as connection:
+        await connection.execute(
+            """
+            INSERT INTO grox_orders (
+                order_id, discord_message_id, client_id, status, payload, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
+            ON CONFLICT (order_id) DO UPDATE SET
+                discord_message_id = EXCLUDED.discord_message_id,
+                client_id = EXCLUDED.client_id,
+                status = EXCLUDED.status,
+                payload = EXCLUDED.payload,
+                updated_at = NOW()
+            """,
+            order.order_id,
+            order.discord_message_id,
+            order.client_id,
+            order.status,
+            payload,
+        )
 
 
 # ============================================================
@@ -712,11 +798,13 @@ async def discover_requirements(
     conversation = (
         f"Клієнт: {first_message.strip()}"
     )
+    order.task = conversation
+    await save_order(order)
 
     await thread.send(
         "🧠 **Добре, спочатку розберімося із завданням.**\n\n"
         "Я поставлю кілька коротких уточнень, якщо вони будуть потрібні. "
-        "Після цього сформую фінальне ТЗ і покажу вам ціну."
+        "Після цього сформую фінальне ТЗ і перевірю, чи достатньо даних для виконання."
     )
 
     for round_number in range(1, MAX_REQUIREMENT_ROUNDS + 1):
@@ -779,6 +867,8 @@ async def discover_requirements(
         conversation += (
             f"\n\nКлієнт: {answer}"
         )
+        order.task = conversation
+        await save_order(order)
 
         await thread.send(
             "✅ **Зрозумів.**"
@@ -790,10 +880,15 @@ async def discover_requirements(
         conversation
     )
 
-    if final_analysis["final_tz"]:
+    if final_analysis["ready"] and final_analysis["final_tz"]:
         return final_analysis["final_tz"]
 
-    return conversation
+    await thread.send(
+        "⚠️ Не вдалося сформувати достатньо повне технічне завдання "
+        "після всіх уточнень. Я не починатиму створення навмання.\n\n"
+        "Будь ласка, створіть нове замовлення та опишіть бажаний результат детальніше."
+    )
+    return None
 
 
 
@@ -1080,6 +1175,7 @@ async def revise_and_test_website(
         if qa_result["success"]:
             order.site_url = live_url
             order.site_code = html_code
+            await save_order(order)
             await thread.send(
                 "✅ **Правку внесено та перевірено!**\n\n"
                 f"🌐 **Оновлений сайт:**\n{live_url}"
@@ -1237,6 +1333,7 @@ async def post_delivery_conversation(
                 )
 
                 order.task = updated_task
+                await save_order(order)
 
                 success = await revise_and_test_website(
                     order,
@@ -1415,7 +1512,6 @@ async def test_website(url: str):
     warnings = []
     console_errors = []
     failed_requests = []
-    clicked_elements = 0
 
     title = ""
     button_count = 0
@@ -1554,77 +1650,33 @@ async def test_website(url: str):
             )
 
             # ------------------------------------------------
-            # TEST BUTTONS
+            # INSPECT BUTTONS WITHOUT CLICKING
+            #
+            # Clicking arbitrary buttons during QA can submit forms,
+            # purchase items, send messages, delete data, or trigger
+            # external side effects. Only inspect their presence and
+            # accessibility; never activate them automatically.
             # ------------------------------------------------
 
-            for index in range(
-                min(button_count, 30)
-            ):
+            visible_button_count = 0
+            for index in range(min(button_count, 100)):
                 try:
-                    button = buttons.nth(
-                        index
-                    )
-
-                    if not await button.is_visible():
-                        continue
-
-                    disabled = await button.is_disabled()
-
-                    if disabled:
-                        continue
-
-                    before_url = page.url
-
-                    before_text = await page.locator(
-                        "body"
-                    ).inner_text(
-                        timeout=3000
-                    )
-
-                    await button.scroll_into_view_if_needed()
-
-                    await button.click(
-                        timeout=5000
-                    )
-
-                    clicked_elements += 1
-
-                    await page.wait_for_timeout(
-                        500
-                    )
-
-                    after_text = await page.locator(
-                        "body"
-                    ).inner_text(
-                        timeout=3000
-                    )
-
-                    after_url = page.url
-
-                    if (
-                        before_url == after_url
-                        and before_text == after_text
-                    ):
-                        warnings.append(
-                            f"Кнопка #{index + 1} "
-                            f"не показала очевидної зміни "
-                            f"після натискання."
-                        )
-
-                    if before_url != after_url:
-                        try:
-                            await page.go_back(
-                                wait_until="networkidle",
-                                timeout=10000
+                    button = buttons.nth(index)
+                    if await button.is_visible():
+                        visible_button_count += 1
+                        if await button.is_disabled():
+                            warnings.append(
+                                f"Кнопка #{index + 1} вимкнена."
                             )
-                        except Exception:
-                            pass
-
                 except Exception as error:
-                    errors.append(
-                        f"Кнопка #{index + 1} "
-                        f"спричинила помилку: {error}"
+                    warnings.append(
+                        f"Не вдалося перевірити кнопку #{index + 1}: {error}"
                     )
+
+            print(
+                f"[QA] Visible buttons inspected without activation: "
+                f"{visible_button_count}"
+            )
 
             # ------------------------------------------------
             # TEST LINKS
@@ -1714,9 +1766,7 @@ async def test_website(url: str):
             # ------------------------------------------------
             # JAVASCRIPT CONSOLE ERRORS
             #
-            # Collected only AFTER the buttons were clicked, so errors
-            # raised by clicks are counted too (previously the list was
-            # copied once, right after page load).
+            # Collected after read-only inspection; no page controls are activated.
             # ------------------------------------------------
 
             for console_error in dict.fromkeys(console_errors):
@@ -1761,7 +1811,7 @@ async def test_website(url: str):
         f"URL: {url}",
         f"Title: {title}",
         f"Кнопок знайдено: {button_count}",
-        f"Кнопок натиснуто: {clicked_elements}",
+        "Кнопки автоматично не натискалися (безпечна read-only перевірка).",
         f"Посилань знайдено: {link_count}",
         f"Форм знайдено: {form_count}",
     ]
@@ -1847,8 +1897,8 @@ async def generate_test_and_fix_website(
             f"🧪 **Перевірка сайту "
             f"{attempt}/{MAX_WEBSITE_FIX_ATTEMPTS}...**\n\n"
             "🔍 Перевіряю завантаження, "
-            "JavaScript, кнопки, посилання "
-            "та форми."
+            "JavaScript, доступність кнопок, посилання "
+            "та структуру форм без натискання елементів."
         )
 
         # ----------------------------------------------------
@@ -1899,6 +1949,7 @@ async def generate_test_and_fix_website(
 
             order.site_url = live_url
             order.site_code = html_code
+            await save_order(order)
 
             return True
 
@@ -2656,14 +2707,10 @@ async def build_and_deploy_software_bot(
         )
         return False
 
-    if (
-        DEPLOY_ALLOWED_USER_IDS
-        and order.client_id not in DEPLOY_ALLOWED_USER_IDS
-    ):
+    if order.client_id != GROX_OWNER_ID:
         await thread.send(
-            "🔒 **Автоматичне розгортання ботів доступне лише "
-            "довіреним користувачам.**\n\n"
-            "ТЗ збережено. Зверніться до адміністратора Grox."
+            "🔒 Розгортання дозволене лише власнику Grox. "
+            "GitHub і Render не змінювалися."
         )
         return False
 
@@ -2715,6 +2762,7 @@ async def build_and_deploy_software_bot(
         )
 
     order.project_repo_path = root_dir
+    await save_order(order)
     await thread.send("☁️ **Створюю окремий Render-сервіс...**")
 
     render_env: dict[str, str] = {}
@@ -2736,6 +2784,7 @@ async def build_and_deploy_software_bot(
 
     order.render_service_id = render_info.get("id")
     order.deployment_url = render_info.get("url")
+    await save_order(order)
 
     if generated_platform == "Discord":
         builder_token_services.append(
@@ -2775,6 +2824,9 @@ async def build_and_deploy_software_bot(
 async def process_order(
     message: discord.Message
 ):
+    if message.author.id != GROX_OWNER_ID:
+        return
+
     if message.id in active_orders:
         return
 
@@ -2794,6 +2846,7 @@ async def process_order(
         order = create_order(
             message
         )
+        await save_order(order)
 
         # ====================================================
         # CREATE THREAD
@@ -2817,6 +2870,7 @@ async def process_order(
             )
 
             order.status = "ERROR"
+            await save_order(order)
             return
 
         except Exception as error:
@@ -2834,9 +2888,11 @@ async def process_order(
             )
 
             order.status = "ERROR"
+            await save_order(order)
             return
 
         order.thread_id = thread.id
+        await save_order(order)
 
         print(
             f"[THREAD CREATED] "
@@ -2854,12 +2910,9 @@ async def process_order(
             f"🤖 **Grox прийняв ваше замовлення.**\n\n"
             f"🆔 Замовлення: "
             f"**#{order.order_id}**\n\n"
-            f"💡 Вам не потрібно "
-            f"заздалегідь визначати ціну.\n\n"
+            f"💡 Вам не потрібно самостійно оцінювати завдання.\n\n"
             f"📋 Надішліть детальне ТЗ.\n\n"
-            f"🧠 Grox проаналізує "
-            f"складність проєкту "
-            f"та запропонує справедливу ціну."
+            f"🧠 Grox уточнить вимоги, визначить тип проєкту та підготує результат."
         )
 
         # ====================================================
@@ -2890,6 +2943,7 @@ async def process_order(
             )
 
             order.status = "EXPIRED"
+            await save_order(order)
             return
 
         first_task = initial_message.content.strip()
@@ -2899,6 +2953,7 @@ async def process_order(
                 "❌ ТЗ не може бути порожнім."
             )
             order.status = "ERROR"
+            await save_order(order)
             return
 
         if len(first_task) > MAX_TASK_LENGTH:
@@ -2907,6 +2962,7 @@ async def process_order(
                 f"Максимум: {MAX_TASK_LENGTH} символів."
             )
             order.status = "ERROR"
+            await save_order(order)
             return
 
         # ====================================================
@@ -2921,17 +2977,18 @@ async def process_order(
 
         if not final_task:
             order.status = "ERROR"
+            await save_order(order)
             return
 
         if len(final_task) > MAX_TASK_LENGTH:
             final_task = final_task[:MAX_TASK_LENGTH]
 
         order.task = final_task
+        await save_order(order)
 
         await thread.send(
             "📋 **Фінальне ТЗ сформовано.**\n\n"
-            "🧠 Тепер я оціню складність проєкту та "
-            "запропоную ціну."
+            "🧠 Тепер перевірю тип проєкту та підготую його виконання."
         )
 
         # ====================================================
@@ -2952,6 +3009,7 @@ async def process_order(
         order.budget = 0
         order.client_approved_price = True
         order.status = "IN_PROGRESS"
+        await save_order(order)
 
         await thread.send(
             "✅ **Технічне завдання прийнято!**\n\n"
@@ -3025,6 +3083,7 @@ async def process_order(
 
             if not success:
                 order.status = "QA_FAILED"
+                await save_order(order)
                 return
 
         # ====================================================
@@ -3086,6 +3145,7 @@ async def process_order(
             )
 
             order.status = "UNSUPPORTED"
+            await save_order(order)
             return
 
         # ====================================================
@@ -3093,6 +3153,7 @@ async def process_order(
         # ====================================================
 
         order.status = "COMPLETED"
+        await save_order(order)
 
         # ====================================================
         # SITE PREVIEW
@@ -3115,6 +3176,7 @@ async def process_order(
         )
 
         order.status = "COMPLETED"
+        await save_order(order)
 
         await thread.send(
             completed_message(
@@ -3171,6 +3233,15 @@ async def process_order(
             pass
 
     finally:
+        if "order" in locals():
+            try:
+                await save_order(order)
+            except Exception as persist_error:
+                print(
+                    f"[DATABASE ERROR] Could not persist order "
+                    f"#{order.order_id}: {persist_error!r}"
+                )
+
         active_orders.discard(
             message.id
         )
@@ -3259,6 +3330,12 @@ async def on_message(
     message: discord.Message
 ):
     if message.author.bot:
+        return
+
+    # Grox is a private assistant for its owner only. Ignore everyone else
+    # before command processing or order detection, so outsiders cannot use
+    # Groq, Vercel, GitHub, or Render resources.
+    if message.author.id != GROX_OWNER_ID:
         return
 
     # Always process commands first.
@@ -3401,6 +3478,7 @@ async def main():
     attempt = 0
 
     try:
+        await initialize_database()
         while True:
             attempt += 1
             discord_ready = False
@@ -3475,6 +3553,7 @@ async def main():
         if not bot.is_closed():
             await bot.close()
         await health_runner.cleanup()
+        await close_database()
 
 
 # ============================================================
