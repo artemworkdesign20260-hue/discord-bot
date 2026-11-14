@@ -18,5 +18,8 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
       - name: Compile Grox
         run: python -m py_compile main.py
