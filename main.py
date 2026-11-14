@@ -740,7 +740,7 @@ async def groq_request(
 
     raise RuntimeError(
         f"Groq тимчасово недоступний після {total_attempts} спроб. "
-        f"Остання помилка: {type(last_error).__name__}: {last_error}"
+        f"Остання помилка: {safe_exception(last_error)}"
     )
 
 
@@ -2380,7 +2380,7 @@ def validate_github_repo(value) -> str:
             "GITHUB_REPO має формат `owner/repository`, наприклад "
             "`myname/grox-projects` (без https://github.com/, без .git, "
             "без пробілів і переносів рядка). "
-            f"Поточне значення: {repo!r}"
+            "Перевір GITHUB_REPO у Render Environment; значення не виводиться з міркувань безпеки."
         )
 
     return repo
