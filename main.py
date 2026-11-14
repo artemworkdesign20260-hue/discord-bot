@@ -1516,7 +1516,7 @@ async def deploy_to_vercel(
                 print(
                     f"[VERCEL ERROR] "
                     f"HTTP {response.status}: "
-                    redact_sensitive_text(response_text)
+                    f"{redact_sensitive_text(response_text)}"
                 )
 
                 return None
@@ -1525,7 +1525,7 @@ async def deploy_to_vercel(
         print(
             f"[VERCEL EXCEPTION] "
             f"{type(error).__name__}: "
-            redact_sensitive_text(error)
+            f"{redact_sensitive_text(error)}"
         )
 
         print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
@@ -1752,7 +1752,7 @@ async def test_website(url: str):
                     warnings.append(
                         f"Не вдалося перевірити "
                         f"посилання #{index + 1}: "
-                        redact_sensitive_text(error)
+                        f"{redact_sensitive_text(error)}"
                     )
 
             # ------------------------------------------------
@@ -1794,7 +1794,7 @@ async def test_website(url: str):
                     errors.append(
                         f"Помилка перевірки "
                         f"форми #{index + 1}: "
-                        redact_sensitive_text(error)
+                        f"{redact_sensitive_text(error)}"
                     )
 
             # ------------------------------------------------
