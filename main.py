@@ -1829,7 +1829,7 @@ async def test_website(url: str):
                 "QA-система не змогла завершити "
                 "перевірку.\n"
                 f"Помилка: {type(error).__name__}: "
-                redact_sensitive_text(error)
+                f"{redact_sensitive_text(error)}"
             )
         }
 
