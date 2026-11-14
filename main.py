@@ -247,8 +247,9 @@ async def initialize_database():
     db_pool = await asyncpg.create_pool(
         dsn=database_dsn,
         ssl=True,
-        min_size=1,
+        min_size=0,
         max_size=3,
+        max_inactive_connection_lifetime=240,
         command_timeout=30,
     )
 
@@ -797,6 +798,8 @@ async def discover_requirements(
     conversation = (
         f"Клієнт: {first_message.strip()}"
     )
+    order.task = conversation
+    await save_order(order)
 
     await thread.send(
         "🧠 **Добре, спочатку розберімося із завданням.**\n\n"
@@ -864,6 +867,8 @@ async def discover_requirements(
         conversation += (
             f"\n\nКлієнт: {answer}"
         )
+        order.task = conversation
+        await save_order(order)
 
         await thread.send(
             "✅ **Зрозумів.**"
