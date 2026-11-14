@@ -6,10 +6,11 @@ import traceback
 import random
 import base64
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from urllib.parse import quote
 
 import aiohttp
+import asyncpg
 from aiohttp import web
 
 import discord
@@ -45,6 +46,10 @@ GENERATED_DISCORD_TOKEN = (
     os.getenv("GROX_BUILDER_DISCORD_TOKEN")
     or os.getenv("BUILDER_DISCORD_TOKEN")
 )
+
+# Dedicated database for Grox's own persistent order history.
+# This is deliberately separate from Bot 2's DATABASE_URL.
+GROX_DATABASE_URL = os.getenv("GROX_DATABASE_URL")
 
 # Optional durable database connection for generated Bot 2 projects.
 # On Render, SQLite files may be lost when an instance is replaced unless
@@ -121,6 +126,7 @@ required_variables = {
     "GROQ_API_KEY": GROQ_API_KEY,
     "CLIENT_CHANNEL_ID": CLIENT_CHANNEL_ID,
     "GROX_OWNER_ID": GROX_OWNER_ID,
+    "GROX_DATABASE_URL": GROX_DATABASE_URL,
 }
 
 missing_variables = [
@@ -225,6 +231,90 @@ active_clients: dict[int, int] = {}
 builder_token_services: list[str] = []
 
 next_order_id = 1000
+db_pool: asyncpg.Pool | None = None
+
+
+async def initialize_database():
+    """Create Grox's own tables and restore saved order records."""
+    global db_pool, next_order_id
+
+    if not GROX_DATABASE_URL:
+        raise RuntimeError("Відсутня Environment Variable: GROX_DATABASE_URL")
+
+    # Neon connection strings include libpq query parameters such as
+    # sslmode/channel_binding. asyncpg uses ssl=True instead.
+    database_dsn = GROX_DATABASE_URL.split("?", 1)[0]
+    db_pool = await asyncpg.create_pool(
+        dsn=database_dsn,
+        ssl=True,
+        min_size=1,
+        max_size=3,
+        command_timeout=30,
+    )
+
+    async with db_pool.acquire() as connection:
+        await connection.execute("""
+            CREATE TABLE IF NOT EXISTS grox_orders (
+                order_id BIGINT PRIMARY KEY,
+                discord_message_id BIGINT NOT NULL UNIQUE,
+                client_id BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        rows = await connection.fetch(
+            "SELECT payload FROM grox_orders ORDER BY order_id"
+        )
+
+    restored = 0
+    for row in rows:
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        order = Order(**payload)
+        orders[order.order_id] = order
+        restored += 1
+
+    if orders:
+        next_order_id = max(orders)
+
+    print(f"[DATABASE] Neon connected; restored {restored} saved order(s).")
+
+
+async def close_database():
+    global db_pool
+    if db_pool is not None:
+        await db_pool.close()
+        db_pool = None
+
+
+async def save_order(order: Order):
+    """Persist a complete order snapshot; fail loudly if storage is unavailable."""
+    if db_pool is None:
+        raise RuntimeError("Grox database is not initialized.")
+
+    payload = json.dumps(asdict(order), ensure_ascii=False)
+    async with db_pool.acquire() as connection:
+        await connection.execute(
+            """
+            INSERT INTO grox_orders (
+                order_id, discord_message_id, client_id, status, payload, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
+            ON CONFLICT (order_id) DO UPDATE SET
+                discord_message_id = EXCLUDED.discord_message_id,
+                client_id = EXCLUDED.client_id,
+                status = EXCLUDED.status,
+                payload = EXCLUDED.payload,
+                updated_at = NOW()
+            """,
+            order.order_id,
+            order.discord_message_id,
+            order.client_id,
+            order.status,
+            payload,
+        )
 
 
 # ============================================================
@@ -1080,6 +1170,7 @@ async def revise_and_test_website(
         if qa_result["success"]:
             order.site_url = live_url
             order.site_code = html_code
+            await save_order(order)
             await thread.send(
                 "✅ **Правку внесено та перевірено!**\n\n"
                 f"🌐 **Оновлений сайт:**\n{live_url}"
@@ -1237,6 +1328,7 @@ async def post_delivery_conversation(
                 )
 
                 order.task = updated_task
+                await save_order(order)
 
                 success = await revise_and_test_website(
                     order,
@@ -1852,6 +1944,7 @@ async def generate_test_and_fix_website(
 
             order.site_url = live_url
             order.site_code = html_code
+            await save_order(order)
 
             return True
 
@@ -2664,6 +2757,7 @@ async def build_and_deploy_software_bot(
         )
 
     order.project_repo_path = root_dir
+    await save_order(order)
     await thread.send("☁️ **Створюю окремий Render-сервіс...**")
 
     render_env: dict[str, str] = {}
@@ -2685,6 +2779,7 @@ async def build_and_deploy_software_bot(
 
     order.render_service_id = render_info.get("id")
     order.deployment_url = render_info.get("url")
+    await save_order(order)
 
     if generated_platform == "Discord":
         builder_token_services.append(
@@ -2746,6 +2841,7 @@ async def process_order(
         order = create_order(
             message
         )
+        await save_order(order)
 
         # ====================================================
         # CREATE THREAD
@@ -2769,6 +2865,7 @@ async def process_order(
             )
 
             order.status = "ERROR"
+            await save_order(order)
             return
 
         except Exception as error:
@@ -2786,9 +2883,11 @@ async def process_order(
             )
 
             order.status = "ERROR"
+            await save_order(order)
             return
 
         order.thread_id = thread.id
+        await save_order(order)
 
         print(
             f"[THREAD CREATED] "
@@ -2839,6 +2938,7 @@ async def process_order(
             )
 
             order.status = "EXPIRED"
+            await save_order(order)
             return
 
         first_task = initial_message.content.strip()
@@ -2848,6 +2948,7 @@ async def process_order(
                 "❌ ТЗ не може бути порожнім."
             )
             order.status = "ERROR"
+            await save_order(order)
             return
 
         if len(first_task) > MAX_TASK_LENGTH:
@@ -2856,6 +2957,7 @@ async def process_order(
                 f"Максимум: {MAX_TASK_LENGTH} символів."
             )
             order.status = "ERROR"
+            await save_order(order)
             return
 
         # ====================================================
@@ -2870,12 +2972,14 @@ async def process_order(
 
         if not final_task:
             order.status = "ERROR"
+            await save_order(order)
             return
 
         if len(final_task) > MAX_TASK_LENGTH:
             final_task = final_task[:MAX_TASK_LENGTH]
 
         order.task = final_task
+        await save_order(order)
 
         await thread.send(
             "📋 **Фінальне ТЗ сформовано.**\n\n"
@@ -2900,6 +3004,7 @@ async def process_order(
         order.budget = 0
         order.client_approved_price = True
         order.status = "IN_PROGRESS"
+        await save_order(order)
 
         await thread.send(
             "✅ **Технічне завдання прийнято!**\n\n"
@@ -2973,6 +3078,7 @@ async def process_order(
 
             if not success:
                 order.status = "QA_FAILED"
+                await save_order(order)
                 return
 
         # ====================================================
@@ -3034,6 +3140,7 @@ async def process_order(
             )
 
             order.status = "UNSUPPORTED"
+            await save_order(order)
             return
 
         # ====================================================
@@ -3041,6 +3148,7 @@ async def process_order(
         # ====================================================
 
         order.status = "COMPLETED"
+        await save_order(order)
 
         # ====================================================
         # SITE PREVIEW
@@ -3063,6 +3171,7 @@ async def process_order(
         )
 
         order.status = "COMPLETED"
+        await save_order(order)
 
         await thread.send(
             completed_message(
@@ -3119,6 +3228,15 @@ async def process_order(
             pass
 
     finally:
+        if "order" in locals():
+            try:
+                await save_order(order)
+            except Exception as persist_error:
+                print(
+                    f"[DATABASE ERROR] Could not persist order "
+                    f"#{order.order_id}: {persist_error!r}"
+                )
+
         active_orders.discard(
             message.id
         )
@@ -3355,6 +3473,7 @@ async def main():
     attempt = 0
 
     try:
+        await initialize_database()
         while True:
             attempt += 1
             discord_ready = False
@@ -3429,6 +3548,7 @@ async def main():
         if not bot.is_closed():
             await bot.close()
         await health_runner.cleanup()
+        await close_database()
 
 
 # ============================================================
