@@ -98,14 +98,20 @@ def safe_exception(error: Exception) -> str:
 
 
 def safe_error_detail(error: Exception, limit: int = 1200) -> str:
-    """Expose actionable RuntimeError diagnostics after redacting credentials."""
-    if not isinstance(error, RuntimeError):
-        return type(error).__name__
-    detail = redact_sensitive_text(str(error)).strip()
-    detail = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1[REDACTED]", detail)
+    """Expose sanitized diagnostics for expected and unexpected exceptions."""
+    error_type = type(error).__name__
+    try:
+        detail = redact_sensitive_text(str(error)).strip()
+        detail = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1[REDACTED]", detail)
+        # Keep diagnostics compact and prevent control characters from shaping
+        # Discord messages or log output.
+        detail = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", detail)
+        detail = re.sub(r"\s+", " ", detail).strip()
+    except Exception:
+        return error_type
     if not detail:
-        return type(error).__name__
-    return detail[:limit]
+        return error_type
+    return f"{error_type}: {detail[:limit]}"
 
 
 
