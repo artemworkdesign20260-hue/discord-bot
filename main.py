@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import os
 import re
 import uuid
@@ -2185,17 +2186,69 @@ def validate_generated_project(files: dict[str, str], bot2: bool = False) -> lis
     main_code = files.get("main.py", "")
     if main_code:
         try:
-            compile(main_code, "generated_main.py", "exec")
+            tree = ast.parse(main_code, filename="generated_main.py")
         except SyntaxError as error:
             errors.append(
                 f"Синтаксична помилка main.py: рядок {error.lineno}: {error.msg}."
             )
+            tree = None
 
-        for pattern, label in DANGEROUS_CODE_PATTERNS:
-            if re.search(pattern, main_code):
-                errors.append(
-                    f"У main.py знайдено заборонену конструкцію: {label}."
-                )
+        # Inspect executable syntax rather than comments or string literals.
+        if tree is not None:
+            forbidden_secrets = {
+                "GITHUB_TOKEN", "RENDER_API_KEY", "GROQ_API_KEY",
+                "VERCEL_TOKEN", "GROX_DATABASE_URL",
+            }
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules = {alias.name.split(".", 1)[0] for alias in node.names}
+                    if "subprocess" in modules:
+                        errors.append("У main.py заборонено імпорт subprocess.")
+                    if "pickle" in modules:
+                        errors.append("У main.py заборонено імпорт pickle.")
+                elif isinstance(node, ast.ImportFrom):
+                    module = (node.module or "").split(".", 1)[0]
+                    if module == "subprocess":
+                        errors.append("У main.py заборонено імпорт subprocess.")
+                    if module == "pickle":
+                        errors.append("У main.py заборонено імпорт pickle.")
+
+                if isinstance(node, ast.Call):
+                    function = node.func
+                    if isinstance(function, ast.Name) and function.id in {"eval", "exec", "__import__"}:
+                        errors.append(f"У main.py заборонено виклик {function.id}().")
+                    if (
+                        isinstance(function, ast.Attribute)
+                        and isinstance(function.value, ast.Name)
+                        and function.value.id == "os"
+                        and function.attr == "system"
+                    ):
+                        errors.append("У main.py заборонено виклик os.system().")
+                    if (
+                        isinstance(function, ast.Attribute)
+                        and isinstance(function.value, ast.Name)
+                        and function.value.id == "subprocess"
+                    ):
+                        errors.append("У main.py заборонено виклики subprocess.")
+                    if (
+                        isinstance(function, ast.Attribute)
+                        and isinstance(function.value, ast.Name)
+                        and function.value.id == "pickle"
+                        and function.attr in {"load", "loads"}
+                    ):
+                        errors.append("У main.py заборонено десеріалізацію через pickle.")
+                    if (
+                        isinstance(function, ast.Attribute)
+                        and isinstance(function.value, ast.Name)
+                        and function.value.id == "os"
+                        and function.attr == "getenv"
+                        and node.args
+                        and isinstance(node.args[0], ast.Constant)
+                        and node.args[0].value in forbidden_secrets
+                    ):
+                        errors.append(
+                            f"У main.py заборонено читати захищену змінну {node.args[0].value}."
+                        )
 
     if not bot2 or not main_code:
         return errors
