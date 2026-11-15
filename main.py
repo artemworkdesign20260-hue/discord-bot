@@ -2917,7 +2917,7 @@ async def build_and_deploy_software_bot(
         )
         return False
 
-    if GENERATED_DISCORD_TOKEN == DISCORD_TOKEN:
+    if GENERATED_DISCORD_TOKEN and GENERATED_DISCORD_TOKEN == DISCORD_TOKEN:
         await thread.send(
             "🔒 **Токен нового бота збігається з токеном самого Grox.**\n\n"
             "Створи окремий Discord application/bot і налаштуй його токен "
