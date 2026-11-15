@@ -2318,10 +2318,10 @@ async def generate_software_project(client_task: str):
             if match:
                 content = match.group(1).strip()
                 content = re.sub(
-                    r"^```(?:python|text|markdown)?\\s*", "", content,
+                    r"^```(?:python|text|markdown)?\s*", "", content,
                     flags=re.IGNORECASE
                 )
-                content = re.sub(r"\\s*```$", "", content)
+                content = re.sub(r"\s*```$", "", content)
                 files[filename] = content.strip()
         validation_errors = validate_generated_project(files, bot2=bot2)
 
