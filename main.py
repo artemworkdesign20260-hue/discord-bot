@@ -2733,6 +2733,10 @@ async def build_and_deploy_software_bot(
         )
         return False
 
+    # Validate once before generation or publishing. Never echo the raw
+    # environment value in Discord messages.
+    repo = validate_github_repo(GITHUB_REPO)
+
     if not RENDER_API_KEY:
         await thread.send(
             "⚠️ **Не можу створити сервіс у Render.**\n\n"
@@ -2831,14 +2835,14 @@ async def build_and_deploy_software_bot(
         if not ready:
             return False
         await thread.send(
-            "📁 GitHub: `" + GITHUB_REPO + "/" + root_dir + "`\n"
+            "📁 GitHub: `" + repo + "/" + root_dir + "`\n"
             + (f"🌐 Render: {order.deployment_url}" if order.deployment_url else "")
         )
         return True
 
     message = (
         "📦 **Проєкт опубліковано в GitHub і передано на розгортання в Render.**\n\n"
-        f"📁 GitHub: `{GITHUB_REPO}/{root_dir}`\n"
+        f"📁 GitHub: `{repo}/{root_dir}`\n"
     )
     if order.deployment_url:
         message += f"🌐 Render: {order.deployment_url}\n"
