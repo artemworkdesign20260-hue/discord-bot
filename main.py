@@ -1746,7 +1746,7 @@ async def test_website(url: str):
                     warnings.append(
                         f"Не вдалося перевірити "
                         f"посилання #{index + 1}: "
-                        f"{redact_sensitive_text(error)}"
+                        f"{safe_exception(error)}"
                     )
 
             # ------------------------------------------------
@@ -1788,7 +1788,7 @@ async def test_website(url: str):
                     errors.append(
                         f"Помилка перевірки "
                         f"форми #{index + 1}: "
-                        f"{redact_sensitive_text(error)}"
+                        f"{safe_exception(error)}"
                     )
 
             # ------------------------------------------------
@@ -3560,7 +3560,7 @@ async def main():
                 delay = min(300, 15 * (2 ** min(attempt - 1, 4)))
                 print(
                     f"[DISCORD] Мережева помилка {type(error).__name__}: "
-                    f"{redact_sensitive_text(error)}. Повтор через {delay} секунд."
+                    f"{safe_exception(error)}. Повтор через {delay} секунд."
                 )
                 await asyncio.sleep(delay)
 
@@ -3569,7 +3569,7 @@ async def main():
                 delay = min(300, 30 * (2 ** min(attempt - 1, 3)))
                 print(
                     f"[DISCORD] Непередбачена помилка {type(error).__name__}: "
-                    f"{redact_sensitive_text(error)}. Повтор через {delay} секунд."
+                    f"{safe_exception(error)}. Повтор через {delay} секунд."
                 )
                 print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
                 await asyncio.sleep(delay)
