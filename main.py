@@ -2250,7 +2250,7 @@ async def generate_software_project(client_task: str):
 - Реалізуй саме функції з ТЗ; код має бути робочим, не макетом.
 - Не залишай TODO, pass як заміну функціональності або фальшиві кнопки.
 - Проєкт повинен запускатися командою `python main.py`.
-- Створи health HTTP endpoint, який слухає PORT з environment variable.
+- Створи health HTTP endpoint на `/`, який слухає PORT з environment variable та повертає JSON `{"status":"ok","discord_ready":true або false}`; для Discord true дозволено лише після успішного підключення до Gateway.
 - Для Discord використовуй discord.py та читай токен тільки з DISCORD_TOKEN.
 - Не вставляй секрети в код, README, логи або GitHub.
 - Усі токени/API keys бери з environment variables; не вигадуй їх.
@@ -2389,6 +2389,54 @@ async def wait_for_bot2_ready(service_url: str, thread: discord.Thread) -> bool:
         "Перевір Build/Deploy Logs у Render."
     )
     return False
+
+
+
+async def wait_for_generated_service_ready(
+    service_url: str,
+    thread: discord.Thread,
+    require_discord_ready: bool = False,
+) -> bool:
+    """Do not report a generated service as complete until its health endpoint responds."""
+    if not service_url:
+        await thread.send("⚠️ Render створив сервіс, але не повернув URL; готовність не підтверджена.")
+        return False
+
+    health_url = service_url.rstrip("/") + "/"
+    deadline = asyncio.get_running_loop().time() + BOT2_DEPLOY_WAIT_SECONDS
+    last_problem = "Render ще запускає сервіс."
+    timeout = aiohttp.ClientTimeout(total=25)
+
+    await thread.send("⏳ **Перевіряю запуск створеного сервісу в Render...**")
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                async with session.get(health_url) as response:
+                    body = await response.text()
+                    if response.status == 200:
+                        try:
+                            payload = json.loads(body)
+                        except json.JSONDecodeError:
+                            payload = {}
+                        healthy = isinstance(payload, dict) and payload.get("status") == "ok"
+                        discord_ok = (not require_discord_ready) or payload.get("discord_ready") is True
+                        if healthy and discord_ok:
+                            await thread.send("✅ **Render health-check успішний. Сервіс відповідає та готовий.**")
+                            return True
+                        last_problem = "Health endpoint відповідає, але сервіс або Discord ще не готовий."
+                    else:
+                        last_problem = f"Health endpoint повернув HTTP {response.status}."
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                last_problem = f"Очікування Render: {type(error).__name__}."
+            await asyncio.sleep(max(3, BOT2_HEALTH_POLL_INTERVAL))
+
+    await thread.send(
+        "❌ **Не вдалося підтвердити готовність сервісу.**\\n\\n"
+        f"Останній стан: {last_problem}\\n"
+        "Проєкт збережено в GitHub, але я не позначаю його як готовий. Перевір Render Logs."
+    )
+    return False
+
 
 
 # ============================================================
@@ -2871,8 +2919,17 @@ async def build_and_deploy_software_bot(
         )
         return True
 
+    # A successful Render API response means only that a service record was created.
+    ready = await wait_for_generated_service_ready(
+        order.deployment_url,
+        thread,
+        require_discord_ready=(generated_platform == "Discord"),
+    )
+    if not ready:
+        return False
+
     message = (
-        "📦 **Проєкт опубліковано в GitHub і передано на розгортання в Render.**\n\n"
+        "📦 **Проєкт опубліковано в GitHub і запущено в Render.**\n\n"
         f"📁 GitHub: `{repo}/{root_dir}`\n"
     )
     if order.deployment_url:
