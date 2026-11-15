@@ -133,7 +133,7 @@ POST_DELIVERY_TIMEOUT = int(
 
 # Maximum number of clarification rounds before Grox builds the final TЗ.
 MAX_REQUIREMENT_ROUNDS = int(
-    os.getenv("MAX_REQUIREMENT_ROUNDS", "10")
+    os.getenv("MAX_REQUIREMENT_ROUNDS", "3")
 )
 
 PORT = int(
@@ -814,12 +814,12 @@ async def analyze_requirements(conversation: str):
 
 Виріши, чи вже достатньо інформації для виконання проєкту.
 
-Якщо важливої інформації не вистачає:
-- постав ОДНЕ найважливіше уточнювальне питання;
-- не став кілька питань одним повідомленням;
-- не повторюй те, що клієнт уже сказав;
-- говори просто, природно і по-людськи;
-- якщо доречно, запропонуй клієнту кілька зрозумілих варіантів.
+Постав уточнювальне питання ТІЛЬКИ якщо без відповіді неможливо почати роботу.
+Не запитуй необов'язкові побажання, кольори, назви, дрібні деталі або те,
+для чого можна безпечно вибрати стандартне рішення.
+Для необов'язкових деталей самостійно застосуй прості професійні значення.
+Максимум одне коротке питання за раунд. Не повторюй уже надану інформацію.
+Якщо завдання зрозуміле хоча б на базовому рівні — сформуй ТЗ і починай роботу.
 
 Якщо інформації достатньо:
 - сформуй повне фінальне ТЗ;
@@ -876,6 +876,38 @@ FINAL_TZ: ...
             else ""
         ),
     }
+
+
+def requirement_control_action(text: str) -> str | None:
+    """Recognise owner control commands so they are never treated as task answers."""
+    value = (text or "").strip().casefold()
+    compact = re.sub(r"[.!?\\s]+", " ", value).strip()
+
+    if value in {"!cancel", "!stop", "!abort"} or compact in {
+        "скасуй замовлення",
+        "зупини опитування",
+        "припини уточнення",
+        "зупини уточнення",
+        "стоп",
+        "скасуй",
+    }:
+        return "cancel"
+
+    if value in {"!skip", "!continue"} or compact in {
+        "без уточнень",
+        "продовжуй без уточнень",
+        "пропусти уточнення",
+        "досить питань",
+        "починай з того що є",
+    }:
+        return "skip"
+
+    # Reserve command-like messages for future owner controls. Never feed them
+    # to the requirements model as if they were part of the client's task.
+    if value.startswith("!grox ") or value.startswith("!"):
+        return "unknown"
+
+    return None
 
 
 async def discover_requirements(
@@ -939,6 +971,29 @@ async def discover_requirements(
 
         answer = reply.content.strip()
 
+        control_action = requirement_control_action(answer)
+        if control_action == "cancel":
+            await thread.send(
+                "🛑 **Уточнення зупинено.** Замовлення скасовано; "
+                "це повідомлення не було додане до технічного завдання."
+            )
+            return None
+
+        if control_action == "skip":
+            await thread.send(
+                "⏭️ **Уточнення пропущено.** Продовжую роботу "
+                "з інформацією, яку ви вже надали."
+            )
+            return conversation
+
+        if control_action == "unknown":
+            await thread.send(
+                "⚙️ Це схоже на команду, а не на відповідь. "
+                "Доступні команди: !cancel — зупинити замовлення; "
+                "!skip — продовжити без наступних уточнень."
+            )
+            continue
+
         if not answer:
             await thread.send(
                 "❌ Будь ласка, напишіть відповідь текстом."
@@ -962,8 +1017,8 @@ async def discover_requirements(
             "✅ **Зрозумів.**"
         )
 
-    # After the maximum number of rounds, ask Groq to create the
-    # best TЗ from information the client actually provided.
+    # The clarification budget is deliberately small. If Groq still asks
+    # for optional details, build from the information already supplied.
     final_analysis = await analyze_requirements(
         conversation
     )
