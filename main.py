@@ -330,7 +330,20 @@ async def initialize_database():
     if orders:
         next_order_id = max(orders)
 
-    print(f"[DATABASE] Neon connected; restored {restored} saved order(s).")
+    # In-memory Discord listeners/tasks cannot survive a Render restart.
+    # Mark unfinished orders as interrupted instead of leaving them falsely
+    # looking active forever after the process comes back online.
+    interrupted = 0
+    for order in orders.values():
+        if order.status in {"WAITING_TZ", "IN_PROGRESS"}:
+            order.status = "INTERRUPTED"
+            await save_order(order)
+            interrupted += 1
+
+    print(
+        f"[DATABASE] Neon connected; restored {restored} saved order(s); "
+        f"marked {interrupted} interrupted order(s)."
+    )
 
 
 async def close_database():
@@ -1908,7 +1921,8 @@ async def test_website(url: str):
 
     if success:
         report_lines.append(
-            "\n✅ Критичних помилок не знайдено."
+            "\n✅ Базову перевірку завантаження та JavaScript пройдено."
+            "\nℹ️ Функціональність кожної кнопки й форми автоматично не підтверджена."
         )
     else:
         report_lines.append(
@@ -2009,12 +2023,11 @@ async def generate_test_and_fix_website(
 
         if qa_result["success"]:
             await thread.send(
-                "✅ **QA-перевірку пройдено!**\n\n"
-                "Сайт відкривається, "
-                "критичних JavaScript-помилок "
+                "✅ **Базову QA-перевірку пройдено!**\n\n"
+                "Сайт відкривається, критичних JavaScript-помилок "
                 "не знайдено.\n\n"
-                "🔒 Тепер сайт можна вважати "
-                "готовим до фінальної передачі."
+                "ℹ️ Це перевірка завантаження та структури, а не повний "
+                "ручний тест кожної кнопки, форми й бізнес-функції."
             )
 
             order.site_url = live_url
@@ -3413,6 +3426,14 @@ async def process_order(
         )
 
     except Exception as error:
+        # Do not leave a failed order marked WAITING_TZ or IN_PROGRESS.
+        # Completed/expired/unsupported orders keep their terminal status.
+        if "order" in locals() and order.status not in {
+            "COMPLETED", "ERROR", "EXPIRED", "QA_FAILED",
+            "UNSUPPORTED", "INTERRUPTED",
+        }:
+            order.status = "ERROR"
+
         print(
             "========================================"
         )
