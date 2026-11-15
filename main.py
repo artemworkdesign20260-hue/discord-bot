@@ -2250,7 +2250,7 @@ async def generate_software_project(client_task: str):
 - Реалізуй саме функції з ТЗ; код має бути робочим, не макетом.
 - Не залишай TODO, pass як заміну функціональності або фальшиві кнопки.
 - Проєкт повинен запускатися командою `python main.py`.
-- Створи health HTTP endpoint на `/`, який слухає PORT з environment variable та повертає JSON `{"status":"ok","discord_ready":true або false}`; для Discord true дозволено лише після успішного підключення до Gateway.
+- Створи health HTTP endpoint на `/`, який слухає PORT з environment variable та повертає JSON `{"status":"ok","discord_ready":true}` після підключення Discord та `false` до підключення; для Discord true дозволено лише після успішного підключення до Gateway.
 - Для Discord використовуй discord.py та читай токен тільки з DISCORD_TOKEN.
 - Не вставляй секрети в код, README, логи або GitHub.
 - Усі токени/API keys бери з environment variables; не вигадуй їх.
@@ -2419,7 +2419,7 @@ async def wait_for_generated_service_ready(
                         except json.JSONDecodeError:
                             payload = {}
                         healthy = isinstance(payload, dict) and payload.get("status") == "ok"
-                        discord_ok = (not require_discord_ready) or payload.get("discord_ready") is True
+                        discord_ok = (not require_discord_ready) or (isinstance(payload, dict) and payload.get("discord_ready") is True)
                         if healthy and discord_ok:
                             await thread.send("✅ **Render health-check успішний. Сервіс відповідає та готовий.**")
                             return True
