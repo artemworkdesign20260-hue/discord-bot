@@ -92,10 +92,8 @@ def redact_sensitive_text(value) -> str:
 
 
 def safe_exception(error: Exception) -> str:
-    """Return a diagnostic safe for logs and Discord; never dump raw exception data."""
-    return redact_sensitive_text(
-        f"{type(error).__name__}: {error}"
-    )[:1000]
+    """Return only the exception class; raw messages may contain credentials or user data."""
+    return type(error).__name__
 
 
 
@@ -200,7 +198,7 @@ if not GROQ_API_KEY:
 
 print(f"[GROQ] API configured. Model: {GROQ_MODEL}")
 
-print(f"[SECURITY] Owner-only mode enabled for Discord user {GROX_OWNER_ID}.")
+print("[SECURITY] Owner-only mode enabled.")
 
 
 # ============================================================
@@ -1342,7 +1340,7 @@ async def post_delivery_conversation(
         print(
             f"[CLIENT FOLLOW-UP] "
             f"order=#{order.order_id} "
-            f"content={text!r}"
+            f"message_length={len(text)}"
         )
 
         if order.site_code and is_revision_request(text):
@@ -1514,18 +1512,14 @@ async def deploy_to_vercel(
                         return deployment_url
 
                 print(
-                    f"[VERCEL ERROR] "
-                    f"HTTP {response.status}: "
-                    f"{redact_sensitive_text(response_text)}"
+                    f"[VERCEL ERROR] HTTP {response.status}; response body omitted."
                 )
 
                 return None
 
     except Exception as error:
         print(
-            f"[VERCEL EXCEPTION] "
-            f"{type(error).__name__}: "
-            f"{redact_sensitive_text(error)}"
+            f"[VERCEL EXCEPTION] {type(error).__name__}; details omitted."
         )
 
         print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
@@ -1752,7 +1746,7 @@ async def test_website(url: str):
                     warnings.append(
                         f"Не вдалося перевірити "
                         f"посилання #{index + 1}: "
-                        f"{redact_sensitive_text(error)}"
+                        f"{safe_exception(error)}"
                     )
 
             # ------------------------------------------------
@@ -1794,7 +1788,7 @@ async def test_website(url: str):
                     errors.append(
                         f"Помилка перевірки "
                         f"форми #{index + 1}: "
-                        f"{redact_sensitive_text(error)}"
+                        f"{safe_exception(error)}"
                     )
 
             # ------------------------------------------------
@@ -1828,8 +1822,7 @@ async def test_website(url: str):
             "report": (
                 "QA-система не змогла завершити "
                 "перевірку.\n"
-                f"Помилка: {type(error).__name__}: "
-                f"{redact_sensitive_text(error)}"
+                f"Помилка: {type(error).__name__}."
             )
         }
 
@@ -1888,7 +1881,7 @@ async def test_website(url: str):
     )
 
     print(
-        report
+        f"[QA SUMMARY] success={success} errors={len(errors)} warnings={len(warnings)}"
     )
 
     return {
@@ -2584,15 +2577,14 @@ async def deploy_project_to_render(
 
             if response.status != 200:
                 raise RuntimeError(
-                    f"Render owners request failed "
-                    f"HTTP {response.status}: {owners_body}"
+                    f"Render owners request failed HTTP {response.status}; response body omitted."
                 )
 
             try:
                 owners_data = json.loads(owners_body)
             except json.JSONDecodeError as error:
                 raise RuntimeError(
-                    f"Render owners повернув некоректний JSON: {owners_body[:500]}"
+                    "Render owners повернув некоректний JSON; відповідь API приховано."
                 ) from error
 
         # Render API versions/proxies may return either a list directly or
@@ -2606,7 +2598,7 @@ async def deploy_project_to_render(
 
         if not owners or not isinstance(owners[0], dict):
             raise RuntimeError(
-                f"Render API не повернув коректний список owner: {str(owners_data)[:500]}"
+                "Render API не повернув коректний список owner; відповідь API приховано."
             )
 
         first_owner = owners[0]
@@ -2912,9 +2904,7 @@ async def process_order(
 
         except Exception as error:
             print(
-                f"[THREAD ERROR] "
-                f"{type(error).__name__}: "
-                f"{redact_sensitive_text(error)}"
+                f"[THREAD ERROR] {safe_exception(error)}; details omitted."
             )
 
             print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
@@ -3152,7 +3142,7 @@ async def process_order(
                     "========================================"
                 )
 
-                safe_error = redact_sensitive_text(error).replace("```", "'")[:500]
+                safe_error = safe_exception(error)
                 await thread.send(
                     "❌ **Не вдалося завершити створення "
                     "програмного бота.**\n\n"
@@ -3276,7 +3266,7 @@ async def process_order(
             except Exception as persist_error:
                 print(
                     f"[DATABASE ERROR] Could not persist order "
-                    f"#{order.order_id}: {persist_error!r}"
+                    f"#{order.order_id}: {type(persist_error).__name__}; details omitted."
                 )
 
         active_orders.discard(
@@ -3411,10 +3401,9 @@ async def on_message(
         return
 
     print(
-        f"[ORDER DETECTED] "
-        f"{message.author} | "
-        f"Message: "
-        f"{message.content[:200]}"
+        f"[ORDER DETECTED] user_id={message.author.id} "
+        f"message_id={message.id} "
+        f"message_length={len(message.content)}"
     )
 
     asyncio.create_task(
@@ -3571,7 +3560,7 @@ async def main():
                 delay = min(300, 15 * (2 ** min(attempt - 1, 4)))
                 print(
                     f"[DISCORD] Мережева помилка {type(error).__name__}: "
-                    f"{redact_sensitive_text(error)}. Повтор через {delay} секунд."
+                    f"{safe_exception(error)}. Повтор через {delay} секунд."
                 )
                 await asyncio.sleep(delay)
 
@@ -3580,7 +3569,7 @@ async def main():
                 delay = min(300, 30 * (2 ** min(attempt - 1, 3)))
                 print(
                     f"[DISCORD] Непередбачена помилка {type(error).__name__}: "
-                    f"{redact_sensitive_text(error)}. Повтор через {delay} секунд."
+                    f"{safe_exception(error)}. Повтор через {delay} секунд."
                 )
                 print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
                 await asyncio.sleep(delay)
