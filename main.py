@@ -96,6 +96,17 @@ def safe_exception(error: Exception) -> str:
     return type(error).__name__
 
 
+def safe_error_detail(error: Exception, limit: int = 1200) -> str:
+    """Expose actionable RuntimeError diagnostics after redacting credentials."""
+    if not isinstance(error, RuntimeError):
+        return type(error).__name__
+    detail = redact_sensitive_text(str(error)).strip()
+    detail = re.sub(r"(?i)(bearer\\s+)[^\\s]+", r"\\1[REDACTED]", detail)
+    if not detail:
+        return type(error).__name__
+    return detail[:limit]
+
+
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
@@ -3134,15 +3145,13 @@ async def process_order(
                 print(
                     f"Type: {type(error).__name__}"
                 )
-                print(
-                    f"Message: {safe_exception(error)}"
-                )
-                print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
+                safe_error = safe_error_detail(error)
+                print(f"Safe diagnostic: {safe_error}")
+                print("[TRACEBACK OMITTED] Секрети та повний traceback не виводяться.")
                 print(
                     "========================================"
                 )
 
-                safe_error = safe_exception(error)
                 await thread.send(
                     "❌ **Не вдалося завершити створення "
                     "програмного бота.**\n\n"
