@@ -881,7 +881,7 @@ FINAL_TZ: ...
 def requirement_control_action(text: str) -> str | None:
     """Recognise owner control commands so they are never treated as task answers."""
     value = (text or "").strip().casefold()
-    compact = re.sub(r"[.!?\\s]+", " ", value).strip()
+    compact = re.sub(r"[.!?\s]+", " ", value).strip()
 
     if value in {"!cancel", "!stop", "!abort"} or compact in {
         "скасуй замовлення",
