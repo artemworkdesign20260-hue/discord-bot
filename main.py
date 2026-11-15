@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import os
 import re
 import uuid
@@ -94,6 +95,17 @@ def redact_sensitive_text(value) -> str:
 def safe_exception(error: Exception) -> str:
     """Return only the exception class; raw messages may contain credentials or user data."""
     return type(error).__name__
+
+
+def safe_error_detail(error: Exception, limit: int = 1200) -> str:
+    """Expose actionable RuntimeError diagnostics after redacting credentials."""
+    if not isinstance(error, RuntimeError):
+        return type(error).__name__
+    detail = redact_sensitive_text(str(error)).strip()
+    detail = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1[REDACTED]", detail)
+    if not detail:
+        return type(error).__name__
+    return detail[:limit]
 
 
 
@@ -2174,17 +2186,69 @@ def validate_generated_project(files: dict[str, str], bot2: bool = False) -> lis
     main_code = files.get("main.py", "")
     if main_code:
         try:
-            compile(main_code, "generated_main.py", "exec")
+            tree = ast.parse(main_code, filename="generated_main.py")
         except SyntaxError as error:
             errors.append(
                 f"Синтаксична помилка main.py: рядок {error.lineno}: {error.msg}."
             )
+            tree = None
 
-        for pattern, label in DANGEROUS_CODE_PATTERNS:
-            if re.search(pattern, main_code):
-                errors.append(
-                    f"У main.py знайдено заборонену конструкцію: {label}."
-                )
+        # Inspect executable syntax rather than comments or string literals.
+        if tree is not None:
+            forbidden_secrets = {
+                "GITHUB_TOKEN", "RENDER_API_KEY", "GROQ_API_KEY",
+                "VERCEL_TOKEN", "GROX_DATABASE_URL",
+            }
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules = {alias.name.split(".", 1)[0] for alias in node.names}
+                    if "subprocess" in modules:
+                        errors.append("У main.py заборонено імпорт subprocess.")
+                    if "pickle" in modules:
+                        errors.append("У main.py заборонено імпорт pickle.")
+                elif isinstance(node, ast.ImportFrom):
+                    module = (node.module or "").split(".", 1)[0]
+                    if module == "subprocess":
+                        errors.append("У main.py заборонено імпорт subprocess.")
+                    if module == "pickle":
+                        errors.append("У main.py заборонено імпорт pickle.")
+
+                if isinstance(node, ast.Call):
+                    function = node.func
+                    if isinstance(function, ast.Name) and function.id in {"eval", "exec", "__import__"}:
+                        errors.append(f"У main.py заборонено виклик {function.id}().")
+                    if (
+                        isinstance(function, ast.Attribute)
+                        and isinstance(function.value, ast.Name)
+                        and function.value.id == "os"
+                        and function.attr == "system"
+                    ):
+                        errors.append("У main.py заборонено виклик os.system().")
+                    if (
+                        isinstance(function, ast.Attribute)
+                        and isinstance(function.value, ast.Name)
+                        and function.value.id == "subprocess"
+                    ):
+                        errors.append("У main.py заборонено виклики subprocess.")
+                    if (
+                        isinstance(function, ast.Attribute)
+                        and isinstance(function.value, ast.Name)
+                        and function.value.id == "pickle"
+                        and function.attr in {"load", "loads"}
+                    ):
+                        errors.append("У main.py заборонено десеріалізацію через pickle.")
+                    if (
+                        isinstance(function, ast.Attribute)
+                        and isinstance(function.value, ast.Name)
+                        and function.value.id == "os"
+                        and function.attr == "getenv"
+                        and node.args
+                        and isinstance(node.args[0], ast.Constant)
+                        and node.args[0].value in forbidden_secrets
+                    ):
+                        errors.append(
+                            f"У main.py заборонено читати захищену змінну {node.args[0].value}."
+                        )
 
     if not bot2 or not main_code:
         return errors
@@ -2239,7 +2303,7 @@ async def generate_software_project(client_task: str):
 - Реалізуй саме функції з ТЗ; код має бути робочим, не макетом.
 - Не залишай TODO, pass як заміну функціональності або фальшиві кнопки.
 - Проєкт повинен запускатися командою `python main.py`.
-- Створи health HTTP endpoint, який слухає PORT з environment variable.
+- Створи health HTTP endpoint на `/`, який слухає PORT з environment variable та повертає JSON `{"status":"ok","discord_ready":true}` після підключення Discord та `false` до підключення; для Discord true дозволено лише після успішного підключення до Gateway.
 - Для Discord використовуй discord.py та читай токен тільки з DISCORD_TOKEN.
 - Не вставляй секрети в код, README, логи або GitHub.
 - Усі токени/API keys бери з environment variables; не вигадуй їх.
@@ -2287,9 +2351,37 @@ async def generate_software_project(client_task: str):
 
     validation_errors = validate_generated_project(files, bot2=bot2)
     if validation_errors:
-        raise RuntimeError(
-            "Згенерований проєкт не пройшов перевірку; файли НЕ опубліковано:\n- "
+        # One automatic repair attempt prevents a malformed first LLM response
+        # from immediately terminating the whole order.
+        repair_prompt = (
+            "Попередня генерація не пройшла перевірку. Виправ усі помилки "
+            "та поверни ПОВНІСТЮ всі три файли у точному форматі ===FILE: ...===.\n"
+            "Помилки перевірки:\n- "
             + "\n- ".join(validation_errors)
+            + "\n\nПочаткове технічне завдання:\n" + client_task
+            + "\n\nСпеціальні вимоги:\n" + special_requirements
+        )
+        repaired_result = await groq_request(
+            repair_prompt,
+            max_output_tokens=30000
+        )
+        files = {}
+        for filename, pattern in patterns.items():
+            match = re.search(pattern, repaired_result, re.IGNORECASE | re.DOTALL)
+            if match:
+                content = match.group(1).strip()
+                content = re.sub(
+                    r"^```(?:python|text|markdown)?\s*", "", content,
+                    flags=re.IGNORECASE
+                )
+                content = re.sub(r"\s*```$", "", content)
+                files[filename] = content.strip()
+        validation_errors = validate_generated_project(files, bot2=bot2)
+
+    if validation_errors:
+        raise RuntimeError(
+            "Згенерований проєкт не пройшов перевірку навіть після повторного виправлення; "
+            "файли НЕ опубліковано:\n- " + "\n- ".join(validation_errors)
         )
 
     return files
@@ -2350,6 +2442,54 @@ async def wait_for_bot2_ready(service_url: str, thread: discord.Thread) -> bool:
         "Перевір Build/Deploy Logs у Render."
     )
     return False
+
+
+
+async def wait_for_generated_service_ready(
+    service_url: str,
+    thread: discord.Thread,
+    require_discord_ready: bool = False,
+) -> bool:
+    """Do not report a generated service as complete until its health endpoint responds."""
+    if not service_url:
+        await thread.send("⚠️ Render створив сервіс, але не повернув URL; готовність не підтверджена.")
+        return False
+
+    health_url = service_url.rstrip("/") + "/"
+    deadline = asyncio.get_running_loop().time() + BOT2_DEPLOY_WAIT_SECONDS
+    last_problem = "Render ще запускає сервіс."
+    timeout = aiohttp.ClientTimeout(total=25)
+
+    await thread.send("⏳ **Перевіряю запуск створеного сервісу в Render...**")
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                async with session.get(health_url) as response:
+                    body = await response.text()
+                    if response.status == 200:
+                        try:
+                            payload = json.loads(body)
+                        except json.JSONDecodeError:
+                            payload = {}
+                        healthy = isinstance(payload, dict) and payload.get("status") == "ok"
+                        discord_ok = (not require_discord_ready) or (isinstance(payload, dict) and payload.get("discord_ready") is True)
+                        if healthy and discord_ok:
+                            await thread.send("✅ **Render health-check успішний. Сервіс відповідає та готовий.**")
+                            return True
+                        last_problem = "Health endpoint відповідає, але сервіс або Discord ще не готовий."
+                    else:
+                        last_problem = f"Health endpoint повернув HTTP {response.status}."
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                last_problem = f"Очікування Render: {type(error).__name__}."
+            await asyncio.sleep(max(3, BOT2_HEALTH_POLL_INTERVAL))
+
+    await thread.send(
+        "❌ **Не вдалося підтвердити готовність сервісу.**\\n\\n"
+        f"Останній стан: {last_problem}\\n"
+        "Проєкт збережено в GitHub, але я не позначаю його як готовий. Перевір Render Logs."
+    )
+    return False
+
 
 
 # ============================================================
@@ -2832,8 +2972,17 @@ async def build_and_deploy_software_bot(
         )
         return True
 
+    # A successful Render API response means only that a service record was created.
+    ready = await wait_for_generated_service_ready(
+        order.deployment_url,
+        thread,
+        require_discord_ready=(generated_platform == "Discord"),
+    )
+    if not ready:
+        return False
+
     message = (
-        "📦 **Проєкт опубліковано в GitHub і передано на розгортання в Render.**\n\n"
+        "📦 **Проєкт опубліковано в GitHub і запущено в Render.**\n\n"
         f"📁 GitHub: `{repo}/{root_dir}`\n"
     )
     if order.deployment_url:
@@ -3134,15 +3283,13 @@ async def process_order(
                 print(
                     f"Type: {type(error).__name__}"
                 )
-                print(
-                    f"Message: {safe_exception(error)}"
-                )
-                print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
+                safe_error = safe_error_detail(error)
+                print(f"Safe diagnostic: {safe_error}")
+                print("[TRACEBACK OMITTED] Секрети та повний traceback не виводяться.")
                 print(
                     "========================================"
                 )
 
-                safe_error = safe_exception(error)
                 await thread.send(
                     "❌ **Не вдалося завершити створення "
                     "програмного бота.**\n\n"
@@ -3239,11 +3386,9 @@ async def process_order(
             f"Type: {type(error).__name__}"
         )
 
-        print(
-            f"Message: {safe_exception(error)}"
-        )
-
-        print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
+        safe_error = safe_error_detail(error)
+        print(f"Safe diagnostic: {safe_error}")
+        print("[TRACEBACK OMITTED] Секрети та повний traceback не виводяться.")
 
         print(
             "========================================"
@@ -3252,8 +3397,8 @@ async def process_order(
         try:
             await message.channel.send(
                 f"{message.author.mention}, "
-                f"під час обробки замовлення "
-                f"сталася технічна помилка."
+                f"під час обробки замовлення сталася технічна помилка.\n"
+                f"Безпечна причина: `{safe_error}`"
             )
 
         except Exception:
