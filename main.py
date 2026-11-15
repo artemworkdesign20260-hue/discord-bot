@@ -3276,11 +3276,9 @@ async def process_order(
             f"Type: {type(error).__name__}"
         )
 
-        print(
-            f"Message: {safe_exception(error)}"
-        )
-
-        print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
+        safe_error = safe_error_detail(error)
+        print(f"Safe diagnostic: {safe_error}")
+        print("[TRACEBACK OMITTED] Секрети та повний traceback не виводяться.")
 
         print(
             "========================================"
@@ -3289,8 +3287,8 @@ async def process_order(
         try:
             await message.channel.send(
                 f"{message.author.mention}, "
-                f"під час обробки замовлення "
-                f"сталася технічна помилка."
+                f"під час обробки замовлення сталася технічна помилка.\n"
+                f"Безпечна причина: `{safe_error}`"
             )
 
         except Exception:
