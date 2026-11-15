@@ -2298,9 +2298,37 @@ async def generate_software_project(client_task: str):
 
     validation_errors = validate_generated_project(files, bot2=bot2)
     if validation_errors:
-        raise RuntimeError(
-            "Згенерований проєкт не пройшов перевірку; файли НЕ опубліковано:\n- "
+        # One automatic repair attempt prevents a malformed first LLM response
+        # from immediately terminating the whole order.
+        repair_prompt = (
+            "Попередня генерація не пройшла перевірку. Виправ усі помилки "
+            "та поверни ПОВНІСТЮ всі три файли у точному форматі ===FILE: ...===.\n"
+            "Помилки перевірки:\n- "
             + "\n- ".join(validation_errors)
+            + "\n\nПочаткове технічне завдання:\n" + client_task
+            + "\n\nСпеціальні вимоги:\n" + special_requirements
+        )
+        repaired_result = await groq_request(
+            repair_prompt,
+            max_output_tokens=30000
+        )
+        files = {}
+        for filename, pattern in patterns.items():
+            match = re.search(pattern, repaired_result, re.IGNORECASE | re.DOTALL)
+            if match:
+                content = match.group(1).strip()
+                content = re.sub(
+                    r"^```(?:python|text|markdown)?\\s*", "", content,
+                    flags=re.IGNORECASE
+                )
+                content = re.sub(r"\\s*```$", "", content)
+                files[filename] = content.strip()
+        validation_errors = validate_generated_project(files, bot2=bot2)
+
+    if validation_errors:
+        raise RuntimeError(
+            "Згенерований проєкт не пройшов перевірку навіть після повторного виправлення; "
+            "файли НЕ опубліковано:\n- " + "\n- ".join(validation_errors)
         )
 
     return files
