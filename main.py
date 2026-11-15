@@ -713,18 +713,38 @@ async def groq_request(
                         data = {}
 
                     if response.status >= 400:
-                        error_message = data.get("error", {}).get("message", response_text)
+                        api_error = data.get("error") if isinstance(data, dict) else None
+                        if isinstance(api_error, dict):
+                            error_message = api_error.get("message") or response_text
+                        elif isinstance(api_error, str):
+                            error_message = api_error
+                        else:
+                            error_message = response_text or "порожня відповідь API"
+                        error_message = redact_sensitive_text(str(error_message))
+                        error_message = re.sub(
+                            r"(?i)(bearer\s+)[^\s]+",
+                            r"\1[REDACTED]",
+                            error_message,
+                        )
                         raise RuntimeError(
-                            f"Groq API HTTP {response.status}: {error_message}"
+                            f"Groq API HTTP {response.status}: {error_message[:500]}"
                         )
 
-                    choices = data.get("choices") or []
+                    if not isinstance(data, dict):
+                        raise RuntimeError("Groq API повернув JSON неочікуваного формату.")
+
+                    choices = data.get("choices")
+                    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                        raise RuntimeError("Groq API не повернув список choices у відповіді.")
+
+                    response_message = choices[0].get("message")
                     content = (
-                        choices[0].get("message", {}).get("content")
-                        if choices else None
+                        response_message.get("content")
+                        if isinstance(response_message, dict)
+                        else None
                     )
-                    if not content or not content.strip():
-                        raise RuntimeError("Groq повернув порожню відповідь.")
+                    if not isinstance(content, str) or not content.strip():
+                        raise RuntimeError("Groq повернув порожню або некоректну відповідь.")
 
                     return content.strip()
 
@@ -732,7 +752,7 @@ async def groq_request(
             last_error = error
             print(
                 f"[GROQ ERROR] Attempt {attempt}/{total_attempts}: "
-                f"{safe_exception(error)}"
+                f"{safe_error_detail(error)}"
             )
             error_text = str(error).lower()
             # asyncio.TimeoutError and aiohttp network errors often have an
@@ -754,9 +774,14 @@ async def groq_request(
             print(f"[GROQ] Тимчасова помилка. Повтор через {delay:.1f}s...")
             await asyncio.sleep(delay)
 
+    last_error_detail = (
+        safe_error_detail(last_error)
+        if last_error is not None
+        else "невідома помилка"
+    )
     raise RuntimeError(
         f"Groq тимчасово недоступний після {total_attempts} спроб. "
-        f"Остання помилка: {safe_exception(last_error)}"
+        f"Остання помилка: {last_error_detail}"
     )
 
 
@@ -2037,7 +2062,7 @@ async def generate_test_and_fix_website(
             )
 
             print(
-                safe_exception(error)
+                safe_error_detail(error)
             )
 
             print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
@@ -2503,6 +2528,7 @@ async def wait_for_generated_service_ready(
 # ============================================================
 
 GITHUB_API_URL = "https://api.github.com"
+GITHUB_WRITE_LOCK = asyncio.Lock()
 
 _GITHUB_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
@@ -2619,62 +2645,63 @@ async def github_upsert_file(
 
     timeout = aiohttp.ClientTimeout(total=60)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        sha = None
-
-        async with session.get(
-            url,
-            headers=headers,
-            params={"ref": branch}
-        ) as response:
-            if response.status == 200:
-                data = await response.json()
-                sha = data.get("sha")
-            elif response.status != 404:
+    async with GITHUB_WRITE_LOCK:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            sha = None
+    
+            async with session.get(
+                url,
+                headers=headers,
+                params={"ref": branch}
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    sha = data.get("sha")
+                elif response.status != 404:
+                    body = await response.text()
+                    raise RuntimeError(
+                        f"GitHub GET failed HTTP {response.status}; відповідь API приховано."
+                    )
+    
+            payload = {
+                "message": commit_message,
+                "content": base64.b64encode(
+                    content.encode("utf-8")
+                ).decode("ascii"),
+                "branch": branch,
+            }
+    
+            if sha:
+                payload["sha"] = sha
+    
+            async with session.put(
+                url,
+                headers=headers,
+                json=payload
+            ) as response:
+                status = response.status
                 body = await response.text()
-                raise RuntimeError(
-                    f"GitHub GET failed HTTP {response.status}; відповідь API приховано."
-                )
-
-        payload = {
-            "message": commit_message,
-            "content": base64.b64encode(
-                content.encode("utf-8")
-            ).decode("ascii"),
-            "branch": branch,
-        }
-
-        if sha:
-            payload["sha"] = sha
-
-        async with session.put(
-            url,
-            headers=headers,
-            json=payload
-        ) as response:
-            status = response.status
-            body = await response.text()
-
-        if status not in (200, 201):
-            message = f"GitHub PUT failed HTTP {status}; відповідь API приховано."
-
-            if status == 404:
-                # Для PUT 404 означає не "файл відсутній" (файл буде
-                # створено), а проблему з репозиторієм, доступом або гілкою.
-                try:
-                    diagnosis = await _diagnose_github_404(
-                        session, headers, repo, branch
-                    )
-                except Exception as diag_error:
-                    diagnosis = (
-                        "Діагностика не вдалася: "
-                        f"{type(diag_error).__name__}"
-                    )
-                message += f"\nДіагностика: {diagnosis}"
-
-            raise RuntimeError(message)
-
-        data = json.loads(body)
+    
+            if status not in (200, 201):
+                message = f"GitHub PUT failed HTTP {status}; відповідь API приховано."
+    
+                if status == 404:
+                    # Для PUT 404 означає не "файл відсутній" (файл буде
+                    # створено), а проблему з репозиторієм, доступом або гілкою.
+                    try:
+                        diagnosis = await _diagnose_github_404(
+                            session, headers, repo, branch
+                        )
+                    except Exception as diag_error:
+                        diagnosis = (
+                            "Діагностика не вдалася: "
+                            f"{type(diag_error).__name__}"
+                        )
+                    message += f"\nДіагностика: {diagnosis}"
+    
+                raise RuntimeError(message)
+    
+            data = json.loads(body)
 
     return data
 
@@ -2770,18 +2797,9 @@ async def deploy_project_to_render(
             }
         ]
 
-        # Bot 2 is Discord-only: never pass Telegram credentials to it.
-        optional_env = {}
-        is_bot2_service = bool(extra_env and extra_env.get("BOT2_MODE") == "1")
-        if not is_bot2_service:
-            optional_env.update({
-                "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-                "TELEGRAM_API_ID": TELEGRAM_API_ID,
-                "TELEGRAM_API_HASH": TELEGRAM_API_HASH,
-            })
-
-        if extra_env:
-            optional_env.update(extra_env)
+        # Generated services receive only credentials explicitly required
+        # by their task. Never copy Grox's unrelated platform credentials.
+        optional_env = dict(extra_env or {})
 
         for key, value in optional_env.items():
             if value:
@@ -2891,6 +2909,21 @@ async def build_and_deploy_software_bot(
 
     bot2 = is_bot2_project(order.task)
     generated_platform = "Discord" if bot2 else detect_bot_platform(order.task)
+
+    if generated_platform != "Discord":
+        await thread.send(
+            "⚠️ **Зараз Grox автоматично створює лише Discord-ботів.**\n\n"
+            "Інші платформи не розгортатиму, щоб не передавати зайві облікові дані."
+        )
+        return False
+
+    if GENERATED_DISCORD_TOKEN == DISCORD_TOKEN:
+        await thread.send(
+            "🔒 **Токен нового бота збігається з токеном самого Grox.**\n\n"
+            "Створи окремий Discord application/bot і налаштуй його токен "
+            "у GROX_BUILDER_DISCORD_TOKEN. Не використовуй токен Grox."
+        )
+        return False
 
     if generated_platform == "Discord" and not GENERATED_DISCORD_TOKEN:
         await thread.send(
@@ -3245,7 +3278,7 @@ async def process_order(
                 )
 
                 print(
-                    f"Message: {safe_exception(error)}"
+                    f"Safe diagnostic: {safe_error_detail(error)}"
                 )
 
                 print("[TRACEBACK OMITTED] Деталі помилки приховано, щоб виключити витік секретів.")
