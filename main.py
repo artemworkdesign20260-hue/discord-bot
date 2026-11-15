@@ -101,7 +101,7 @@ def safe_error_detail(error: Exception, limit: int = 1200) -> str:
     if not isinstance(error, RuntimeError):
         return type(error).__name__
     detail = redact_sensitive_text(str(error)).strip()
-    detail = re.sub(r"(?i)(bearer\\s+)[^\\s]+", r"\\1[REDACTED]", detail)
+    detail = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1[REDACTED]", detail)
     if not detail:
         return type(error).__name__
     return detail[:limit]
