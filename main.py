@@ -2679,6 +2679,37 @@ async def _diagnose_github_404(session, headers, repo, branch) -> str:
     )
 
 
+def _safe_github_error_detail(status: int, body: str, request_id: str | None = None) -> str:
+    """Повертає корисну, але безпечну діагностику відповіді GitHub API."""
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+
+    raw_message = payload.get("message", "") if isinstance(payload, dict) else ""
+    if not isinstance(raw_message, str):
+        raw_message = ""
+
+    # Не показуємо токен або заголовок авторизації навіть якщо вони випадково є у відповіді.
+    detail = raw_message.replace(GITHUB_TOKEN, "[REDACTED]") if GITHUB_TOKEN else raw_message
+    detail = re.sub(r"(?i)(Bearer|token)\\s+[A-Za-z0-9_\\-]+", r"\\1 [REDACTED]", detail)
+    detail = re.sub(r"[\\r\\n\\t]+", " ", detail)
+    detail = re.sub(r"\\s{2,}", " ", detail).strip()
+    detail = detail[:500] or "GitHub не надав текстового пояснення."
+
+    documentation_url = payload.get("documentation_url", "") if isinstance(payload, dict) else ""
+    if not isinstance(documentation_url, str) or not documentation_url.startswith("https://docs.github.com/"):
+        documentation_url = ""
+
+    safe_request_id = request_id if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9-]{1,100}", request_id) else ""
+    parts = [f"GitHub API: {detail}"]
+    if documentation_url:
+        parts.append(f"Документація: {documentation_url}")
+    if safe_request_id:
+        parts.append(f"Request ID: {safe_request_id}")
+    return f"HTTP {status}. " + " | ".join(parts)
+
+
 async def github_upsert_file(
     repo_path: str,
     file_path: str,
@@ -2727,9 +2758,9 @@ async def github_upsert_file(
                     sha = data.get("sha")
                 elif response.status != 404:
                     body = await response.text()
-                    raise RuntimeError(
-                        f"GitHub GET failed HTTP {response.status}; відповідь API приховано."
-                    )
+                    request_id = response.headers.get("X-GitHub-Request-Id")
+                    detail = _safe_github_error_detail(response.status, body, request_id)
+                    raise RuntimeError(f"GitHub GET failed: {detail}")
     
             payload = {
                 "message": commit_message,
@@ -2749,13 +2780,14 @@ async def github_upsert_file(
             ) as response:
                 status = response.status
                 body = await response.text()
+                request_id = response.headers.get("X-GitHub-Request-Id")
     
             if status not in (200, 201):
-                message = f"GitHub PUT failed HTTP {status}; відповідь API приховано."
+                detail = _safe_github_error_detail(status, body, request_id)
+                message = f"GitHub PUT failed: {detail}"
     
                 if status == 404:
-                    # Для PUT 404 означає не "файл відсутній" (файл буде
-                    # створено), а проблему з репозиторієм, доступом або гілкою.
+                    # Для PUT 404 додатково перевіряємо доступ до репозиторію та гілки.
                     try:
                         diagnosis = await _diagnose_github_404(
                             session, headers, repo, branch
@@ -2765,7 +2797,7 @@ async def github_upsert_file(
                             "Діагностика не вдалася: "
                             f"{type(diag_error).__name__}"
                         )
-                    message += f"\nДіагностика: {diagnosis}"
+                    message += f"\\nДіагностика: {diagnosis}"
     
                 raise RuntimeError(message)
     
