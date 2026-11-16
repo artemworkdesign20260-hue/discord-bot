@@ -105,7 +105,7 @@ def safe_error_detail(error: Exception, limit: int = 1200) -> str:
         detail = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1[REDACTED]", detail)
         # Keep diagnostics compact and prevent control characters from shaping
         # Discord messages or log output.
-    detail = re.sub(r"[\r\n\t]+", " ", detail)
+        detail = re.sub(r"[\r\n\t]+", " ", detail)
         detail = re.sub(r"\s+", " ", detail).strip()
     except Exception:
         return error_type
