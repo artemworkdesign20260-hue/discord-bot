@@ -105,7 +105,7 @@ def safe_error_detail(error: Exception, limit: int = 1200) -> str:
         detail = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1[REDACTED]", detail)
         # Keep diagnostics compact and prevent control characters from shaping
         # Discord messages or log output.
-        detail = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", detail)
+    detail = re.sub(r"[\r\n\t]+", " ", detail)
         detail = re.sub(r"\s+", " ", detail).strip()
     except Exception:
         return error_type
@@ -2693,7 +2693,7 @@ def _safe_github_error_detail(status: int, body: str, request_id: str | None = N
     # Не показуємо токен або заголовок авторизації навіть якщо вони випадково є у відповіді.
     detail = raw_message.replace(GITHUB_TOKEN, "[REDACTED]") if GITHUB_TOKEN else raw_message
     detail = re.sub(r"(?i)(Bearer|token)\s+[A-Za-z0-9_\-]+", r"\1 [REDACTED]", detail)
-    detail = re.sub(r"[\\r\\n\\t]+", " ", detail)
+    detail = re.sub(r"[\r\n\t]+", " ", detail)
     detail = re.sub(r"\s{2,}", " ", detail).strip()
     detail = detail[:500] or "GitHub не надав текстового пояснення."
 
