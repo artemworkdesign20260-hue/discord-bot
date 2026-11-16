@@ -2692,9 +2692,9 @@ def _safe_github_error_detail(status: int, body: str, request_id: str | None = N
 
     # Не показуємо токен або заголовок авторизації навіть якщо вони випадково є у відповіді.
     detail = raw_message.replace(GITHUB_TOKEN, "[REDACTED]") if GITHUB_TOKEN else raw_message
-    detail = re.sub(r"(?i)(Bearer|token)\\s+[A-Za-z0-9_\\-]+", r"\\1 [REDACTED]", detail)
+    detail = re.sub(r"(?i)(Bearer|token)\s+[A-Za-z0-9_\-]+", r"\1 [REDACTED]", detail)
     detail = re.sub(r"[\\r\\n\\t]+", " ", detail)
-    detail = re.sub(r"\\s{2,}", " ", detail).strip()
+    detail = re.sub(r"\s{2,}", " ", detail).strip()
     detail = detail[:500] or "GitHub не надав текстового пояснення."
 
     documentation_url = payload.get("documentation_url", "") if isinstance(payload, dict) else ""
