@@ -2679,6 +2679,52 @@ async def _diagnose_github_404(session, headers, repo, branch) -> str:
     )
 
 
+async def _diagnose_github_403(session, headers, repo) -> str:
+    """Перевіряє, ким GitHub бачить PAT і чи має він push-доступ до repo."""
+    details = []
+
+    async with session.get(
+        f"{GITHUB_API_URL}/user", headers=headers
+    ) as response:
+        user_status = response.status
+        user_data = await response.json() if user_status == 200 else {}
+
+    async with session.get(
+        f"{GITHUB_API_URL}/repos/{repo}", headers=headers
+    ) as response:
+        repo_status = response.status
+        repo_data = await response.json() if repo_status == 200 else {}
+
+    if user_status == 200:
+        login = user_data.get("login")
+        if login:
+            details.append(f"PAT авторизований як @{login}")
+            owner = (repo_data.get("owner") or {}).get("login")
+            if owner and login.lower() != owner.lower():
+                details.append(
+                    f"власник репозиторію — @{owner}, а власник PAT — @{login}"
+                )
+    else:
+        details.append(f"перевірка власника PAT повернула HTTP {user_status}")
+
+    if repo_status == 200:
+        permissions = repo_data.get("permissions") or {}
+        if "push" in permissions:
+            details.append(
+                "GitHub підтверджує push-доступ до репозиторію"
+                if permissions.get("push")
+                else "GitHub НЕ підтверджує push-доступ до репозиторію"
+            )
+        else:
+            details.append("GitHub не повернув permissions.push для цього PAT")
+    else:
+        details.append(
+            f"перевірка доступу до репозиторію повернула HTTP {repo_status}"
+        )
+
+    return "Діагностика PAT: " + "; ".join(details) + "."
+
+
 def _safe_github_error_detail(status: int, body: str, request_id: str | None = None) -> str:
     """Повертає корисну, але безпечну діагностику відповіді GitHub API."""
     try:
@@ -2802,6 +2848,18 @@ async def github_upsert_file(
                             f"{type(diag_error).__name__}"
                         )
                     message += f"\\nДіагностика: {diagnosis}"
+                elif status == 403:
+                    # Перевіряємо реального власника PAT і push-доступ.
+                    try:
+                        diagnosis = await _diagnose_github_403(
+                            session, headers, repo
+                        )
+                    except Exception as diag_error:
+                        diagnosis = (
+                            "Діагностика PAT не вдалася: "
+                            f"{type(diag_error).__name__}"
+                        )
+                    message += f"\\n{diagnosis}"
     
                 raise RuntimeError(message)
     
