@@ -2875,7 +2875,8 @@ async def github_upsert_file(
 async def deploy_project_to_render(
     service_name: str,
     root_dir: str,
-    extra_env: dict[str, str] | None = None
+    extra_env: dict[str, str] | None = None,
+    is_bot2_service: bool = False
 ):
     if not RENDER_API_KEY:
         raise RuntimeError(
@@ -3149,7 +3150,8 @@ async def build_and_deploy_software_bot(
     render_info = await deploy_project_to_render(
         service_name,
         root_dir,
-        extra_env=render_env
+        extra_env=render_env,
+        is_bot2_service=bot2
     )
 
     order.render_service_id = render_info.get("id")
