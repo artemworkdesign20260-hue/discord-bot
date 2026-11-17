@@ -879,9 +879,9 @@ FINAL_TZ: ...
     # Never let the requirements model ask a client to disclose credentials.
     # Integrations are configured by the owner in the server environment.
     credential_request = re.search(
-        r"(?i)\\b(?:github\\s*)?(?:pat|token|api\\s*key|access\\s*key|"
-        r"парол\\w*|токен\\w*|ключ\\w*|секрет\\w*|"
-        r"database\\s*url|\\.env)\\b",
+        r"(?i)\b(?:github\s*)?(?:pat|token|api\s*key|access\s*key|"
+        r"парол\w*|токен\w*|ключ\w*|секрет\w*|"
+        r"database\s*url|\.env)\b",
         question
     )
     if credential_request:
