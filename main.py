@@ -821,6 +821,15 @@ async def analyze_requirements(conversation: str):
 Максимум одне коротке питання за раунд. Не повторюй уже надану інформацію.
 Якщо завдання зрозуміле хоча б на базовому рівні — сформуй ТЗ і починай роботу.
 
+ВАЖЛИВО ПРО СЕКРЕТИ ТА ІНТЕГРАЦІЇ:
+- НІКОЛИ не проси клієнта надсилати GitHub PAT, GitHub token, API key,
+  пароль, database URL, .env або будь-який інший секрет у Discord чи чат.
+- Інтеграції Grox уже налаштовуються власником через змінні середовища сервера.
+  Для GitHub використовуй налаштований GITHUB_TOKEN автоматично.
+- Якщо потрібного секрету немає в серверній конфігурації, не проси його у клієнта:
+  повідом про внутрішню помилку конфігурації власнику Grox окремо.
+- Наявність або відсутність секретів НЕ є уточненням до технічного завдання клієнта.
+
 Якщо інформації достатньо:
 - сформуй повне фінальне ТЗ;
 - використовуй ТІЛЬКИ інформацію з розмови;
@@ -860,21 +869,39 @@ FINAL_TZ: ...
         re.IGNORECASE | re.DOTALL
     )
 
+    ready = bool(
+        ready_match
+        and ready_match.group(1).upper() == "YES"
+    )
+    question = question_match.group(1).strip() if question_match else ""
+    final_tz = final_match.group(1).strip() if final_match else ""
+
+    # Never let the requirements model ask a client to disclose credentials.
+    # Integrations are configured by the owner in the server environment.
+    credential_request = re.search(
+        r"(?i)\\b(?:github\\s*)?(?:pat|token|api\\s*key|access\\s*key|"
+        r"парол\\w*|токен\\w*|ключ\\w*|секрет\\w*|"
+        r"database\\s*url|\\.env)\\b",
+        question
+    )
+    if credential_request:
+        if GITHUB_TOKEN:
+            # The credential is already configured server-side; it is not a
+            # client requirement. Continue using the provided task description.
+            ready = True
+            final_tz = final_tz or conversation
+        else:
+            # Do not expose a request for secrets to the client.
+            ready = False
+            question = (
+                "Внутрішня конфігурація інтеграції потребує перевірки "
+                "власником Grox. Будь ласка, продовжуйте описувати функції проєкту."
+            )
+
     return {
-        "ready": bool(
-            ready_match
-            and ready_match.group(1).upper() == "YES"
-        ),
-        "question": (
-            question_match.group(1).strip()
-            if question_match
-            else ""
-        ),
-        "final_tz": (
-            final_match.group(1).strip()
-            if final_match
-            else ""
-        ),
+        "ready": ready,
+        "question": question,
+        "final_tz": final_tz,
     }
 
 
