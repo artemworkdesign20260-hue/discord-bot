@@ -2781,9 +2781,13 @@ async def github_upsert_file(
                 status = response.status
                 body = await response.text()
                 request_id = response.headers.get("X-GitHub-Request-Id")
+                accepted_permissions = response.headers.get("X-Accepted-GitHub-Permissions", "")
     
             if status not in (200, 201):
                 detail = _safe_github_error_detail(status, body, request_id)
+                if accepted_permissions:
+                    safe_permissions = re.sub(r"[^A-Za-z0-9_=,; -]", "", accepted_permissions)[:200]
+                    detail += f" | Потрібні права GitHub API (X-Accepted-GitHub-Permissions): {safe_permissions}"
                 message = f"GitHub PUT failed: {detail}"
     
                 if status == 404:
