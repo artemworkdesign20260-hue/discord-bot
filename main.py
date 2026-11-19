@@ -736,8 +736,8 @@ async def groq_request(
                             error_message = response_text or "порожня відповідь API"
                         error_message = redact_sensitive_text(str(error_message))
                         error_message = re.sub(
-                            r"(?i)(bearer\\s+)[^\\s]+",
-                            r"\\1[REDACTED]",
+                            r"(?i)(bearer\s+)[^\s]+",
+                            r"\1[REDACTED]",
                             error_message,
                         )
 
@@ -745,7 +745,7 @@ async def groq_request(
                         # Prefer its token-window reset header; otherwise wait
                         # for a full minute before retrying the same request.
                         error_lower = error_message.casefold()
-                        if "tokens per minute" in error_lower or re.search(r"\\btpm\\b", error_lower):
+                        if "tokens per minute" in error_lower or re.search(r"\btpm\b", error_lower):
                             for header_name in (
                                 "retry-after",
                                 "x-ratelimit-reset-tokens",
@@ -757,7 +757,7 @@ async def groq_request(
                                     retry_delay_hint = max(1, int(float(header_value)) + 1)
                                 except (TypeError, ValueError):
                                     seconds_match = re.fullmatch(
-                                        r"\\s*(\\d+(?:\\.\\d+)?)s\\s*",
+                                        r"\s*(\d+(?:\.\d+)?)s\s*",
                                         header_value,
                                         re.IGNORECASE,
                                     )
@@ -802,7 +802,7 @@ async def groq_request(
             # oversized request body: only the explicit TPM message is retried.
             tpm_limited = (
                 "tokens per minute" in error_text
-                or bool(re.search(r"\\btpm\\b", error_text))
+                or bool(re.search(r"\btpm\b", error_text))
             )
             # asyncio.TimeoutError and aiohttp network errors often have an
             # EMPTY message, so the text check below cannot recognise them.
