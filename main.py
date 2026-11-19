@@ -707,6 +707,7 @@ async def groq_request(
     timeout = aiohttp.ClientTimeout(total=CLIENT_TIMEOUT)
 
     for attempt in range(1, total_attempts + 1):
+        retry_delay_hint = None
         try:
             print(
                 f"[GROQ] Attempt {attempt}/{total_attempts} "
@@ -735,10 +736,38 @@ async def groq_request(
                             error_message = response_text or "порожня відповідь API"
                         error_message = redact_sensitive_text(str(error_message))
                         error_message = re.sub(
-                            r"(?i)(bearer\s+)[^\s]+",
-                            r"\1[REDACTED]",
+                            r"(?i)(bearer\\s+)[^\\s]+",
+                            r"\\1[REDACTED]",
                             error_message,
                         )
+
+                        # Groq may report an organization TPM limit as HTTP 413.
+                        # Prefer its token-window reset header; otherwise wait
+                        # for a full minute before retrying the same request.
+                        error_lower = error_message.casefold()
+                        if "tokens per minute" in error_lower or re.search(r"\\btpm\\b", error_lower):
+                            for header_name in (
+                                "retry-after",
+                                "x-ratelimit-reset-tokens",
+                            ):
+                                header_value = response.headers.get(header_name)
+                                if not header_value:
+                                    continue
+                                try:
+                                    retry_delay_hint = max(1, int(float(header_value)) + 1)
+                                except (TypeError, ValueError):
+                                    seconds_match = re.fullmatch(
+                                        r"\\s*(\\d+(?:\\.\\d+)?)s\\s*",
+                                        header_value,
+                                        re.IGNORECASE,
+                                    )
+                                    if seconds_match:
+                                        retry_delay_hint = max(
+                                            1, int(float(seconds_match.group(1))) + 1
+                                        )
+                                if retry_delay_hint is not None:
+                                    break
+
                         raise RuntimeError(
                             f"Groq API HTTP {response.status}: {error_message[:500]}"
                         )
@@ -768,12 +797,19 @@ async def groq_request(
                 f"{safe_error_detail(error)}"
             )
             error_text = str(error).lower()
+            # Groq's on_demand tier can return HTTP 413 for an organization
+            # tokens-per-minute (TPM) limit. This is distinct from a genuinely
+            # oversized request body: only the explicit TPM message is retried.
+            tpm_limited = (
+                "tokens per minute" in error_text
+                or bool(re.search(r"\\btpm\\b", error_text))
+            )
             # asyncio.TimeoutError and aiohttp network errors often have an
             # EMPTY message, so the text check below cannot recognise them.
             temporary = isinstance(
                 error,
                 (asyncio.TimeoutError, aiohttp.ClientError)
-            ) or any(code in error_text for code in (
+            ) or tpm_limited or any(code in error_text for code in (
                 "429", "rate limit", "resource exhausted", "503",
                 "unavailable", "temporarily", "deadline", "timeout",
                 "overloaded", "service unavailable", "502", "504",
@@ -783,8 +819,15 @@ async def groq_request(
                 raise
             if attempt >= total_attempts:
                 break
-            delay = min(60, (2 ** (attempt - 1)) + random.uniform(0.5, 2.0))
-            print(f"[GROQ] Тимчасова помилка. Повтор через {delay:.1f}s...")
+            if tpm_limited:
+                delay = float(retry_delay_hint or 60) + random.uniform(0.5, 2.0)
+                print(
+                    f"[GROQ] TPM-ліміт організації. Чекаю скидання вікна "
+                    f"та повторю через {delay:.1f}s..."
+                )
+            else:
+                delay = min(60, (2 ** (attempt - 1)) + random.uniform(0.5, 2.0))
+                print(f"[GROQ] Тимчасова помилка. Повтор через {delay:.1f}s...")
             await asyncio.sleep(delay)
 
     last_error_detail = (
