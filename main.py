@@ -120,6 +120,14 @@ GROQ_MODEL = os.getenv(
     "openai/gpt-oss-120b"
 )
 
+# Groq TPM guard. Keep a safety margin because the provider counts input,
+# reserved output tokens, and other requests made during the same minute.
+GROQ_TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "8000"))
+GROQ_TPM_RESERVE = int(os.getenv("GROQ_TPM_RESERVE", "700"))
+GROQ_MIN_COMPLETION_TOKENS = int(
+    os.getenv("GROQ_MIN_COMPLETION_TOKENS", "256")
+)
+
 CLIENT_TIMEOUT = int(
     os.getenv("CLIENT_TIMEOUT", "600")
 )
@@ -688,12 +696,52 @@ def extract_budget(text: str):
 # GROQ REQUEST
 # ============================================================
 
+def estimate_groq_prompt_tokens(prompt: str) -> int:
+    """
+    Conservative local estimate without another tokenizer dependency.
+    Non-ASCII text is budgeted more heavily; ASCII code/punctuation also
+    gets a conservative allowance. This is a guard, not an exact tokenizer.
+    """
+    non_ascii = sum(1 for char in prompt if ord(char) > 127)
+    ascii_chars = len(prompt) - non_ascii
+    return max(1, int(non_ascii * 1.0 + ascii_chars * 0.6) + 100)
+
+
 async def groq_request(
     prompt: str,
     max_output_tokens: int
 ):
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("Порожній запит до Groq.")
+
     last_error = None
     total_attempts = max(1, GROQ_RETRIES + 1)
+
+    # Leave headroom for estimation error and concurrent requests using the
+    # same organization-level TPM quota.
+    estimated_input_tokens = estimate_groq_prompt_tokens(prompt)
+    available_output_tokens = (
+        GROQ_TPM_LIMIT - GROQ_TPM_RESERVE - estimated_input_tokens
+    )
+    if available_output_tokens < GROQ_MIN_COMPLETION_TOKENS:
+        raise RuntimeError(
+            "Запит до Groq завеликий для поточного ліміту TPM. "
+            "Потрібно скоротити вхідний контекст або розбити завдання на частини. "
+            f"Оцінка вхідних токенів: {estimated_input_tokens}; "
+            f"ліміт: {GROQ_TPM_LIMIT}; резерв: {GROQ_TPM_RESERVE}."
+        )
+
+    current_max_output_tokens = min(
+        max(GROQ_MIN_COMPLETION_TOKENS, int(max_output_tokens)),
+        available_output_tokens,
+    )
+    if current_max_output_tokens < max_output_tokens:
+        print(
+            f"[GROQ] Output cap adjusted: requested={max_output_tokens}, "
+            f"using={current_max_output_tokens}, "
+            f"estimated_input={estimated_input_tokens}, "
+            f"TPM_limit={GROQ_TPM_LIMIT}"
+        )
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -702,7 +750,7 @@ async def groq_request(
     payload = {
         "model": GROQ_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "max_completion_tokens": max_output_tokens,
+        "max_completion_tokens": current_max_output_tokens,
     }
     timeout = aiohttp.ClientTimeout(total=CLIENT_TIMEOUT)
 
@@ -710,7 +758,8 @@ async def groq_request(
         try:
             print(
                 f"[GROQ] Attempt {attempt}/{total_attempts} "
-                f"model={GROQ_MODEL}"
+                f"model={GROQ_MODEL} "
+                f"max_completion_tokens={payload['max_completion_tokens']}"
             )
 
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -768,13 +817,37 @@ async def groq_request(
                 f"{safe_error_detail(error)}"
             )
             error_text = str(error).lower()
+
+            # A 413 from Groq can mean the reserved completion budget would
+            # exceed TPM. Reduce the output reservation before retrying.
+            if "413" in error_text and payload["max_completion_tokens"] > GROQ_MIN_COMPLETION_TOKENS:
+                requested_match = re.search(r"Requested\s+(\d+)", str(error), re.IGNORECASE)
+                limit_match = re.search(r"Limit\s+(\d+)", str(error), re.IGNORECASE)
+                if requested_match and limit_match:
+                    overage = max(
+                        1,
+                        int(requested_match.group(1)) - int(limit_match.group(1))
+                    )
+                    reduced = payload["max_completion_tokens"] - overage - 300
+                else:
+                    reduced = int(payload["max_completion_tokens"] * 0.65)
+
+                payload["max_completion_tokens"] = max(
+                    GROQ_MIN_COMPLETION_TOKENS,
+                    min(payload["max_completion_tokens"] - 1, reduced),
+                )
+                print(
+                    "[GROQ] HTTP 413: reduced max_completion_tokens to "
+                    f"{payload['max_completion_tokens']} and will retry."
+                )
+
             # asyncio.TimeoutError and aiohttp network errors often have an
             # EMPTY message, so the text check below cannot recognise them.
             temporary = isinstance(
                 error,
                 (asyncio.TimeoutError, aiohttp.ClientError)
             ) or any(code in error_text for code in (
-                "429", "rate limit", "resource exhausted", "503",
+                "413", "429", "rate limit", "resource exhausted", "503",
                 "unavailable", "temporarily", "deadline", "timeout",
                 "overloaded", "service unavailable", "502", "504",
             ))
