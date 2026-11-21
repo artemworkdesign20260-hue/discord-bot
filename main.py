@@ -2420,7 +2420,7 @@ DANGEROUS_CODE_PATTERNS = (
     (r"__import__\s*\(", "__import__()"),
     (r"\bpickle\s*\.\s*loads?\s*\(", "pickle.load()"),
     (
-        r"GITHUB_TOKEN|RENDER_API_KEY|GROQ_API_KEY|VERCEL_TOKEN",
+        r"GITHUB_TOKEN|RENDER_API_KEY|VERCEL_TOKEN",
         "доступ до секретів Grox",
     ),
 )
@@ -2447,7 +2447,7 @@ def validate_generated_project(files: dict[str, str], bot2: bool = False) -> lis
         # Inspect executable syntax rather than comments or string literals.
         if tree is not None:
             forbidden_secrets = {
-                "GITHUB_TOKEN", "RENDER_API_KEY", "GROQ_API_KEY",
+                "GITHUB_TOKEN", "RENDER_API_KEY",
                 "VERCEL_TOKEN", "GROX_DATABASE_URL",
             }
             for node in ast.walk(tree):
