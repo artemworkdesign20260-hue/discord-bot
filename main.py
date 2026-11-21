@@ -2530,53 +2530,81 @@ async def generate_software_project(client_task: str):
         max_output_tokens=30000
     )
 
-    files = {}
-    patterns = {
-        "main.py": r"===FILE:\s*main\.py===\s*(.*?)(?=\n===FILE:|\Z)",
-        "requirements.txt": r"===FILE:\s*requirements\.txt===\s*(.*?)(?=\n===FILE:|\Z)",
-        "README.md": r"===FILE:\s*README\.md===\s*(.*?)(?=\n===FILE:|\Z)",
-    }
+    def extract_project_files(raw_response: str) -> dict[str, str]:
+        """Extract named project files, tolerating common harmless LLM formatting variations."""
+        extracted: dict[str, str] = {}
+        marker = re.compile(
+            r"(?im)^\\s*(?:```[^\\n]*\\n\\s*)?===\\s*FILE\\s*:\\s*"
+            r"(main\\.py|requirements\\.txt|README\\.md)\\s*===\\s*$"
+        )
+        matches = list(marker.finditer(raw_response or ""))
+        for index, match in enumerate(matches):
+            filename = match.group(1)
+            body_start = match.end()
+            body_end = matches[index + 1].start() if index + 1 < len(matches) else len(raw_response)
+            body = raw_response[body_start:body_end].strip()
+            body = re.sub(r"^\\s*```(?:python|text|markdown)?\\s*", "", body, flags=re.IGNORECASE)
+            body = re.sub(r"\\s*```\\s*$", "", body)
+            if body.strip():
+                extracted[filename] = body.strip()
 
-    for filename, pattern in patterns.items():
-        match = re.search(pattern, result, re.IGNORECASE | re.DOTALL)
-        if match:
-            content = match.group(1).strip()
-            content = re.sub(
-                r"^```(?:python|text|markdown)?\s*", "", content,
-                flags=re.IGNORECASE
-            )
-            content = re.sub(r"\s*```$", "", content)
-            files[filename] = content.strip()
+        # Some model responses contain a single complete file but omit the
+        # requested marker. Accept it only when its content can be identified
+        # unambiguously; never bypass the normal syntax/project validation.
+        if not extracted:
+            candidate = (raw_response or "").strip()
+            candidate = re.sub(r"^\\s*```(?:python)?\\s*", "", candidate, flags=re.IGNORECASE)
+            candidate = re.sub(r"\\s*```\\s*$", "", candidate)
+            if candidate and re.search(r"(?m)^\\s*(?:import|from)\\s+[A-Za-z_]", candidate):
+                try:
+                    ast.parse(candidate, filename="generated_main.py")
+                except SyntaxError:
+                    pass
+                else:
+                    extracted["main.py"] = candidate
+        return extracted
 
+    files = extract_project_files(result)
     validation_errors = validate_generated_project(files, bot2=bot2)
     if validation_errors:
-        # One automatic repair attempt prevents a malformed first LLM response
-        # from immediately terminating the whole order.
-        repair_prompt = (
-            "Попередня генерація не пройшла перевірку. Виправ усі помилки "
-            "та поверни ПОВНІСТЮ всі три файли у точному форматі ===FILE: ...===.\n"
-            "Помилки перевірки:\n- "
-            + "\n- ".join(validation_errors)
-            + "\n\nПочаткове технічне завдання:\n" + client_task
-            + "\n\nСпеціальні вимоги:\n" + special_requirements
-        )
+        # Preserve valid files and regenerate only missing/empty files first.
+        missing_files = [
+            name for name in ("main.py", "requirements.txt", "README.md")
+            if not files.get(name, "").strip()
+        ]
+        if missing_files:
+            requested_files = "\\n".join(
+                f"===FILE: {name}===\\n<повний вміст {name}>"
+                for name in missing_files
+            )
+            repair_prompt = (
+                "Ти — senior software developer Grox. Попередня відповідь не містила "
+                "усі потрібні файли. Згенеруй ТІЛЬКИ відсутні файли, перелічені нижче. "
+                "Не повторюй наявні файли. Кожен файл має бути повним, не обрізаним. "
+                "Поверни точні маркери без Markdown fences.\\n\\n"
+                "ВІДСТУТНІ ФАЙЛИ ТА ФОРМАТ: \\n" + requested_files
+                + "\\n\\nПочаткове технічне завдання:\\n" + client_task
+                + "\\n\\nПлатформа:\\n" + platform
+                + "\\n\\nСпеціальні вимоги:\\n" + special_requirements
+                + "\\n\\nПомилки перевірки:\\n- " + "\\n- ".join(validation_errors)
+            )
+        else:
+            repair_prompt = (
+                "Виправ лише вміст файлів, які не пройшли перевірку. "
+                "Збережи правильні файли без змін. Поверни повні файли з точними "
+                "маркерами ===FILE: filename=== без Markdown fences.\\n\\n"
+                "Помилки перевірки:\\n- " + "\\n- ".join(validation_errors)
+                + "\\n\\nПочаткове технічне завдання:\\n" + client_task
+                + "\\n\\nСпеціальні вимоги:\\n" + special_requirements
+            )
+
         repaired_result = await groq_request(
             repair_prompt,
             max_output_tokens=30000
         )
-        files = {}
-        for filename, pattern in patterns.items():
-            match = re.search(pattern, repaired_result, re.IGNORECASE | re.DOTALL)
-            if match:
-                content = match.group(1).strip()
-                content = re.sub(
-                    r"^```(?:python|text|markdown)?\s*", "", content,
-                    flags=re.IGNORECASE
-                )
-                content = re.sub(r"\s*```$", "", content)
-                files[filename] = content.strip()
+        repaired_files = extract_project_files(repaired_result)
+        files.update(repaired_files)
         validation_errors = validate_generated_project(files, bot2=bot2)
-
     if validation_errors:
         raise RuntimeError(
             "Згенерований проєкт не пройшов перевірку навіть після повторного виправлення; "
