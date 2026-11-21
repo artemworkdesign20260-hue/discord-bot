@@ -2534,8 +2534,8 @@ async def generate_software_project(client_task: str):
         """Extract named project files, tolerating common harmless LLM formatting variations."""
         extracted: dict[str, str] = {}
         marker = re.compile(
-            r"(?im)^\\s*(?:```[^\\n]*\\n\\s*)?===\\s*FILE\\s*:\\s*"
-            r"(main\\.py|requirements\\.txt|README\\.md)\\s*===\\s*$"
+            r"(?im)^\s*(?:```[^\n]*\n\s*)?===\s*FILE\s*:\s*"
+            r"(main\.py|requirements\.txt|README\.md)\s*===\s*$"
         )
         matches = list(marker.finditer(raw_response or ""))
         for index, match in enumerate(matches):
@@ -2543,8 +2543,8 @@ async def generate_software_project(client_task: str):
             body_start = match.end()
             body_end = matches[index + 1].start() if index + 1 < len(matches) else len(raw_response)
             body = raw_response[body_start:body_end].strip()
-            body = re.sub(r"^\\s*```(?:python|text|markdown)?\\s*", "", body, flags=re.IGNORECASE)
-            body = re.sub(r"\\s*```\\s*$", "", body)
+            body = re.sub(r"^\s*```(?:python|text|markdown)?\s*", "", body, flags=re.IGNORECASE)
+            body = re.sub(r"\s*```\s*$", "", body)
             if body.strip():
                 extracted[filename] = body.strip()
 
@@ -2553,9 +2553,9 @@ async def generate_software_project(client_task: str):
         # unambiguously; never bypass the normal syntax/project validation.
         if not extracted:
             candidate = (raw_response or "").strip()
-            candidate = re.sub(r"^\\s*```(?:python)?\\s*", "", candidate, flags=re.IGNORECASE)
-            candidate = re.sub(r"\\s*```\\s*$", "", candidate)
-            if candidate and re.search(r"(?m)^\\s*(?:import|from)\\s+[A-Za-z_]", candidate):
+            candidate = re.sub(r"^\s*```(?:python)?\s*", "", candidate, flags=re.IGNORECASE)
+            candidate = re.sub(r"\s*```\s*$", "", candidate)
+            if candidate and re.search(r"(?m)^\s*(?:import|from)\s+[A-Za-z_]", candidate):
                 try:
                     ast.parse(candidate, filename="generated_main.py")
                 except SyntaxError:
@@ -2573,29 +2573,29 @@ async def generate_software_project(client_task: str):
             if not files.get(name, "").strip()
         ]
         if missing_files:
-            requested_files = "\\n".join(
-                f"===FILE: {name}===\\n<повний вміст {name}>"
+            requested_files = "\n".join(
+                f"===FILE: {name}===\n<повний вміст {name}>"
                 for name in missing_files
             )
             repair_prompt = (
                 "Ти — senior software developer Grox. Попередня відповідь не містила "
                 "усі потрібні файли. Згенеруй ТІЛЬКИ відсутні файли, перелічені нижче. "
                 "Не повторюй наявні файли. Кожен файл має бути повним, не обрізаним. "
-                "Поверни точні маркери без Markdown fences.\\n\\n"
-                "ВІДСТУТНІ ФАЙЛИ ТА ФОРМАТ: \\n" + requested_files
-                + "\\n\\nПочаткове технічне завдання:\\n" + client_task
-                + "\\n\\nПлатформа:\\n" + platform
-                + "\\n\\nСпеціальні вимоги:\\n" + special_requirements
-                + "\\n\\nПомилки перевірки:\\n- " + "\\n- ".join(validation_errors)
+                "Поверни точні маркери без Markdown fences.\n\n"
+                "ВІДСТУТНІ ФАЙЛИ ТА ФОРМАТ: \n" + requested_files
+                + "\n\nПочаткове технічне завдання:\n" + client_task
+                + "\n\nПлатформа:\n" + platform
+                + "\n\nСпеціальні вимоги:\n" + special_requirements
+                + "\n\nПомилки перевірки:\n- " + "\n- ".join(validation_errors)
             )
         else:
             repair_prompt = (
                 "Виправ лише вміст файлів, які не пройшли перевірку. "
                 "Збережи правильні файли без змін. Поверни повні файли з точними "
-                "маркерами ===FILE: filename=== без Markdown fences.\\n\\n"
-                "Помилки перевірки:\\n- " + "\\n- ".join(validation_errors)
-                + "\\n\\nПочаткове технічне завдання:\\n" + client_task
-                + "\\n\\nСпеціальні вимоги:\\n" + special_requirements
+                "маркерами ===FILE: filename=== без Markdown fences.\n\n"
+                "Помилки перевірки:\n- " + "\n- ".join(validation_errors)
+                + "\n\nПочаткове технічне завдання:\n" + client_task
+                + "\n\nСпеціальні вимоги:\n" + special_requirements
             )
 
         repaired_result = await groq_request(
