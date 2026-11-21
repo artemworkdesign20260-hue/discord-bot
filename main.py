@@ -2592,7 +2592,7 @@ async def generate_software_project(client_task: str):
             candidates = []
 
             for fenced in re.finditer(
-                r"```(?:python|py)[ \t]*\r?\n(.*?)(?:```|\\Z)",
+                r"```(?:python|py)[ \t]*\r?\n(.*?)(?:```|\Z)",
                 raw_response or "",
                 re.IGNORECASE | re.DOTALL,
             ):
