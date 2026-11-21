@@ -2727,8 +2727,8 @@ async def generate_software_project(client_task: str):
             # Give the repair model the actual generated source. Without this,
             # it only sees the error message and task, so it cannot reliably
             # repair a specific syntax error in the existing file.
-            current_files_context = "\\n\\n".join(
-                f"=== CURRENT FILE: {name} ===\\n"
+            current_files_context = "\n\n".join(
+                f"=== CURRENT FILE: {name} ===\n"
                 + redact_sensitive_text(content)
                 for name, content in files.items()
             )
