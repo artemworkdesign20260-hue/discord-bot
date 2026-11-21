@@ -2724,13 +2724,27 @@ async def generate_software_project(client_task: str):
                     + "\n\nПомилки перевірки:\n- " + "\n- ".join(validation_errors)
                 )
         else:
+            # Give the repair model the actual generated source. Without this,
+            # it only sees the error message and task, so it cannot reliably
+            # repair a specific syntax error in the existing file.
+            current_files_context = "\\n\\n".join(
+                f"=== CURRENT FILE: {name} ===\\n"
+                + redact_sensitive_text(content)
+                for name, content in files.items()
+            )
             repair_prompt = (
-                "Виправ лише вміст файлів, які не пройшли перевірку. "
-                "Збережи правильні файли без змін. Поверни повні файли з точними "
-                "маркерами ===FILE: filename=== без Markdown fences.\n\n"
-                "Помилки перевірки:\n- " + "\n- ".join(validation_errors)
-                + "\n\nПочаткове технічне завдання:\n" + client_task
-                + "\n\nСпеціальні вимоги:\n" + special_requirements
+                "Ти — senior Python/software engineer. Виправ наявний згенерований "
+                "проєкт, а не створюй випадкову нову реалізацію. Обов'язково прочитай "
+                "повний поточний вміст файлів нижче. Виправ КОЖНУ вказану помилку, "
+                "зокрема синтаксис Python (лапки, дужки, переноси рядків, відступи). "
+                "Збережи всі вже реалізовані функції та логіку; не видаляй функції "
+                "заради проходження перевірки. Поверни повний вміст кожного файлу, "
+                "який змінюєш, з точними маркерами ===FILE: filename=== без Markdown fences. "
+                "Не повертай фрагменти або diff. Не додавай пояснень.\\n\\n"
+                "ПОТОЧНІ ФАЙЛИ:\\n" + current_files_context
+                + "\\n\\nПомилки перевірки:\\n- " + "\\n- ".join(validation_errors)
+                + "\\n\\nПочаткове технічне завдання:\\n" + client_task
+                + "\\n\\nСпеціальні вимоги:\\n" + special_requirements
             )
 
         repair_generation = await groq_request(
