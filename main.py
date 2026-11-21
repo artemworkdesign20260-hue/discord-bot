@@ -715,7 +715,8 @@ def estimate_groq_prompt_tokens(prompt: str) -> int:
 
 async def _groq_request_unlocked(
     prompt: str,
-    max_output_tokens: int
+    max_output_tokens: int,
+    return_metadata: bool = False,
 ):
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("Порожній запит до Groq.")
@@ -830,6 +831,12 @@ async def _groq_request_unlocked(
                             "the generated content may be incomplete."
                         )
 
+                    if return_metadata:
+                        return {
+                            "content": content.strip(),
+                            "finish_reason": finish_reason,
+                            "usage": usage if isinstance(usage, dict) else {},
+                        }
                     return content.strip()
 
         except Exception as error:
@@ -902,10 +909,18 @@ async def _groq_request_unlocked(
     )
 
 
-async def groq_request(prompt: str, max_output_tokens: int):
+async def groq_request(
+    prompt: str,
+    max_output_tokens: int,
+    return_metadata: bool = False,
+):
     """Serialize requests and retries against the shared organization TPM quota."""
     async with GROQ_REQUEST_LOCK:
-        return await _groq_request_unlocked(prompt, max_output_tokens)
+        return await _groq_request_unlocked(
+            prompt,
+            max_output_tokens,
+            return_metadata=return_metadata,
+        )
 
 
 # ============================================================
@@ -2562,10 +2577,13 @@ async def generate_software_project(client_task: str):
 Не використовуй Markdown fences навколо файлів.
 """
 
-    result = await groq_request(
+    generation_result = await groq_request(
         prompt,
-        max_output_tokens=30000
+        max_output_tokens=30000,
+        return_metadata=True,
     )
+    result = generation_result["content"]
+    generation_truncated = generation_result["finish_reason"] == "length"
 
     def extract_project_files(raw_response: str) -> dict[str, str]:
         """Extract named project files, tolerating common harmless LLM formatting variations."""
@@ -2665,6 +2683,10 @@ async def generate_software_project(client_task: str):
         f"missing={[name for name in ('main.py', 'requirements.txt', 'README.md') if not files.get(name, '').strip()]}"
     )
     validation_errors = validate_generated_project(files, bot2=bot2)
+    if generation_truncated:
+        validation_errors.append(
+            "Groq обрізав первинну відповідь за лімітом токенів; потрібне повторне повне генерування."
+        )
     if validation_errors:
         # Preserve valid files and regenerate only missing/empty files first.
         missing_files = [
@@ -2711,10 +2733,13 @@ async def generate_software_project(client_task: str):
                 + "\n\nСпеціальні вимоги:\n" + special_requirements
             )
 
-        repaired_result = await groq_request(
+        repair_generation = await groq_request(
             repair_prompt,
-            max_output_tokens=30000
+            max_output_tokens=30000,
+            return_metadata=True,
         )
+        repaired_result = repair_generation["content"]
+        repair_truncated = repair_generation["finish_reason"] == "length"
         repaired_files = extract_project_files(repaired_result)
         print(
             "[PROJECT REPAIR] "
@@ -2724,6 +2749,10 @@ async def generate_software_project(client_task: str):
         )
         files.update(repaired_files)
         validation_errors = validate_generated_project(files, bot2=bot2)
+        if repair_truncated:
+            validation_errors.append(
+                "Groq обрізав відповідь повторного виправлення за лімітом токенів."
+            )
     if validation_errors:
         raise RuntimeError(
             "Згенерований проєкт не пройшов перевірку навіть після повторного виправлення; "
