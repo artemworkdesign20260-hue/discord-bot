@@ -696,6 +696,9 @@ def extract_budget(text: str):
 # GROQ REQUEST
 # ============================================================
 
+GROQ_REQUEST_LOCK = asyncio.Lock()
+
+
 def estimate_groq_prompt_tokens(prompt: str) -> int:
     """
     Conservative local estimate without another tokenizer dependency.
@@ -704,10 +707,13 @@ def estimate_groq_prompt_tokens(prompt: str) -> int:
     """
     non_ascii = sum(1 for char in prompt if ord(char) > 127)
     ascii_chars = len(prompt) - non_ascii
-    return max(1, int(non_ascii * 1.0 + ascii_chars * 0.6) + 100)
+    # Calibrated against token counts reported by Groq in live logs.
+    # The old character-per-token estimate was too high and left only
+    # 812 completion tokens for a complete multi-file project.
+    return max(200, int(non_ascii * 0.65 + ascii_chars * 0.4) + 200)
 
 
-async def groq_request(
+async def _groq_request_unlocked(
     prompt: str,
     max_output_tokens: int
 ):
@@ -799,7 +805,8 @@ async def groq_request(
                     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
                         raise RuntimeError("Groq API не повернув список choices у відповіді.")
 
-                    response_message = choices[0].get("message")
+                    response_choice = choices[0]
+                    response_message = response_choice.get("message")
                     content = (
                         response_message.get("content")
                         if isinstance(response_message, dict)
@@ -807,6 +814,21 @@ async def groq_request(
                     )
                     if not isinstance(content, str) or not content.strip():
                         raise RuntimeError("Groq повернув порожню або некоректну відповідь.")
+
+                    usage = data.get("usage")
+                    if isinstance(usage, dict):
+                        print(
+                            "[GROQ] Usage: "
+                            f"prompt={usage.get('prompt_tokens', 'unknown')} "
+                            f"completion={usage.get('completion_tokens', 'unknown')} "
+                            f"total={usage.get('total_tokens', 'unknown')}"
+                        )
+                    finish_reason = response_choice.get("finish_reason")
+                    if finish_reason == "length":
+                        print(
+                            "[GROQ] WARNING: response reached the output token limit; "
+                            "the generated content may be incomplete."
+                        )
 
                     return content.strip()
 
@@ -857,6 +879,15 @@ async def groq_request(
             if attempt >= total_attempts:
                 break
             delay = min(60, (2 ** (attempt - 1)) + random.uniform(0.5, 2.0))
+            retry_after_match = re.search(
+                r"(?:try again in|retry after)\s*([0-9]+(?:\.[0-9]+)?)\s*s",
+                str(error),
+                re.IGNORECASE,
+            )
+            if retry_after_match:
+                provider_delay = float(retry_after_match.group(1))
+                delay = max(delay, provider_delay + random.uniform(0.25, 0.75))
+            delay = min(120, delay)
             print(f"[GROQ] Тимчасова помилка. Повтор через {delay:.1f}s...")
             await asyncio.sleep(delay)
 
@@ -869,6 +900,12 @@ async def groq_request(
         f"Groq тимчасово недоступний після {total_attempts} спроб. "
         f"Остання помилка: {last_error_detail}"
     )
+
+
+async def groq_request(prompt: str, max_output_tokens: int):
+    """Serialize requests and retries against the shared organization TPM quota."""
+    async with GROQ_REQUEST_LOCK:
+        return await _groq_request_unlocked(prompt, max_output_tokens)
 
 
 # ============================================================
@@ -2548,23 +2585,85 @@ async def generate_software_project(client_task: str):
             if body.strip():
                 extracted[filename] = body.strip()
 
-        # Some model responses contain a single complete file but omit the
-        # requested marker. Accept it only when its content can be identified
-        # unambiguously; never bypass the normal syntax/project validation.
-        if not extracted:
-            candidate = (raw_response or "").strip()
-            candidate = re.sub(r"^\s*```(?:python)?\s*", "", candidate, flags=re.IGNORECASE)
-            candidate = re.sub(r"\s*```\s*$", "", candidate)
-            if candidate and re.search(r"(?m)^\s*(?:import|from)\s+[A-Za-z_]", candidate):
+        # Some models omit the main.py marker or wrap the file in a Python
+        # code fence. Recover only syntactically valid, recognisable entry-point
+        # code; never treat arbitrary README snippets as the project main file.
+        if not extracted.get("main.py"):
+            candidates = []
+
+            for fenced in re.finditer(
+                r"```(?:python|py)[ \t]*\r?\n(.*?)(?:```|\\Z)",
+                raw_response or "",
+                re.IGNORECASE | re.DOTALL,
+            ):
+                candidates.append(fenced.group(1).strip())
+
+            if not matches:
+                candidates.append((raw_response or "").strip())
+            elif matches:
+                # If the model placed an unmarked main.py before the first
+                # marked file, inspect only that unmarked prefix.
+                prefix = (raw_response or "")[:matches[0].start()].strip()
+                if prefix:
+                    candidates.append(prefix)
+
+            for candidate in candidates:
+                candidate = re.sub(
+                    r"^\s*```(?:python|py)?[ \t]*\r?\n?",
+                    "",
+                    candidate,
+                    flags=re.IGNORECASE,
+                )
+                candidate = re.sub(r"\s*```\s*$", "", candidate).strip()
+
+                # Ignore any explanatory preamble before the first Python
+                # import, while preserving the complete remaining source.
+                import_match = re.search(
+                    r"(?m)^(?:import\s+[A-Za-z_]|from\s+[A-Za-z_])",
+                    candidate,
+                )
+                if import_match:
+                    candidate = candidate[import_match.start():].strip()
+
                 try:
-                    ast.parse(candidate, filename="generated_main.py")
+                    tree = ast.parse(candidate, filename="generated_main.py")
                 except SyntaxError:
-                    pass
-                else:
+                    continue
+
+                has_import = any(
+                    isinstance(node, (ast.Import, ast.ImportFrom))
+                    for node in ast.walk(tree)
+                )
+                has_entrypoint = any(
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == "main"
+                    for node in ast.walk(tree)
+                ) or any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"run", "start"}
+                    for node in ast.walk(tree)
+                ) or any(
+                    isinstance(node, ast.If)
+                    and isinstance(node.test, ast.Compare)
+                    and "__name__" in ast.unparse(node.test)
+                    and "__main__" in ast.unparse(node.test)
+                    for node in ast.walk(tree)
+                )
+
+                if has_import and has_entrypoint:
                     extracted["main.py"] = candidate
+                    break
+
         return extracted
 
     files = extract_project_files(result)
+    print(
+        "[PROJECT GENERATION] "
+        f"response_chars={len(result)} "
+        f"extracted={sorted(files)} "
+        f"missing={[name for name in ('main.py', 'requirements.txt', 'README.md') if not files.get(name, '').strip()]}"
+    )
     validation_errors = validate_generated_project(files, bot2=bot2)
     if validation_errors:
         # Preserve valid files and regenerate only missing/empty files first.
@@ -2577,17 +2676,31 @@ async def generate_software_project(client_task: str):
                 f"===FILE: {name}===\n<повний вміст {name}>"
                 for name in missing_files
             )
-            repair_prompt = (
-                "Ти — senior software developer Grox. Попередня відповідь не містила "
-                "усі потрібні файли. Згенеруй ТІЛЬКИ відсутні файли, перелічені нижче. "
-                "Не повторюй наявні файли. Кожен файл має бути повним, не обрізаним. "
-                "Поверни точні маркери без Markdown fences.\n\n"
-                "ВІДСТУТНІ ФАЙЛИ ТА ФОРМАТ: \n" + requested_files
-                + "\n\nПочаткове технічне завдання:\n" + client_task
-                + "\n\nПлатформа:\n" + platform
-                + "\n\nСпеціальні вимоги:\n" + special_requirements
-                + "\n\nПомилки перевірки:\n- " + "\n- ".join(validation_errors)
-            )
+            if missing_files == ["main.py"]:
+                repair_prompt = (
+                    "Ти — senior Python developer Grox. Згенеруй лише повний "
+                    "робочий файл main.py за технічним завданням нижче. "
+                    "Поверни тільки Python-код в одному fenced Python code block. "
+                    "Не додавай пояснень, README чи requirements. "
+                    "Код має бути завершеним, синтаксично правильним і запускатися "
+                    "командою python main.py. Не використовуй TODO або заглушки.\n\n"
+                    "Технічне завдання:\n" + client_task
+                    + "\n\nПлатформа:\n" + platform
+                    + "\n\nСпеціальні вимоги:\n" + special_requirements
+                    + "\n\nПомилки перевірки:\n- " + "\n- ".join(validation_errors)
+                )
+            else:
+                repair_prompt = (
+                    "Ти — senior software developer Grox. Попередня відповідь не містила "
+                    "усі потрібні файли. Згенеруй ТІЛЬКИ відсутні файли, перелічені нижче. "
+                    "Не повторюй наявні файли. Кожен файл має бути повним, не обрізаним. "
+                    "Поверни точні маркери без Markdown fences.\n\n"
+                    "ВІДСТУТНІ ФАЙЛИ ТА ФОРМАТ: \n" + requested_files
+                    + "\n\nПочаткове технічне завдання:\n" + client_task
+                    + "\n\nПлатформа:\n" + platform
+                    + "\n\nСпеціальні вимоги:\n" + special_requirements
+                    + "\n\nПомилки перевірки:\n- " + "\n- ".join(validation_errors)
+                )
         else:
             repair_prompt = (
                 "Виправ лише вміст файлів, які не пройшли перевірку. "
@@ -2603,6 +2716,12 @@ async def generate_software_project(client_task: str):
             max_output_tokens=30000
         )
         repaired_files = extract_project_files(repaired_result)
+        print(
+            "[PROJECT REPAIR] "
+            f"response_chars={len(repaired_result)} "
+            f"extracted={sorted(repaired_files)} "
+            f"requested_missing={missing_files}"
+        )
         files.update(repaired_files)
         validation_errors = validate_generated_project(files, bot2=bot2)
     if validation_errors:
