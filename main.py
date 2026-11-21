@@ -2740,11 +2740,11 @@ async def generate_software_project(client_task: str):
                 "Збережи всі вже реалізовані функції та логіку; не видаляй функції "
                 "заради проходження перевірки. Поверни повний вміст кожного файлу, "
                 "який змінюєш, з точними маркерами ===FILE: filename=== без Markdown fences. "
-                "Не повертай фрагменти або diff. Не додавай пояснень.\\n\\n"
-                "ПОТОЧНІ ФАЙЛИ:\\n" + current_files_context
-                + "\\n\\nПомилки перевірки:\\n- " + "\\n- ".join(validation_errors)
-                + "\\n\\nПочаткове технічне завдання:\\n" + client_task
-                + "\\n\\nСпеціальні вимоги:\\n" + special_requirements
+                "Не повертай фрагменти або diff. Не додавай пояснень.\n\n"
+                "ПОТОЧНІ ФАЙЛИ:\n" + current_files_context
+                + "\n\nПомилки перевірки:\n- " + "\n- ".join(validation_errors)
+                + "\n\nПочаткове технічне завдання:\n" + client_task
+                + "\n\nСпеціальні вимоги:\n" + special_requirements
             )
 
         repair_generation = await groq_request(
