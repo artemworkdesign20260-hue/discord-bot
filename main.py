@@ -2513,7 +2513,7 @@ def validate_generated_project(files: dict[str, str], bot2: bool = False) -> lis
     ]
     has_discord_dependency = any(
         re.match(
-            r"^(?:discord\\.py|py-cord)(?:\\s*(?:[<>=!~;\\[]|$))",
+            r"^(?:discord\.py|py-cord)(?:\s*(?:[<>=!~;\[]|$))",
             line,
             re.IGNORECASE,
         )
