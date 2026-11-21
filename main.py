@@ -2501,6 +2501,29 @@ def validate_generated_project(files: dict[str, str], bot2: bool = False) -> lis
                             f"У main.py заборонено читати захищену змінну {node.args[0].value}."
                         )
 
+    # Every automatically deployed software bot currently targets Discord,
+    # not only the dedicated Bot 2. Validate its runtime dependency before the
+    # Bot-2-specific checks; previously generic Discord bots could pass with
+    # no Discord library in requirements.txt.
+    requirements = files.get("requirements.txt", "")
+    requirement_lines = [
+        line.split("#", 1)[0].strip()
+        for line in requirements.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    has_discord_dependency = any(
+        re.match(
+            r"^(?:discord\\.py|py-cord)(?:\\s*(?:[<>=!~;\\[]|$))",
+            line,
+            re.IGNORECASE,
+        )
+        for line in requirement_lines
+    )
+    if not has_discord_dependency:
+        errors.append(
+            "У requirements.txt не вказана залежність discord.py або py-cord."
+        )
+
     if not bot2 or not main_code:
         return errors
 
@@ -2519,10 +2542,6 @@ def validate_generated_project(files: dict[str, str], bot2: bool = False) -> lis
     for pattern, label in checks:
         if not re.search(pattern, main_code, re.IGNORECASE):
             errors.append(f"У main.py не знайдено реалізацію: {label}.")
-
-    requirements = files.get("requirements.txt", "").casefold()
-    if "discord.py" not in requirements and "py-cord" not in requirements:
-        errors.append("У requirements.txt не вказана Discord-бібліотека.")
 
     readme = files.get("README.md", "").casefold()
     if "discord" not in readme or not re.search(r"environment|змін", readme):
