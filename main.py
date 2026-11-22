@@ -2729,12 +2729,12 @@ async def generate_software_project(client_task: str):
         if main_py_has_syntax_error and "main.py" not in repair_targets:
             repair_targets.insert(0, "main.py")
 
-        requested_files = "\\n".join(
-            f"===FILE: {name}===\\n<повний виправлений вміст {name}>"
+        requested_files = "\n".join(
+            f"===FILE: {name}===\n<повний виправлений вміст {name}>"
             for name in repair_targets
         )
-        current_files_context = "\\n\\n".join(
-            f"=== CURRENT FILE: {name} ===\\n"
+        current_files_context = "\n\n".join(
+            f"=== CURRENT FILE: {name} ===\n"
             + redact_sensitive_text(content)
             for name, content in files.items()
         )
@@ -2749,15 +2749,15 @@ async def generate_software_project(client_task: str):
             "відступи, переноси рядків та завершеність блоків. "
             "Не видаляй функції заради проходження перевірки. "
             "Поверни КОЖЕН цільовий файл повністю, без diff і фрагментів, "
-            "використовуючи точні маркери нижче. Не додавай пояснень чи Markdown fences.\\n\\n"
-            "ОБОВ'ЯЗКОВИЙ ФОРМАТ: \\n" + requested_files
-            + "\\n\\nПОТОЧНІ ФАЙЛИ (контекст для виправлення):\\n"
+            "використовуючи точні маркери нижче. Не додавай пояснень чи Markdown fences.\n\n"
+            "ОБОВ'ЯЗКОВИЙ ФОРМАТ: \n" + requested_files
+            + "\n\nПОТОЧНІ ФАЙЛИ (контекст для виправлення):\n"
             + current_files_context
-            + "\\n\\nПОМИЛКИ ПЕРЕВІРКИ:\\n- "
-            + "\\n- ".join(validation_errors)
-            + "\\n\\nПОЧАТКОВЕ ТЕХНІЧНЕ ЗАВДАННЯ:\\n" + client_task
-            + "\\n\\nПЛАТФОРМА:\\n" + platform
-            + "\\n\\nСПЕЦІАЛЬНІ ВИМОГИ:\\n" + special_requirements
+            + "\n\nПОМИЛКИ ПЕРЕВІРКИ:\n- "
+            + "\n- ".join(validation_errors)
+            + "\n\nПОЧАТКОВЕ ТЕХНІЧНЕ ЗАВДАННЯ:\n" + client_task
+            + "\n\nПЛАТФОРМА:\n" + platform
+            + "\n\nСПЕЦІАЛЬНІ ВИМОГИ:\n" + special_requirements
         )
 
         repair_generation = await groq_request(
