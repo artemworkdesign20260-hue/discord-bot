@@ -2725,117 +2725,145 @@ async def generate_software_project(client_task: str):
         validation_errors.append(
             "Groq обрізав первинну відповідь за лімітом токенів; потрібне повторне повне генерування."
         )
-    if validation_errors:
-        # Repair both absent files and existing files that failed validation.
-        # Previously, a syntactically invalid but non-empty main.py was not
-        # included in missing_files, so the repair model only regenerated
-        # README.md/requirements.txt and never received a chance to fix main.py.
+    # Run a bounded repair/validation cycle. Never publish files unless the
+    # deterministic validator reports zero errors after a complete repair.
+    max_repair_rounds = 3
+    repair_round = 0
+
+    while validation_errors and repair_round < max_repair_rounds:
+        repair_round += 1
+
         missing_files = [
             name for name in ("main.py", "requirements.txt", "README.md")
             if not files.get(name, "").strip()
         ]
         repair_targets = list(missing_files)
-        main_py_has_syntax_error = any(
-            "Синтаксична помилка main.py:" in error
-            for error in validation_errors
-        )
-        if main_py_has_syntax_error and "main.py" not in repair_targets:
-            repair_targets.insert(0, "main.py")
 
-        # A length finish reason means the final generated file may be
-        # incomplete even when it is non-empty and happens to parse.
-        # Repair the last started file; syntax validation independently adds
-        # main.py when its Python source is invalid.
-        if generation_truncated:
+        error_text = "\\n".join(validation_errors)
+        if "main.py" in error_text and "main.py" not in repair_targets:
+            repair_targets.insert(0, "main.py")
+        if "requirements.txt" in error_text and "requirements.txt" not in repair_targets:
+            repair_targets.append("requirements.txt")
+        if "README.md" in error_text and "README.md" not in repair_targets:
+            repair_targets.append("README.md")
+
+        # If the first answer was truncated, repair the last file that began.
+        if repair_round == 1 and generation_truncated:
             file_marker = re.compile(
-                r"(?im)^\s*===\s*FILE\s*:\s*"
-                r"(main\.py|requirements\.txt|README\.md)\s*===\s*$"
+                r"(?im)^\\s*===\\s*FILE\\s*:\\s*"
+                r"(main\\.py|requirements\\.txt|README\\.md)\\s*===\\s*$"
             )
             generation_markers = list(file_marker.finditer(result or ""))
             truncated_target = (
                 generation_markers[-1].group(1)
-                if generation_markers
-                else "main.py"
+                if generation_markers else "main.py"
             )
             if truncated_target not in repair_targets:
                 repair_targets.append(truncated_target)
 
-        # Never make a repair request with an empty target list.
         if not repair_targets:
             repair_targets = ["main.py"]
 
-        requested_files = "\n".join(
-            f"===FILE: {name}===\n<повний виправлений вміст {name}>"
+        requested_files = "\\n".join(
+            f"===FILE: {name}===\\n<повний виправлений вміст {name}>"
             for name in repair_targets
         )
-        # Include only files that the model must repair. Sending every file
-        # wastes the shared TPM budget and leaves fewer completion tokens.
-        current_files_context = "\n\n".join(
-            f"=== CURRENT FILE: {name} ===\n"
+        current_files_context = "\\n\\n".join(
+            f"=== CURRENT FILE: {name} ===\\n"
             + redact_sensitive_text(files.get(name, ""))
             for name in repair_targets
             if files.get(name, "").strip()
         )
         repair_prompt = (
-            "Ти — senior Python/software engineer Grox. Виправ згенерований проєкт. "
+            "Ти — senior Python/software engineer системи Grox. "
+            "Це раунд виправлення " + str(repair_round) + " з "
+            + str(max_repair_rounds) + ". Виправ усі наведені помилки. "
             "Цільові файли, які ОБОВ'ЯЗКОВО потрібно повернути повністю: "
             + ", ".join(repair_targets)
-            + ". Якщо цільовий файл уже існує, прочитай його повний поточний вміст "
-            "і виправ помилки, зберігаючи всю робочу функціональність та логіку. "
-            "Якщо файл відсутній, створи його повністю відповідно до ТЗ. "
-            "Особливо уважно перевір Python-синтаксис: лапки, дужки, двокрапки, "
-            "відступи, переноси рядків та завершеність блоків. "
-            "Не видаляй функції заради проходження перевірки. "
-            "Поверни КОЖЕН цільовий файл повністю, без diff і фрагментів, "
-            "використовуючи точні маркери нижче. Не додавай пояснень чи Markdown fences.\n\n"
-            "ОБОВ'ЯЗКОВИЙ ФОРМАТ: \n" + requested_files
-            + "\n\nПОТОЧНІ ФАЙЛИ (контекст для виправлення):\n"
-            + current_files_context
-            + "\n\nПОМИЛКИ ПЕРЕВІРКИ:\n- "
-            + "\n- ".join(validation_errors)
-            + "\n\nПОЧАТКОВЕ ТЕХНІЧНЕ ЗАВДАННЯ:\n" + client_task
-            + "\n\nПЛАТФОРМА:\n" + platform
-            + "\n\nСПЕЦІАЛЬНІ ВИМОГИ:\n" + special_requirements
+            + ". Прочитай поточний вміст кожного наявного файлу та збережи "
+            "його робочу функціональність. Відсутні файли створи повністю. "
+            "Перевір синтаксис, лапки, дужки, двокрапки, відступи, імпорти "
+            "та узгодженість між файлами. Не видаляй функції заради проходження "
+            "перевірки. Поверни кожен цільовий файл повністю, без diff, "
+            "фрагментів, пояснень або Markdown fences.\\n\\n"
+            "ОБОВ'ЯЗКОВИЙ ФОРМАТ:\\n" + requested_files
+            + "\\n\\nПОТОЧНІ ФАЙЛИ:\\n" + current_files_context
+            + "\\n\\nПОМИЛКИ ПЕРЕВІРКИ:\\n- "
+            + "\\n- ".join(validation_errors)
+            + "\\n\\nПОЧАТКОВЕ ТЕХНІЧНЕ ЗАВДАННЯ:\\n" + client_task
+            + "\\n\\nПЛАТФОРМА:\\n" + platform
+            + "\\n\\nСПЕЦІАЛЬНІ ВИМОГИ:\\n" + special_requirements
         )
 
-        repair_generation = await groq_request(
-            repair_prompt,
-            max_output_tokens=30000,
-            return_metadata=True,
-        )
+        try:
+            repair_generation = await groq_request(
+                repair_prompt,
+                max_output_tokens=30000,
+                return_metadata=True,
+            )
+        except Exception as repair_error:
+            print(
+                "[PROJECT REPAIR] "
+                f"round={repair_round}/{max_repair_rounds} "
+                f"request_failed={type(repair_error).__name__}: {repair_error}"
+            )
+            validation_errors = [
+                f"Раунд виправлення {repair_round}: запит до Groq не виконано "
+                f"({type(repair_error).__name__})."
+            ]
+            continue
+
         repaired_result = repair_generation["content"]
         repair_truncated = repair_generation["finish_reason"] == "length"
         repaired_files = extract_project_files(repaired_result)
+        returned_targets = [
+            name for name in repair_targets
+            if repaired_files.get(name, "").strip()
+        ]
+        missing_repair_targets = [
+            name for name in repair_targets
+            if name not in returned_targets
+        ]
         print(
             "[PROJECT REPAIR] "
+            f"round={repair_round}/{max_repair_rounds} "
             f"response_chars={len(repaired_result)} "
             f"extracted={sorted(repaired_files)} "
-            f"requested_targets={repair_targets}"
+            f"requested_targets={repair_targets} "
+            f"missing_targets={missing_repair_targets} "
+            f"truncated={repair_truncated}"
         )
-        # Accept only files explicitly requested for repair; an unrelated
-        # partial file from the model must never overwrite a valid original.
+
+        # Do not merge partial or truncated responses. Keeping the previous
+        # files is safe, but they must not be treated as repaired.
+        if repair_truncated or missing_repair_targets:
+            problems = []
+            if repair_truncated:
+                problems.append("Groq обрізав відповідь за лімітом токенів")
+            if missing_repair_targets:
+                problems.append(
+                    "Groq не повернув повні цільові файли: "
+                    + ", ".join(missing_repair_targets)
+                )
+            validation_errors = [
+                f"Раунд виправлення {repair_round}: " + "; ".join(problems) + "."
+            ]
+            continue
+
         files.update({
-            name: content
-            for name, content in repaired_files.items()
-            if name in repair_targets
+            name: repaired_files[name]
+            for name in repair_targets
         })
         validation_errors = validate_generated_project(
             files, bot2=bot2, require_discord=(platform == "Discord")
         )
-        missing_repair_targets = [
-            name for name in repair_targets
-            if not files.get(name, "").strip()
-        ]
-        if missing_repair_targets:
-            validation_errors.append(
-                "Groq не повернув повний вміст цільових файлів виправлення: "
-                + ", ".join(missing_repair_targets)
-                + "."
-            )
-        if repair_truncated:
-            validation_errors.append(
-                "Groq обрізав відповідь повторного виправлення за лімітом токенів; файли не публікуються."
-            )
+
+    if validation_errors:
+        validation_errors.insert(
+            0,
+            f"Вичерпано {max_repair_rounds} раунди виправлення; "
+            "проєкт не пройшов фінальну перевірку.",
+        )
     if validation_errors:
         raise RuntimeError(
             "Згенерований проєкт не пройшов перевірку навіть після повторного виправлення; "
