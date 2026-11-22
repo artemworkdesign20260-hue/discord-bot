@@ -2733,10 +2733,9 @@ async def generate_software_project(client_task: str):
 
         # A length finish reason means the final generated file may be
         # incomplete even when it is non-empty and happens to parse.
-        # Always repair main.py plus the last explicitly started file.
+        # Repair the last started file; syntax validation independently adds
+        # main.py when its Python source is invalid.
         if generation_truncated:
-            if "main.py" not in repair_targets:
-                repair_targets.insert(0, "main.py")
             file_marker = re.compile(
                 r"(?im)^\s*===\s*FILE\s*:\s*"
                 r"(main\.py|requirements\.txt|README\.md)\s*===\s*$"
