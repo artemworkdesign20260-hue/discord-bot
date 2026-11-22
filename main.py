@@ -2807,10 +2807,10 @@ async def generate_software_project(client_task: str):
                 f"round={repair_round}/{max_repair_rounds} "
                 f"request_failed={type(repair_error).__name__}: {repair_error}"
             )
-            validation_errors = [
+            validation_errors.append(
                 f"Раунд виправлення {repair_round}: запит до Groq не виконано "
                 f"({type(repair_error).__name__})."
-            ]
+            )
             continue
 
         repaired_result = repair_generation["content"]
@@ -2845,9 +2845,10 @@ async def generate_software_project(client_task: str):
                     "Groq не повернув повні цільові файли: "
                     + ", ".join(missing_repair_targets)
                 )
-            validation_errors = [
-                f"Раунд виправлення {repair_round}: " + "; ".join(problems) + "."
-            ]
+            validation_errors.extend(
+                f"Раунд виправлення {repair_round}: " + problem + "."
+                for problem in problems
+            )
             continue
 
         files.update({
