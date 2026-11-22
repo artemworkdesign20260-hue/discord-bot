@@ -2426,7 +2426,11 @@ DANGEROUS_CODE_PATTERNS = (
 )
 
 
-def validate_generated_project(files: dict[str, str], bot2: bool = False) -> list[str]:
+def validate_generated_project(
+    files: dict[str, str],
+    bot2: bool = False,
+    require_discord: bool = False,
+) -> list[str]:
     """Perform deterministic checks before any generated files are published."""
     errors: list[str] = []
 
@@ -2501,28 +2505,28 @@ def validate_generated_project(files: dict[str, str], bot2: bool = False) -> lis
                             f"У main.py заборонено читати захищену змінну {node.args[0].value}."
                         )
 
-    # Every automatically deployed software bot currently targets Discord,
-    # not only the dedicated Bot 2. Validate its runtime dependency before the
-    # Bot-2-specific checks; previously generic Discord bots could pass with
-    # no Discord library in requirements.txt.
-    requirements = files.get("requirements.txt", "")
-    requirement_lines = [
-        line.split("#", 1)[0].strip()
-        for line in requirements.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-    has_discord_dependency = any(
-        re.match(
-            r"^(?:discord\.py|py-cord)(?:\s*(?:[<>=!~;\[]|$))",
-            line,
-            re.IGNORECASE,
+    # Require the Discord runtime dependency only for projects routed to
+    # Discord. Telegram and other software projects must not be rejected for
+    # correctly omitting a Discord library.
+    if require_discord:
+        requirements = files.get("requirements.txt", "")
+        requirement_lines = [
+            line.split("#", 1)[0].strip()
+            for line in requirements.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        has_discord_dependency = any(
+            re.match(
+                r"^(?:discord\.py|py-cord)(?:\s*(?:[<>=!~;\[]|$))",
+                line,
+                re.IGNORECASE,
+            )
+            for line in requirement_lines
         )
-        for line in requirement_lines
-    )
-    if not has_discord_dependency:
-        errors.append(
-            "У requirements.txt не вказана залежність discord.py або py-cord."
-        )
+        if not has_discord_dependency:
+            errors.append(
+                "У requirements.txt не вказана залежність discord.py або py-cord."
+            )
 
     if not bot2 or not main_code:
         return errors
@@ -2701,7 +2705,9 @@ async def generate_software_project(client_task: str):
         f"extracted={sorted(files)} "
         f"missing={[name for name in ('main.py', 'requirements.txt', 'README.md') if not files.get(name, '').strip()]}"
     )
-    validation_errors = validate_generated_project(files, bot2=bot2)
+    validation_errors = validate_generated_project(
+        files, bot2=bot2, require_discord=(platform == "Discord")
+    )
     if generation_truncated:
         validation_errors.append(
             "Groq обрізав первинну відповідь за лімітом токенів; потрібне повторне повне генерування."
@@ -2781,7 +2787,9 @@ async def generate_software_project(client_task: str):
             f"requested_missing={missing_files}"
         )
         files.update(repaired_files)
-        validation_errors = validate_generated_project(files, bot2=bot2)
+        validation_errors = validate_generated_project(
+        files, bot2=bot2, require_discord=(platform == "Discord")
+    )
         if repair_truncated:
             validation_errors.append(
                 "Groq обрізав відповідь повторного виправлення за лімітом токенів."
