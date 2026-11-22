@@ -3422,9 +3422,17 @@ async def deploy_project_to_render(
             "Render API повернув неочікувану відповідь сервісу; вміст відповіді приховано."
         )
 
+    service_details = service.get("serviceDetails")
+    if not isinstance(service_details, dict):
+        service_details = {}
+
+    # Render's service-list response nests the primary URL under
+    # serviceDetails.url; creation responses may expose it at the top level.
+    service_url = service.get("url") or service_details.get("url")
+
     return {
         "id": service.get("id"),
-        "url": service.get("url"),
+        "url": service_url,
         "name": service.get("name", service_name),
     }
 
@@ -3525,6 +3533,13 @@ async def build_and_deploy_software_bot(
     await thread.send("☁️ **Створюю окремий Render-сервіс...**")
 
     render_env: dict[str, str] = {}
+
+    # Generated projects may use Groq independently of Grox. Pass the
+    # dedicated Groq key only when the generated source explicitly references
+    # GROQ_API_KEY; never copy Render/GitHub/Vercel or Grox database secrets.
+    if any("GROQ_API_KEY" in content for content in files.values()):
+        render_env["GROQ_API_KEY"] = GROQ_API_KEY
+
     if generated_platform == "Discord":
         render_env["DISCORD_TOKEN"] = GENERATED_DISCORD_TOKEN
     if bot2:
