@@ -45,7 +45,7 @@ If a required integration is not configured, the corresponding publishing step c
 - `GROQ_MODEL` — defaults to `openai/gpt-oss-120b`.
 - `GROQ_RETRIES` — retry count for temporary Groq failures (default 4).
 - `CLIENT_TIMEOUT` — seconds to wait for an owner reply (default 600).
-- `MAX_REQUIREMENT_ROUNDS` — maximum clarification rounds (default 10).
+- `MAX_REQUIREMENT_ROUNDS` — maximum clarification rounds (default 3).
 - `MAX_TASK_LENGTH` — maximum task/message size (default 12000).
 - `MAX_WEBSITE_FIX_ATTEMPTS` — website QA/fix attempts (default 4).
 - `POST_DELIVERY_TIMEOUT` — follow-up window in seconds (default 86400).
