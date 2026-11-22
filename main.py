@@ -2702,6 +2702,8 @@ async def generate_software_project(client_task: str):
     print(
         "[PROJECT GENERATION] "
         f"response_chars={len(result)} "
+        f"finish_reason={generation_result.get('finish_reason')} "
+        f"usage={generation_result.get('usage', {})} "
         f"extracted={sorted(files)} "
         f"missing={[name for name in ('main.py', 'requirements.txt', 'README.md') if not files.get(name, '').strip()]}"
     )
@@ -2729,14 +2731,40 @@ async def generate_software_project(client_task: str):
         if main_py_has_syntax_error and "main.py" not in repair_targets:
             repair_targets.insert(0, "main.py")
 
-        requested_files = "\n".join(
-            f"===FILE: {name}===\n<повний виправлений вміст {name}>"
+        # A length finish reason means the final generated file may be
+        # incomplete even when it is non-empty and happens to parse.
+        # Always repair main.py plus the last explicitly started file.
+        if generation_truncated:
+            if "main.py" not in repair_targets:
+                repair_targets.insert(0, "main.py")
+            file_marker = re.compile(
+                r"(?im)^\\s*(?:\\x60{3}[^\\n]*\\n\\s*)?===\\s*FILE\\s*:\\s*"
+                r"(main\\.py|requirements\\.txt|README\\.md)\\s*===\\s*$"
+            )
+            generation_markers = list(file_marker.finditer(result or ""))
+            truncated_target = (
+                generation_markers[-1].group(1)
+                if generation_markers
+                else "main.py"
+            )
+            if truncated_target not in repair_targets:
+                repair_targets.append(truncated_target)
+
+        # Never make a repair request with an empty target list.
+        if not repair_targets:
+            repair_targets = ["main.py"]
+
+        requested_files = "\\n".join(
+            f"===FILE: {name}===\\n<повний виправлений вміст {name}>"
             for name in repair_targets
         )
-        current_files_context = "\n\n".join(
-            f"=== CURRENT FILE: {name} ===\n"
-            + redact_sensitive_text(content)
-            for name, content in files.items()
+        # Include only files that the model must repair. Sending every file
+        # wastes the shared TPM budget and leaves fewer completion tokens.
+        current_files_context = "\\n\\n".join(
+            f"=== CURRENT FILE: {name} ===\\n"
+            + redact_sensitive_text(files.get(name, ""))
+            for name in repair_targets
+            if files.get(name, "").strip()
         )
         repair_prompt = (
             "Ти — senior Python/software engineer Grox. Виправ згенерований проєкт. "
@@ -2774,13 +2802,29 @@ async def generate_software_project(client_task: str):
             f"extracted={sorted(repaired_files)} "
             f"requested_targets={repair_targets}"
         )
-        files.update(repaired_files)
+        # Accept only files explicitly requested for repair; an unrelated
+        # partial file from the model must never overwrite a valid original.
+        files.update({
+            name: content
+            for name, content in repaired_files.items()
+            if name in repair_targets
+        })
         validation_errors = validate_generated_project(
             files, bot2=bot2, require_discord=(platform == "Discord")
         )
+        missing_repair_targets = [
+            name for name in repair_targets
+            if not files.get(name, "").strip()
+        ]
+        if missing_repair_targets:
+            validation_errors.append(
+                "Groq не повернув повний вміст цільових файлів виправлення: "
+                + ", ".join(missing_repair_targets)
+                + "."
+            )
         if repair_truncated:
             validation_errors.append(
-                "Groq обрізав відповідь повторного виправлення за лімітом токенів."
+                "Groq обрізав відповідь повторного виправлення за лімітом токенів; файли не публікуються."
             )
     if validation_errors:
         raise RuntimeError(
