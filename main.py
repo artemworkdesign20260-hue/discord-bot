@@ -2788,8 +2788,8 @@ async def generate_software_project(client_task: str):
         )
         files.update(repaired_files)
         validation_errors = validate_generated_project(
-        files, bot2=bot2, require_discord=(platform == "Discord")
-    )
+            files, bot2=bot2, require_discord=(platform == "Discord")
+        )
         if repair_truncated:
             validation_errors.append(
                 "Groq обрізав відповідь повторного виправлення за лімітом токенів."
