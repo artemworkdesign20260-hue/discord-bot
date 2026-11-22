@@ -830,6 +830,14 @@ async def _groq_request_unlocked(
                             "[GROQ] WARNING: response reached the output token limit; "
                             "the generated content may be incomplete."
                         )
+                        # Callers that do not explicitly handle response metadata
+                        # must never consume a truncated answer (notably HTML,
+                        # requirement analysis, website fixes, and chat replies).
+                        if not return_metadata:
+                            raise RuntimeError(
+                                "Groq обрізав відповідь за лімітом токенів; "
+                                "неповний результат відхилено."
+                            )
 
                     if return_metadata:
                         return {
@@ -1217,9 +1225,12 @@ def clean_html_output(text: str) -> str:
 
     end = text.lower().rfind("</html>")
 
-    if end != -1:
-        text = text[:end + len("</html>")]
+    if end == -1:
+        raise RuntimeError(
+            "Модель повернула неповний HTML: відсутній закривальний тег </html>."
+        )
 
+    text = text[:end + len("</html>")]
     text = text.strip()
 
     if "<html" not in text.lower() or "<body" not in text.lower():
