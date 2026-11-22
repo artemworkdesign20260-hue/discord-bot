@@ -2738,8 +2738,8 @@ async def generate_software_project(client_task: str):
             if "main.py" not in repair_targets:
                 repair_targets.insert(0, "main.py")
             file_marker = re.compile(
-                r"(?im)^\\s*(?:\\x60{3}[^\\n]*\\n\\s*)?===\\s*FILE\\s*:\\s*"
-                r"(main\\.py|requirements\\.txt|README\\.md)\\s*===\\s*$"
+                r"(?im)^\s*===\s*FILE\s*:\s*"
+                r"(main\.py|requirements\.txt|README\.md)\s*===\s*$"
             )
             generation_markers = list(file_marker.finditer(result or ""))
             truncated_target = (
@@ -2754,14 +2754,14 @@ async def generate_software_project(client_task: str):
         if not repair_targets:
             repair_targets = ["main.py"]
 
-        requested_files = "\\n".join(
-            f"===FILE: {name}===\\n<повний виправлений вміст {name}>"
+        requested_files = "\n".join(
+            f"===FILE: {name}===\n<повний виправлений вміст {name}>"
             for name in repair_targets
         )
         # Include only files that the model must repair. Sending every file
         # wastes the shared TPM budget and leaves fewer completion tokens.
-        current_files_context = "\\n\\n".join(
-            f"=== CURRENT FILE: {name} ===\\n"
+        current_files_context = "\n\n".join(
+            f"=== CURRENT FILE: {name} ===\n"
             + redact_sensitive_text(files.get(name, ""))
             for name in repair_targets
             if files.get(name, "").strip()
