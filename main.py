@@ -2713,64 +2713,52 @@ async def generate_software_project(client_task: str):
             "Groq обрізав первинну відповідь за лімітом токенів; потрібне повторне повне генерування."
         )
     if validation_errors:
-        # Preserve valid files and regenerate only missing/empty files first.
+        # Repair both absent files and existing files that failed validation.
+        # Previously, a syntactically invalid but non-empty main.py was not
+        # included in missing_files, so the repair model only regenerated
+        # README.md/requirements.txt and never received a chance to fix main.py.
         missing_files = [
             name for name in ("main.py", "requirements.txt", "README.md")
             if not files.get(name, "").strip()
         ]
-        if missing_files:
-            requested_files = "\n".join(
-                f"===FILE: {name}===\n<повний вміст {name}>"
-                for name in missing_files
-            )
-            if missing_files == ["main.py"]:
-                repair_prompt = (
-                    "Ти — senior Python developer Grox. Згенеруй лише повний "
-                    "робочий файл main.py за технічним завданням нижче. "
-                    "Поверни тільки Python-код в одному fenced Python code block. "
-                    "Не додавай пояснень, README чи requirements. "
-                    "Код має бути завершеним, синтаксично правильним і запускатися "
-                    "командою python main.py. Не використовуй TODO або заглушки.\n\n"
-                    "Технічне завдання:\n" + client_task
-                    + "\n\nПлатформа:\n" + platform
-                    + "\n\nСпеціальні вимоги:\n" + special_requirements
-                    + "\n\nПомилки перевірки:\n- " + "\n- ".join(validation_errors)
-                )
-            else:
-                repair_prompt = (
-                    "Ти — senior software developer Grox. Попередня відповідь не містила "
-                    "усі потрібні файли. Згенеруй ТІЛЬКИ відсутні файли, перелічені нижче. "
-                    "Не повторюй наявні файли. Кожен файл має бути повним, не обрізаним. "
-                    "Поверни точні маркери без Markdown fences.\n\n"
-                    "ВІДСТУТНІ ФАЙЛИ ТА ФОРМАТ: \n" + requested_files
-                    + "\n\nПочаткове технічне завдання:\n" + client_task
-                    + "\n\nПлатформа:\n" + platform
-                    + "\n\nСпеціальні вимоги:\n" + special_requirements
-                    + "\n\nПомилки перевірки:\n- " + "\n- ".join(validation_errors)
-                )
-        else:
-            # Give the repair model the actual generated source. Without this,
-            # it only sees the error message and task, so it cannot reliably
-            # repair a specific syntax error in the existing file.
-            current_files_context = "\n\n".join(
-                f"=== CURRENT FILE: {name} ===\n"
-                + redact_sensitive_text(content)
-                for name, content in files.items()
-            )
-            repair_prompt = (
-                "Ти — senior Python/software engineer. Виправ наявний згенерований "
-                "проєкт, а не створюй випадкову нову реалізацію. Обов'язково прочитай "
-                "повний поточний вміст файлів нижче. Виправ КОЖНУ вказану помилку, "
-                "зокрема синтаксис Python (лапки, дужки, переноси рядків, відступи). "
-                "Збережи всі вже реалізовані функції та логіку; не видаляй функції "
-                "заради проходження перевірки. Поверни повний вміст кожного файлу, "
-                "який змінюєш, з точними маркерами ===FILE: filename=== без Markdown fences. "
-                "Не повертай фрагменти або diff. Не додавай пояснень.\n\n"
-                "ПОТОЧНІ ФАЙЛИ:\n" + current_files_context
-                + "\n\nПомилки перевірки:\n- " + "\n- ".join(validation_errors)
-                + "\n\nПочаткове технічне завдання:\n" + client_task
-                + "\n\nСпеціальні вимоги:\n" + special_requirements
-            )
+        repair_targets = list(missing_files)
+        main_py_has_syntax_error = any(
+            "Синтаксична помилка main.py:" in error
+            for error in validation_errors
+        )
+        if main_py_has_syntax_error and "main.py" not in repair_targets:
+            repair_targets.insert(0, "main.py")
+
+        requested_files = "\\n".join(
+            f"===FILE: {name}===\\n<повний виправлений вміст {name}>"
+            for name in repair_targets
+        )
+        current_files_context = "\\n\\n".join(
+            f"=== CURRENT FILE: {name} ===\\n"
+            + redact_sensitive_text(content)
+            for name, content in files.items()
+        )
+        repair_prompt = (
+            "Ти — senior Python/software engineer Grox. Виправ згенерований проєкт. "
+            "Цільові файли, які ОБОВ'ЯЗКОВО потрібно повернути повністю: "
+            + ", ".join(repair_targets)
+            + ". Якщо цільовий файл уже існує, прочитай його повний поточний вміст "
+            "і виправ помилки, зберігаючи всю робочу функціональність та логіку. "
+            "Якщо файл відсутній, створи його повністю відповідно до ТЗ. "
+            "Особливо уважно перевір Python-синтаксис: лапки, дужки, двокрапки, "
+            "відступи, переноси рядків та завершеність блоків. "
+            "Не видаляй функції заради проходження перевірки. "
+            "Поверни КОЖЕН цільовий файл повністю, без diff і фрагментів, "
+            "використовуючи точні маркери нижче. Не додавай пояснень чи Markdown fences.\\n\\n"
+            "ОБОВ'ЯЗКОВИЙ ФОРМАТ: \\n" + requested_files
+            + "\\n\\nПОТОЧНІ ФАЙЛИ (контекст для виправлення):\\n"
+            + current_files_context
+            + "\\n\\nПОМИЛКИ ПЕРЕВІРКИ:\\n- "
+            + "\\n- ".join(validation_errors)
+            + "\\n\\nПОЧАТКОВЕ ТЕХНІЧНЕ ЗАВДАННЯ:\\n" + client_task
+            + "\\n\\nПЛАТФОРМА:\\n" + platform
+            + "\\n\\nСПЕЦІАЛЬНІ ВИМОГИ:\\n" + special_requirements
+        )
 
         repair_generation = await groq_request(
             repair_prompt,
@@ -2784,7 +2772,7 @@ async def generate_software_project(client_task: str):
             "[PROJECT REPAIR] "
             f"response_chars={len(repaired_result)} "
             f"extracted={sorted(repaired_files)} "
-            f"requested_missing={missing_files}"
+            f"requested_targets={repair_targets}"
         )
         files.update(repaired_files)
         validation_errors = validate_generated_project(
