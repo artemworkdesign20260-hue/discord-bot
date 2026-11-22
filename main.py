@@ -2739,7 +2739,7 @@ async def generate_software_project(client_task: str):
         ]
         repair_targets = list(missing_files)
 
-        error_text = "\\n".join(validation_errors)
+        error_text = "\n".join(validation_errors)
         if "main.py" in error_text and "main.py" not in repair_targets:
             repair_targets.insert(0, "main.py")
         if "requirements.txt" in error_text and "requirements.txt" not in repair_targets:
@@ -2750,8 +2750,8 @@ async def generate_software_project(client_task: str):
         # If the first answer was truncated, repair the last file that began.
         if repair_round == 1 and generation_truncated:
             file_marker = re.compile(
-                r"(?im)^\\s*===\\s*FILE\\s*:\\s*"
-                r"(main\\.py|requirements\\.txt|README\\.md)\\s*===\\s*$"
+                r"(?im)^\s*===\s*FILE\s*:\s*"
+                r"(main\.py|requirements\.txt|README\.md)\s*===\s*$"
             )
             generation_markers = list(file_marker.finditer(result or ""))
             truncated_target = (
@@ -2764,12 +2764,12 @@ async def generate_software_project(client_task: str):
         if not repair_targets:
             repair_targets = ["main.py"]
 
-        requested_files = "\\n".join(
-            f"===FILE: {name}===\\n<повний виправлений вміст {name}>"
+        requested_files = "\n".join(
+            f"===FILE: {name}===\n<повний виправлений вміст {name}>"
             for name in repair_targets
         )
-        current_files_context = "\\n\\n".join(
-            f"=== CURRENT FILE: {name} ===\\n"
+        current_files_context = "\n\n".join(
+            f"=== CURRENT FILE: {name} ===\n"
             + redact_sensitive_text(files.get(name, ""))
             for name in repair_targets
             if files.get(name, "").strip()
@@ -2785,14 +2785,14 @@ async def generate_software_project(client_task: str):
             "Перевір синтаксис, лапки, дужки, двокрапки, відступи, імпорти "
             "та узгодженість між файлами. Не видаляй функції заради проходження "
             "перевірки. Поверни кожен цільовий файл повністю, без diff, "
-            "фрагментів, пояснень або Markdown fences.\\n\\n"
-            "ОБОВ'ЯЗКОВИЙ ФОРМАТ:\\n" + requested_files
-            + "\\n\\nПОТОЧНІ ФАЙЛИ:\\n" + current_files_context
-            + "\\n\\nПОМИЛКИ ПЕРЕВІРКИ:\\n- "
-            + "\\n- ".join(validation_errors)
-            + "\\n\\nПОЧАТКОВЕ ТЕХНІЧНЕ ЗАВДАННЯ:\\n" + client_task
-            + "\\n\\nПЛАТФОРМА:\\n" + platform
-            + "\\n\\nСПЕЦІАЛЬНІ ВИМОГИ:\\n" + special_requirements
+            "фрагментів, пояснень або Markdown fences.\n\n"
+            "ОБОВ'ЯЗКОВИЙ ФОРМАТ:\n" + requested_files
+            + "\n\nПОТОЧНІ ФАЙЛИ:\n" + current_files_context
+            + "\n\nПОМИЛКИ ПЕРЕВІРКИ:\n- "
+            + "\n- ".join(validation_errors)
+            + "\n\nПОЧАТКОВЕ ТЕХНІЧНЕ ЗАВДАННЯ:\n" + client_task
+            + "\n\nПЛАТФОРМА:\n" + platform
+            + "\n\nСПЕЦІАЛЬНІ ВИМОГИ:\n" + special_requirements
         )
 
         try:
