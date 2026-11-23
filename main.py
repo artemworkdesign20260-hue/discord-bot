@@ -817,7 +817,26 @@ def contains_service_keyword(text: str) -> bool:
 
 
 def is_order_message(text: str) -> bool:
-    return contains_service_keyword(text)
+    if not contains_service_keyword(text):
+        return False
+
+    creation_intent = (
+        "створи", "створити", "зроби", "зробити", "розроби", "розробити",
+        "напиши", "потрібен", "потрібна", "потрібно", "мені треба",
+        "хочу", "запрограмуй", "create", "build", "make", "develop",
+        "need", "i need", "i want",
+    )
+    if has_keyword(text, creation_intent):
+        return True
+
+    # Short task descriptions such as "сайт для магазину" are also valid
+    # starts; casual mentions such as "мій сайт не працює" are not.
+    task_description_starts = (
+        "бот для", "сайт для", "вебсайт для", "додаток для",
+        "скрипт для", "website for", "bot for", "app for",
+    )
+    normalized = (text or "").casefold().strip()
+    return any(phrase in normalized for phrase in task_description_starts)
 
 
 # ============================================================
