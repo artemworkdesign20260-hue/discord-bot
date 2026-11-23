@@ -1,4 +1,5 @@
 import asyncio
+import signal
 import ast
 import os
 import re
@@ -281,6 +282,7 @@ class Order:
 
 orders: dict[int, Order] = {}
 active_orders: set[int] = set()
+processing_tasks: set[asyncio.Task] = set()
 
 # Number of currently open orders per client (see MAX_ACTIVE_ORDERS_PER_USER).
 active_clients: dict[int, int] = {}
@@ -4273,11 +4275,9 @@ async def on_message(
         f"message_length={len(message.content)}"
     )
 
-    asyncio.create_task(
-        process_order(
-            message
-        )
-    )
+    task = asyncio.create_task(process_order(message))
+    processing_tasks.add(task)
+    task.add_done_callback(processing_tasks.discard)
 
 
 # ============================================================
@@ -4369,6 +4369,19 @@ async def main():
     print("🚀 Starting Grox...")
     health_runner = await start_health_server()
     attempt = 0
+    loop = asyncio.get_running_loop()
+
+    def request_shutdown():
+        print("[SHUTDOWN] Signal received; closing Discord client gracefully.")
+        if not bot.is_closed():
+            asyncio.create_task(bot.close())
+
+    for shutdown_signal in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(shutdown_signal, request_shutdown)
+        except (NotImplementedError, RuntimeError):
+            # Signal handlers may be unavailable on non-Unix test platforms.
+            pass
 
     try:
         await initialize_database()
@@ -4445,6 +4458,23 @@ async def main():
         discord_ready = False
         if not bot.is_closed():
             await bot.close()
+
+        # Render sends SIGTERM before stopping an instance. Give active orders
+        # a short grace period to persist their state, then cancel leftovers.
+        pending_tasks = set(processing_tasks)
+        if pending_tasks:
+            _, pending_tasks = await asyncio.wait(pending_tasks, timeout=20)
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+        for shutdown_signal in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.remove_signal_handler(shutdown_signal)
+            except (NotImplementedError, RuntimeError):
+                pass
+
         await health_runner.cleanup()
         await close_database()
 
