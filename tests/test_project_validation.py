@@ -290,5 +290,26 @@ class VercelProjectNamingTests(unittest.TestCase):
         self.assertEqual(vercel_project_name("1001"), "grox-order-1001")
 
 
+class AdditionalDangerousApiTests(unittest.TestCase):
+    def make_files(self, main_code):
+        return {
+            "main.py": main_code,
+            "requirements.txt": "# no third-party dependencies\n",
+            "README.md": "Project environment configuration.\n",
+        }
+
+    def test_detects_asyncio_subprocess_shell(self):
+        errors = validate_generated_project(
+            self.make_files('import asyncio\\nasyncio.create_subprocess_shell("id")\\n')
+        )
+        self.assertTrue(any("asyncio" in error for error in errors))
+
+    def test_detects_aliased_os_posix_spawn(self):
+        errors = validate_generated_project(
+            self.make_files('from os import posix_spawn as launch\\nlaunch("sh", ["sh"])\\n')
+        )
+        self.assertTrue(any("posix_spawn" in error for error in errors))
+
+
 if __name__ == "__main__":
     unittest.main()
