@@ -3004,6 +3004,12 @@ def missing_required_integration_settings(task: str) -> list[str]:
         return missing
 
     if is_software_bot_project(task):
+        platform = detect_bot_platform(task)
+        if platform != "Discord":
+            return [
+                "автоматичне розгортання зараз підтримує лише Discord-ботів"
+            ]
+
         if not GITHUB_TOKEN:
             missing.append("GITHUB_TOKEN")
         if not GITHUB_REPO:
@@ -3017,12 +3023,7 @@ def missing_required_integration_settings(task: str) -> list[str]:
         if not RENDER_API_KEY:
             missing.append("RENDER_API_KEY")
 
-        platform = detect_bot_platform(task)
-        if platform != "Discord":
-            missing.append(
-                "автоматичне розгортання зараз підтримує лише Discord-ботів"
-            )
-        elif not GENERATED_DISCORD_TOKEN:
+        if not GENERATED_DISCORD_TOKEN:
             missing.append("GROX_BUILDER_DISCORD_TOKEN")
         elif GENERATED_DISCORD_TOKEN == DISCORD_TOKEN:
             missing.append(
