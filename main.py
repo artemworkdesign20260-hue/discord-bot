@@ -39,6 +39,8 @@ RENDER_OWNER_ID = os.getenv("RENDER_OWNER_ID", "").strip()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+# Keep generated-project commits off Grox's auto-deploy branch by default.
+GROX_PROJECTS_BRANCH = os.getenv("GROX_PROJECTS_BRANCH", "generated-projects").strip()
 
 # Optional Telegram credentials passed to generated Telegram projects.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -4131,7 +4133,7 @@ async def github_publish_project(
         raise RuntimeError("GITHUB_TOKEN або GITHUB_REPO не налаштований.")
 
     repo = validate_github_repo(GITHUB_REPO)
-    branch = GITHUB_BRANCH
+    branch = GROX_PROJECTS_BRANCH or "generated-projects"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
@@ -4171,7 +4173,32 @@ async def github_publish_project(
             branch_ref_url = (
                 f"{base_url}/git/ref/heads/{quote(branch, safe='/')}"
             )
-            ref_data = await request_json("GET", branch_ref_url)
+            try:
+                ref_data = await request_json("GET", branch_ref_url)
+            except RuntimeError as error:
+                # Create a dedicated projects branch from the configured base
+                # branch on first use, so publishing a bot cannot trigger a
+                # redeploy of Grox itself when its Render service watches main.
+                if "HTTP 404" not in str(error):
+                    raise
+                base_ref_url = (
+                    f"{base_url}/git/ref/heads/{quote(GITHUB_BRANCH, safe='/')}"
+                )
+                base_ref = await request_json("GET", base_ref_url)
+                base_sha = (base_ref.get("object") or {}).get("sha")
+                if not isinstance(base_sha, str) or not base_sha:
+                    raise RuntimeError("GitHub не повернув SHA базової гілки.")
+                try:
+                    await request_json(
+                        "POST",
+                        f"{base_url}/git/refs",
+                        {"ref": f"refs/heads/{branch}", "sha": base_sha},
+                    )
+                except RuntimeError as create_error:
+                    if "HTTP 422" not in str(create_error):
+                        raise
+                ref_data = await request_json("GET", branch_ref_url)
+
             parent_sha = (ref_data.get("object") or {}).get("sha")
             if not isinstance(parent_sha, str) or not parent_sha:
                 raise RuntimeError("GitHub не повернув commit SHA поточної гілки.")
@@ -4461,7 +4488,7 @@ async def deploy_project_to_render(
             "name": service_name,
             "ownerId": owner_id,
             "repo": repo_url,
-            "branch": GITHUB_BRANCH,
+            "branch": GROX_PROJECTS_BRANCH or "generated-projects",
             "rootDir": root_dir,
             "envVars": env_vars,
             "serviceDetails": {
