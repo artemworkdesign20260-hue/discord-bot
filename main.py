@@ -1887,7 +1887,7 @@ async def test_website(url: str):
             try:
                 response = await page.goto(
                     url,
-                    wait_until="networkidle",
+                    wait_until="domcontentloaded",
                     timeout=30000
                 )
 
@@ -2093,9 +2093,11 @@ async def test_website(url: str):
 
         return {
             "success": False,
+            "infra_error": True,
             "report": (
-                "QA-система не змогла завершити "
-                "перевірку.\n"
+                "QA-система не змогла завершити перевірку через внутрішню "
+                "помилку браузера або тестового середовища. Код сайту не слід "
+                "змінювати на підставі цього результату.\n"
                 f"Помилка: {type(error).__name__}."
             )
         }
@@ -2238,6 +2240,18 @@ async def generate_test_and_fix_website(
         qa_result = await test_website(
             live_url
         )
+
+        # A broken Playwright/browser environment is not evidence that the
+        # generated website is defective. Never feed infrastructure failures
+        # into the LLM repair loop or redeploy unchanged HTML.
+        if qa_result.get("infra_error"):
+            await thread.send(
+                "⚠️ **Автоматична QA-перевірка не завершилася через помилку "
+                "тестового середовища.**\n\n"
+                "Я не буду змінювати код сайту навмання або повторно розгортати "
+                "той самий HTML. Перевір налаштування Playwright/Chromium у Grox."
+            )
+            return False
 
         if qa_result["success"]:
             await thread.send(
