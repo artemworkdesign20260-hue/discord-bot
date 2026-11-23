@@ -4209,6 +4209,16 @@ def _safe_github_error_detail(status: int, body: str, request_id: str | None = N
     return f"HTTP {status}. " + " | ".join(parts)
 
 
+def generated_project_branch(root_dir: str) -> str:
+    """Return an isolated branch name for one generated project directory."""
+    if not isinstance(root_dir, str) or not root_dir.strip():
+        raise ValueError("Порожній шлях згенерованого проєкту.")
+    project_slug = root_dir.rstrip("/").split("/")[-1]
+    if project_slug in {"", ".", ".."}:
+        raise ValueError("Некоректний шлях згенерованого проєкту.")
+    return f"{GROX_PROJECTS_BRANCH}/{project_slug}"
+
+
 async def github_publish_project(
     root_dir: str,
     files: dict[str, str],
@@ -4220,7 +4230,7 @@ async def github_publish_project(
         raise RuntimeError("GITHUB_TOKEN або GITHUB_REPO не налаштований.")
 
     repo = validate_github_repo(GITHUB_REPO)
-    branch = (branch or f"{GROX_PROJECTS_BRANCH}/{root_dir.split('/')[-1]}").strip("/")
+    branch = (branch or generated_project_branch(root_dir)).strip("/")
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
@@ -4576,7 +4586,7 @@ async def deploy_project_to_render(
             "name": service_name,
             "ownerId": owner_id,
             "repo": repo_url,
-            "branch": (project_branch or f"{GROX_PROJECTS_BRANCH}/{root_dir.split('/')[-1]}").strip("/"),
+            "branch": (project_branch or generated_project_branch(root_dir)).strip("/"),
             "rootDir": root_dir,
             "envVars": env_vars,
             "serviceDetails": {
@@ -4727,7 +4737,7 @@ async def build_and_deploy_software_bot(
     suffix = uuid.uuid4().hex[:6]
     root_dir = f"generated_projects/order_{order.order_id}_{suffix}"
     service_name = f"grox-order-{order.order_id}-{suffix}"
-    project_branch = f"{GROX_PROJECTS_BRANCH}/{root_dir.split('/')[-1]}"
+    project_branch = generated_project_branch(root_dir)
 
     token_fingerprint = hashlib.sha256(
         GENERATED_DISCORD_TOKEN.encode("utf-8")
