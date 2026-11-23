@@ -3210,12 +3210,13 @@ def validate_generated_project(
         "GROX_DATABASE_URL",
     }
     dangerous_os_calls = {
-        "system", "popen",
+        "system", "popen", "fork", "forkpty", "posix_spawn", "posix_spawnp", "startfile",
         "spawnl", "spawnle", "spawnlp", "spawnlpe",
         "spawnv", "spawnve", "spawnvp", "spawnvpe",
         "execl", "execle", "execlp", "execlpe",
         "execv", "execve", "execvp", "execvpe",
     }
+    dangerous_asyncio_calls = {"create_subprocess_exec", "create_subprocess_shell"}
 
     requirement_names: set[str] = set()
     for requirement_line in files.get("requirements.txt", "").splitlines():
@@ -3290,6 +3291,7 @@ def validate_generated_project(
         pickle_modules = {"pickle"}
         builtins_modules = {"builtins"}
         subprocess_modules = {"subprocess"}
+        asyncio_modules = {"asyncio"}
         dangerous_function_aliases: set[str] = set()
         getenv_aliases: set[str] = set()
         environ_aliases: set[str] = set()
@@ -3310,6 +3312,10 @@ def validate_generated_project(
                         add_error(f"У {filename} заборонено імпорт subprocess.")
                     elif root == "builtins":
                         builtins_modules.add(bound_name)
+                    elif root == "asyncio":
+                        asyncio_modules.add(bound_name)
+                    elif root in {"pty", "commands"}:
+                        add_error(f"У {filename} заборонено імпорт {root}.")
 
             elif isinstance(node, ast.ImportFrom):
                 module = (node.module or "").split(".", 1)[0]
@@ -3332,6 +3338,12 @@ def validate_generated_project(
                     for alias in node.names:
                         if alias.name in {"eval", "exec", "__import__"}:
                             dangerous_function_aliases.add(alias.asname or alias.name)
+                elif module == "asyncio":
+                    for alias in node.names:
+                        if alias.name in dangerous_asyncio_calls:
+                            dangerous_function_aliases.add(alias.asname or alias.name)
+                elif module in {"pty", "commands"}:
+                    add_error(f"У {filename} заборонено імпорт {module}.")
 
         def is_secret_argument(call_node: ast.Call) -> bool:
             return bool(
@@ -3387,6 +3399,10 @@ def validate_generated_project(
                         if owner.id in subprocess_modules:
                             add_error(
                                 f"У {filename} заборонено виклики subprocess."
+                            )
+                        if owner.id in asyncio_modules and function.attr in dangerous_asyncio_calls:
+                            add_error(
+                                f"У {filename} заборонено запускати дочірні процеси через asyncio."
                             )
 
                     elif isinstance(owner, ast.Attribute):
