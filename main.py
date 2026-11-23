@@ -1129,7 +1129,7 @@ def parse_retry_after_seconds(value) -> float | None:
         "hours": 3600.0,
     }
     matches = re.findall(
-        r"(\d+(?:\.\d+)?)\s*(milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b",
+        r"(\d+(?:\.\d+)?)\s*(milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)(?=$|\s|\d|[.,;])",
         raw,
         re.IGNORECASE,
     )
