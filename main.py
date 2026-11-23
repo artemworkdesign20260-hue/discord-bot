@@ -252,6 +252,10 @@ bot = commands.Bot(
 # ORDER DATA
 # ============================================================
 
+class ActiveOrderLimitReached(Exception):
+    """Raised when the database-wide per-client active order limit is reached."""
+
+
 @dataclass
 class Order:
     order_id: int
@@ -596,6 +600,44 @@ async def create_order(message: discord.Message) -> Order | None:
             await connection.fetchval(
                 "SELECT pg_advisory_xact_lock(8472011, 1)"
             )
+
+            existing_order_id = await connection.fetchval(
+                "SELECT order_id FROM grox_orders WHERE discord_message_id = $1",
+                message.id,
+            )
+            if existing_order_id is not None:
+                return None
+
+            # Enforce the per-client limit across overlapping Render instances,
+            # not only through each process's local active_clients dictionary.
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 8472011))",
+                str(message.author.id),
+            )
+            active_count = await connection.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM grox_orders
+                WHERE client_id = $1
+                  AND (
+                    status IN ('WAITING_TZ', 'IN_PROGRESS')
+                    OR (
+                        status = 'COMPLETED'
+                        AND CASE
+                            WHEN jsonb_typeof(payload->'post_delivery_expires_at') = 'number'
+                            THEN (payload->>'post_delivery_expires_at')::bigint
+                            ELSE 0
+                        END > EXTRACT(EPOCH FROM NOW())::bigint
+                    )
+                  )
+                """,
+                message.author.id,
+            )
+            if int(active_count or 0) >= MAX_ACTIVE_ORDERS_PER_USER:
+                raise ActiveOrderLimitReached(
+                    f"Client already has {active_count} active order(s)."
+                )
+
             order_id = await connection.fetchval(
                 "SELECT nextval('grox_order_id_seq')"
             )
@@ -4727,7 +4769,16 @@ async def process_order(
         # CREATE ORDER
         # ====================================================
 
-        order = await create_order(message)
+        try:
+            order = await create_order(message)
+        except ActiveOrderLimitReached:
+            await message.channel.send(
+                "⚠️ Досягнуто ліміту одночасних завдань. "
+                f"Максимум — {MAX_ACTIVE_ORDERS_PER_USER}. "
+                "Зачекайте, поки завершиться одне з попередніх."
+            )
+            return
+
         if order is None:
             # Another Render instance may already have processed this exact
             # Discord message. The database uniqueness constraint is the
