@@ -1941,7 +1941,7 @@ async def revise_and_test_website(
 
         if qa_result.get("infra_error"):
             await thread.send(
-                "⚠️ **QA-середовище не змогло перевірити оновлений сайт.**\\n\\n"
+                "⚠️ **QA-середовище не змогло перевірити оновлений сайт.**\n\n"
                 "Я не буду переписувати код через помилку браузера або тестового середовища."
             )
             return False
@@ -3682,10 +3682,10 @@ async def generate_software_project(client_task: str):
             repaired_result, repair_truncated = await continue_truncated_groq_output(
                 repaired_result,
                 context=(
-                    "Клієнтське ТЗ:\\n" + client_task
-                    + "\\nПлатформа:\\n" + platform
-                    + "\\nПомилки перевірки:\\n" + "\\n".join(validation_errors)
-                    + "\\nПоточні цільові файли:\\n" + current_files_context
+                    "Клієнтське ТЗ:\n" + client_task
+                    + "\nПлатформа:\n" + platform
+                    + "\nПомилки перевірки:\n" + "\n".join(validation_errors)
+                    + "\nПоточні цільові файли:\n" + current_files_context
                 ),
                 output_contract=(
                     "Поверни продовження повних файлів: "
@@ -3850,8 +3850,8 @@ async def wait_for_generated_service_ready(
             await asyncio.sleep(max(3, BOT2_HEALTH_POLL_INTERVAL))
 
     await thread.send(
-        "❌ **Не вдалося підтвердити готовність сервісу.**\\n\\n"
-        f"Останній стан: {last_problem}\\n"
+        "❌ **Не вдалося підтвердити готовність сервісу.**\n\n"
+        f"Останній стан: {last_problem}\n"
         "Проєкт збережено в GitHub, але я не позначаю його як готовий. Перевір Render Logs."
     )
     return False
@@ -4809,7 +4809,7 @@ async def process_order(
 
         if len(final_task) > MAX_TASK_LENGTH:
             await thread.send(
-                "❌ **Фінальне ТЗ перевищує допустимий розмір.**\\n\\n"
+                "❌ **Фінальне ТЗ перевищує допустимий розмір.**\n\n"
                 f"Максимум — {MAX_TASK_LENGTH} символів. Я не буду мовчки "
                 "обрізати вимоги, щоб не втратити важливу частину завдання. "
                 "Скоротіть ТЗ і створіть нове замовлення."
