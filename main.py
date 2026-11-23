@@ -2646,20 +2646,63 @@ def is_software_bot_project(task: str) -> bool:
     return is_bot2_project(task) or has_keyword(task, bot_words)
 
 
+def _first_keyword_position(text: str, keywords) -> int | None:
+    positions = []
+    for keyword in keywords:
+        match = re.search(_keyword_regex(keyword), text or "", re.IGNORECASE)
+        if match:
+            positions.append(match.start())
+    return min(positions) if positions else None
+
+
+def is_website_project(task: str) -> bool:
+    """Choose the primary deliverable, not a platform mentioned as an integration."""
+    website_position = _first_keyword_position(
+        task,
+        ("сайт", "website", "web", "лендинг", "landing", "вебсайт"),
+    )
+    if website_position is None:
+        return False
+
+    bot_position = _first_keyword_position(
+        task,
+        ("discord bot", "discord бот", "telegram bot", "telegram бот", "bot", "бот"),
+    )
+    return bot_position is None or website_position < bot_position
+
+
 def detect_bot_platform(task: str) -> str:
     # Bot 2 is explicitly Discord-only, even if the description mentions
     # other platforms while explaining what must NOT be supported.
     if is_bot2_project(task):
         return "Discord"
 
-    normalized = task.casefold()
+    telegram_bot_position = _first_keyword_position(
+        task,
+        ("telegram bot", "telegram-бот", "телеграм бот", "бот для телеграм", "бот у телеграм"),
+    )
+    discord_bot_position = _first_keyword_position(
+        task,
+        ("discord bot", "discord-бот", "discord бот", "бот для discord", "бот у discord"),
+    )
 
-    if any(word in normalized for word in ("telegram", "телеграм")):
+    if telegram_bot_position is not None and discord_bot_position is not None:
+        return "Telegram" if telegram_bot_position < discord_bot_position else "Discord"
+    if telegram_bot_position is not None:
         return "Telegram"
-
-    if "discord" in normalized:
+    if discord_bot_position is not None:
         return "Discord"
 
+    normalized = (task or "").casefold()
+    mentions_telegram = "telegram" in normalized or "телеграм" in normalized
+    mentions_discord = "discord" in normalized
+    if mentions_telegram and not mentions_discord:
+        return "Telegram"
+    if mentions_discord and not mentions_telegram:
+        return "Discord"
+
+    # If both platforms are merely mentioned, do not guess which one is the
+    # bot's host platform; cross-platform integrations are not a platform cue.
     return "Software bot"
 
 
@@ -4388,20 +4431,7 @@ async def process_order(
         # PROJECT TYPE DETECTION
         # ====================================================
 
-        website_project = (
-            not is_software_bot_project(order.task)
-            and has_keyword(
-                order.task,
-                (
-                    "сайт",
-                    "website",
-                    "web",
-                    "лендинг",
-                    "landing",
-                    "вебсайт",
-                )
-            )
-        )
+        website_project = is_website_project(order.task)
 
         # ====================================================
         # WEBSITE
