@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest.mock import AsyncMock, patch
 
 # main.py validates its required configuration at import time. These dummy
 # values are used only by the unit-test process; no network connection starts.
@@ -12,7 +13,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, detect_bot_platform, is_revision_request, is_website_project, select_render_owner_id, validate_generated_project
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, is_revision_request, is_website_project, select_render_owner_id, validate_generated_project
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -154,6 +155,42 @@ class CredentialRequestDetectionTests(unittest.TestCase):
 
     def test_private_key_is_a_credential_request(self):
         self.assertTrue(contains_credential_request("Потрібен приватний ключ доступу."))
+
+
+class GroqContinuationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_appends_continuation(self):
+        with patch(
+            "main.groq_request",
+            new=AsyncMock(return_value={"content": "def", "finish_reason": "stop"}),
+        ):
+            result, still_truncated = await continue_truncated_groq_output(
+                "abc", "task context", "plain text"
+            )
+        self.assertEqual(result, "abcdef")
+        self.assertFalse(still_truncated)
+
+    async def test_removes_repeated_overlap(self):
+        with patch(
+            "main.groq_request",
+            new=AsyncMock(return_value={"content": "defghi", "finish_reason": "stop"}),
+        ):
+            result, still_truncated = await continue_truncated_groq_output(
+                "abcdef", "task context", "plain text"
+            )
+        self.assertEqual(result, "abcdefghi")
+        self.assertFalse(still_truncated)
+
+    async def test_reports_still_truncated_after_bounded_rounds(self):
+        with patch(
+            "main.groq_request",
+            new=AsyncMock(return_value={"content": "more", "finish_reason": "length"}),
+        ) as mocked:
+            result, still_truncated = await continue_truncated_groq_output(
+                "start", "task context", "plain text", max_rounds=3
+            )
+        self.assertEqual(mocked.await_count, 3)
+        self.assertTrue(still_truncated)
+        self.assertTrue(result.startswith("start"))
 
 
 if __name__ == "__main__":
