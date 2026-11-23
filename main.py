@@ -11,7 +11,7 @@ import random
 import base64
 import json
 from dataclasses import asdict, dataclass
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import aiohttp
 import asyncpg
@@ -2348,6 +2348,8 @@ async def test_website(url: str):
     warnings = []
     console_errors = []
     failed_requests = []
+    parsed_site_url = urlsplit(url)
+    site_origin = f"{parsed_site_url.scheme}://{parsed_site_url.netloc}"
 
     title = ""
     button_count = 0
@@ -2390,15 +2392,31 @@ async def test_website(url: str):
             # ------------------------------------------------
 
             def handle_request_failed(request):
-                failed_requests.append(
+                detail = (
                     f"{request.method} {request.url} "
                     f"-> {request.failure}"
                 )
+                if request.url.startswith(site_origin):
+                    errors.append(
+                        "Внутрішній ресурс сайту не завантажився: "
+                        f"{urlsplit(request.url).path}."
+                    )
+                else:
+                    failed_requests.append(detail)
 
-            page.on(
-                "requestfailed",
-                handle_request_failed
-            )
+            def handle_response(response):
+                if (
+                    response.status >= 400
+                    and response.url.startswith(site_origin)
+                    and response.request.resource_type != "document"
+                ):
+                    errors.append(
+                        f"Внутрішній ресурс повернув HTTP {response.status}: "
+                        f"{urlsplit(response.url).path}."
+                    )
+
+            page.on("requestfailed", handle_request_failed)
+            page.on("response", handle_response)
 
             # ------------------------------------------------
             # PAGE ERROR
