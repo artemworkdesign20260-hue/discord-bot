@@ -1819,35 +1819,68 @@ async def deploy_to_vercel(
                 except Exception:
                     data = {}
 
-                if response.status in (
-                    200,
-                    201
-                ):
-                    deployment_url = data.get(
-                        "url"
+                if response.status not in (200, 201) or not isinstance(data, dict):
+                    print(
+                        f"[VERCEL ERROR] HTTP {response.status}; response body omitted."
                     )
+                    return None
 
-                    if deployment_url:
-                        if not deployment_url.startswith(
-                            "http"
-                        ):
-                            deployment_url = (
-                                "https://"
-                                + deployment_url
-                            )
+                deployment_id = data.get("id") or data.get("uid")
+                deployment_url = data.get("url")
+                if not isinstance(deployment_url, str) or not deployment_url.strip():
+                    print("[VERCEL ERROR] Create response did not include a deployment URL.")
+                    return None
 
-                        print(
-                            f"[VERCEL] "
-                            f"Deployment successful: "
-                            f"{deployment_url}"
-                        )
+                if not deployment_url.startswith("http://") and not deployment_url.startswith("https://"):
+                    deployment_url = "https://" + deployment_url
 
-                        return deployment_url
+                # A successful POST only queues a deployment. Wait for Vercel's
+                # explicit READY state before the caller starts browser QA.
+                ready_state = str(data.get("readyState") or "").upper()
+                if ready_state == "READY":
+                    print(f"[VERCEL] Deployment READY: {deployment_url}")
+                    return deployment_url
 
-                print(
-                    f"[VERCEL ERROR] HTTP {response.status}; response body omitted."
+                if not deployment_id:
+                    print("[VERCEL ERROR] Deployment ID missing; readiness cannot be verified.")
+                    return None
+
+                deadline = asyncio.get_running_loop().time() + 600
+                deployment_endpoint = (
+                    "https://api.vercel.com/v13/deployments/"
+                    + quote(str(deployment_id), safe="")
                 )
+                while asyncio.get_running_loop().time() < deadline:
+                    async with session.get(
+                        deployment_endpoint,
+                        headers=headers,
+                    ) as status_response:
+                        if status_response.status >= 400:
+                            print(
+                                f"[VERCEL ERROR] Readiness poll HTTP {status_response.status}; "
+                                "response body omitted."
+                            )
+                            return None
+                        try:
+                            status_data = await status_response.json(content_type=None)
+                        except Exception:
+                            status_data = {}
 
+                    if not isinstance(status_data, dict):
+                        print("[VERCEL ERROR] Readiness poll returned an unexpected response.")
+                        return None
+
+                    ready_state = str(status_data.get("readyState") or "").upper()
+                    if ready_state == "READY":
+                        print(f"[VERCEL] Deployment READY: {deployment_url}")
+                        return deployment_url
+                    if ready_state in {"ERROR", "CANCELED", "CANCELLED"}:
+                        print(f"[VERCEL ERROR] Deployment ended with state {ready_state}.")
+                        return None
+
+                    await asyncio.sleep(3)
+
+                print("[VERCEL ERROR] Timed out waiting for deployment READY state.")
                 return None
 
     except Exception as error:
