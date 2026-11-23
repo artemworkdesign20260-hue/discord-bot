@@ -6,7 +6,7 @@ Grox is a private Discord assistant for one configured owner. It is not a public
 
 - Accepts project instructions from the owner in the configured Discord channel.
 - Asks follow-up questions and prepares a technical specification.
-- Generates static websites and supported software bots.
+- Generates static websites and Discord bot projects (other bot-platform deployment paths are not enabled yet).
 - Runs read-only browser QA for generated websites.
 - Can publish websites through Vercel.
 - Can publish generated bot projects to GitHub and create Render services.
@@ -34,9 +34,10 @@ Do not post tokens or API keys in Discord, GitHub, or this README. Set them only
 | `GITHUB_REPO` | Target repository in `owner/repository` format |
 | `GITHUB_BRANCH` | Target branch; defaults to `main` |
 | `RENDER_API_KEY` | Create Render services for generated bots |
+| `RENDER_OWNER_ID` | Optional explicit Render workspace/owner ID when the API returns multiple owners |
 | `GROX_BUILDER_DISCORD_TOKEN` | Discord token injected into a generated Discord bot service |
 | `BUILDER_DISCORD_TOKEN` | Legacy fallback for the generated Discord bot token |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Optional Telegram credentials passed only to generated Telegram projects |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Reserved legacy settings; the current automatic deployment flow does not yet publish Telegram bots |
 
 If a required integration is not configured, the corresponding publishing step cannot run.
 
@@ -44,6 +45,9 @@ If a required integration is not configured, the corresponding publishing step c
 
 - `GROQ_MODEL` — defaults to `openai/gpt-oss-120b`.
 - `GROQ_RETRIES` — retry count for temporary Groq failures (default 4).
+- `GROQ_TPM_LIMIT` — shared rolling token-per-minute budget (default 8000).
+- `GROQ_TPM_RESERVE` — safety margin held back from the TPM budget (default 700).
+- `GROQ_MIN_COMPLETION_TOKENS` — minimum completion reservation (default 256).
 - `CLIENT_TIMEOUT` — seconds to wait for an owner reply (default 600).
 - `MAX_REQUIREMENT_ROUNDS` — maximum clarification rounds (default 3).
 - `MAX_TASK_LENGTH` — maximum task/message size (default 12000).
@@ -78,12 +82,13 @@ Grox requires a dedicated `GROX_DATABASE_URL` connection string. The application
 
 Use a Neon PostgreSQL connection string from the Neon Console. Keep it private and add it only to the Grox Render service's Environment settings. Do not use Bot 2's `DATABASE_URL` or `BOT2_DATABASE_URL` for Grox.
 
-The database preserves the task record across restarts; it does not automatically resume a generation process that was interrupted while Grox was offline. Neon Free also has usage limits, and compute can be suspended when monthly quotas are exhausted.
+The database preserves task records, order IDs, token reservations, and post-delivery conversation expiry. Active orders use heartbeats so an overlapping Render deploy does not incorrectly interrupt them; truly stale orders are marked `INTERRUPTED` after three minutes. Completed post-delivery conversations resume after a restart while their idle window remains active. A code-generation process interrupted mid-build is not automatically resumed yet. Neon Free also has usage limits, and compute can be suspended when monthly quotas are exhausted.
 
 ## Local syntax check
 
 ```bash
 python -m py_compile main.py
+python -m unittest discover -s tests -v
 ```
 
 The GitHub Actions workflow runs this syntax check on pushes to the Grox branch and pull requests targeting `main`. Passing syntax checks does not replace integration tests against Discord, Groq, Vercel, GitHub, or Render.
