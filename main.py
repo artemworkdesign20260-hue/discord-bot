@@ -3747,6 +3747,83 @@ def select_render_owner_id(owners, configured_owner_id: str = "") -> str:
     )
 
 
+async def wait_for_render_deploy(service_id: str, timeout_seconds: int = 600):
+    """Wait for Render's deploy record to become live or report a build failure."""
+    if not RENDER_API_KEY:
+        raise RuntimeError("RENDER_API_KEY не налаштований.")
+
+    api_url = "https://api.render.com/v1"
+    deploys_url = (
+        f"{api_url}/services/{quote(str(service_id), safe='')}/deploys"
+    )
+    headers = {
+        "Authorization": f"Bearer {RENDER_API_KEY}",
+        "Accept": "application/json",
+    }
+    deadline = asyncio.get_running_loop().time() + max(30, timeout_seconds)
+    last_status = "Render ще не створив запис розгортання."
+    terminal_failures = {
+        "build_failed", "pre_deploy_failed", "update_failed",
+        "failed", "canceled", "cancelled", "deactivated",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                async with session.get(
+                    deploys_url,
+                    headers=headers,
+                    params={"limit": "1"},
+                ) as response:
+                    if response.status != 200:
+                        last_status = f"Render deploy API повернув HTTP {response.status}."
+                    else:
+                        try:
+                            payload = await response.json(content_type=None)
+                        except Exception:
+                            payload = None
+
+                        if isinstance(payload, list) and payload:
+                            record = payload[0]
+                            deploy = record.get("deploy", record) if isinstance(record, dict) else {}
+                        elif isinstance(payload, dict):
+                            deploys = payload.get("deploys")
+                            if isinstance(deploys, list) and deploys:
+                                record = deploys[0]
+                                deploy = record.get("deploy", record) if isinstance(record, dict) else {}
+                            else:
+                                deploy = payload.get("deploy", payload)
+                        else:
+                            deploy = {}
+
+                        status = (
+                            str(deploy.get("status") or "").casefold()
+                            if isinstance(deploy, dict) else ""
+                        )
+                        if status == "live":
+                            print(f"[RENDER] Deploy {service_id} is live.")
+                            return True
+                        if status in terminal_failures:
+                            raise RuntimeError(
+                                f"Render deployment failed with status '{status}'. "
+                                "Перевір Build Logs у Render."
+                            )
+                        if status:
+                            last_status = f"Render deploy status: {status}."
+            except RuntimeError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+                last_status = f"Render deploy polling: {type(error).__name__}."
+
+            await asyncio.sleep(5)
+
+    raise RuntimeError(
+        "Не вдалося підтвердити успішне розгортання Render за відведений час. "
+        + last_status
+    )
+
+
 async def deploy_project_to_render(
     service_name: str,
     root_dir: str,
@@ -3901,9 +3978,14 @@ async def deploy_project_to_render(
     # Render's service-list response nests the primary URL under
     # serviceDetails.url; creation responses may expose it at the top level.
     service_url = service.get("url") or service_details.get("url")
+    service_id = service.get("id")
+    if not service_id:
+        raise RuntimeError("Render створив відповідь без service ID; розгортання не підтверджено.")
+
+    await wait_for_render_deploy(str(service_id), timeout_seconds=600)
 
     return {
-        "id": service.get("id"),
+        "id": service_id,
         "url": service_url,
         "name": service.get("name", service_name),
     }
