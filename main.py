@@ -2561,7 +2561,6 @@ def validate_generated_project(
         "RENDER_API_KEY",
         "VERCEL_TOKEN",
         "GROX_DATABASE_URL",
-        "DATABASE_URL",
     }
     dangerous_os_calls = {
         "system", "popen",
@@ -2672,6 +2671,11 @@ def validate_generated_project(
                             add_error(
                                 f"У {filename} заборонено виклик builtins.{function.attr}()."
                             )
+                        if owner.id in environ_aliases and function.attr in {"get", "__getitem__"} and is_secret_argument(node):
+                            add_error(
+                                f"У {filename} заборонено читати захищену змінну "
+                                f"{node.args[0].value}."
+                            )
                         if owner.id in subprocess_modules:
                             add_error(
                                 f"У {filename} заборонено виклики subprocess."
@@ -2685,12 +2689,6 @@ def validate_generated_project(
                             and function.attr in {"get", "__getitem__"}
                             and is_secret_argument(node)
                         ):
-                            add_error(
-                                f"У {filename} заборонено читати захищену змінну "
-                                f"{node.args[0].value}."
-                            )
-                    elif isinstance(owner, ast.Name):
-                        if owner.id in environ_aliases and function.attr in {"get", "__getitem__"} and is_secret_argument(node):
                             add_error(
                                 f"У {filename} заборонено читати захищену змінну "
                                 f"{node.args[0].value}."
