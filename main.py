@@ -328,6 +328,15 @@ async def initialize_database():
         await connection.execute(
             "CREATE SEQUENCE IF NOT EXISTS grox_order_id_seq START WITH 1000"
         )
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS grox_groq_token_usage (
+                id BIGSERIAL PRIMARY KEY,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                reserved_tokens INTEGER NOT NULL CHECK (reserved_tokens > 0)
+            )
+            """
+        )
         # Multiple Render instances can start during a deploy. Serialize
         # sequence synchronization and never move it behind an ID already used.
         async with connection.transaction():
@@ -765,6 +774,99 @@ def estimate_groq_prompt_tokens(prompt: str) -> int:
     return max(200, int(non_ascii * 0.65 + ascii_chars * 0.4) + 200)
 
 
+async def reserve_groq_tokens(prompt: str, requested_output_tokens: int):
+    """Reserve a rolling 60-second token budget shared by all Grox instances."""
+    if db_pool is None:
+        raise RuntimeError("Grox database is not initialized; TPM budget cannot be coordinated.")
+
+    estimated_input_tokens = estimate_groq_prompt_tokens(prompt)
+    max_possible_output = GROQ_TPM_LIMIT - GROQ_TPM_RESERVE - estimated_input_tokens
+    if max_possible_output < GROQ_MIN_COMPLETION_TOKENS:
+        raise RuntimeError(
+            "Запит до Groq завеликий для поточного ліміту TPM. "
+            "Потрібно скоротити вхідний контекст або розбити завдання на частини. "
+            f"Оцінка вхідних токенів: {estimated_input_tokens}; "
+            f"ліміт: {GROQ_TPM_LIMIT}; резерв: {GROQ_TPM_RESERVE}."
+        )
+
+    while True:
+        wait_seconds = None
+        async with db_pool.acquire() as connection:
+            async with connection.transaction():
+                # Coordinate reservations across overlapping Render instances.
+                await connection.fetchval(
+                    "SELECT pg_advisory_xact_lock(8472011, 2)"
+                )
+                await connection.execute(
+                    "DELETE FROM grox_groq_token_usage "
+                    "WHERE created_at < NOW() - INTERVAL '60 seconds'"
+                )
+                used_tokens = await connection.fetchval(
+                    "SELECT COALESCE(SUM(reserved_tokens), 0) "
+                    "FROM grox_groq_token_usage"
+                )
+                available_output_tokens = (
+                    GROQ_TPM_LIMIT
+                    - GROQ_TPM_RESERVE
+                    - estimated_input_tokens
+                    - int(used_tokens or 0)
+                )
+
+                if available_output_tokens >= GROQ_MIN_COMPLETION_TOKENS:
+                    output_tokens = min(
+                        max(GROQ_MIN_COMPLETION_TOKENS, int(requested_output_tokens)),
+                        available_output_tokens,
+                    )
+                    reservation_id = await connection.fetchval(
+                        """
+                        INSERT INTO grox_groq_token_usage (reserved_tokens)
+                        VALUES ($1)
+                        RETURNING id
+                        """,
+                        estimated_input_tokens + output_tokens,
+                    )
+                    return output_tokens, reservation_id, estimated_input_tokens
+
+                wait_seconds = await connection.fetchval(
+                    """
+                    SELECT EXTRACT(EPOCH FROM (
+                        MIN(created_at) + INTERVAL '60 seconds' - NOW()
+                    ))
+                    FROM grox_groq_token_usage
+                    """
+                )
+
+        delay = max(0.5, min(60.0, float(wait_seconds or 1.0) + 0.1))
+        print(
+            f"[GROQ TPM] Shared 60-second budget is full; "
+            f"waiting {delay:.1f}s before reserving tokens."
+        )
+        await asyncio.sleep(delay)
+
+
+async def update_groq_token_reservation(reservation_id: int, usage):
+    """Replace a conservative reservation with provider-reported actual usage."""
+    if db_pool is None or not isinstance(usage, dict):
+        return
+    total_tokens = usage.get("total_tokens")
+    if not isinstance(total_tokens, int) or total_tokens <= 0:
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+            total_tokens = prompt_tokens + completion_tokens
+    if not isinstance(total_tokens, int) or total_tokens <= 0:
+        return
+    try:
+        await db_pool.execute(
+            "UPDATE grox_groq_token_usage SET reserved_tokens = $1 WHERE id = $2",
+            total_tokens,
+            reservation_id,
+        )
+    except Exception as error:
+        # Keep the original conservative reservation if usage reconciliation fails.
+        print(f"[GROQ TPM] Could not reconcile usage: {type(error).__name__}.")
+
+
 async def _groq_request_unlocked(
     prompt: str,
     max_output_tokens: int,
@@ -776,23 +878,10 @@ async def _groq_request_unlocked(
     last_error = None
     total_attempts = max(1, GROQ_RETRIES + 1)
 
-    # Leave headroom for estimation error and concurrent requests using the
-    # same organization-level TPM quota.
-    estimated_input_tokens = estimate_groq_prompt_tokens(prompt)
-    available_output_tokens = (
-        GROQ_TPM_LIMIT - GROQ_TPM_RESERVE - estimated_input_tokens
-    )
-    if available_output_tokens < GROQ_MIN_COMPLETION_TOKENS:
-        raise RuntimeError(
-            "Запит до Groq завеликий для поточного ліміту TPM. "
-            "Потрібно скоротити вхідний контекст або розбити завдання на частини. "
-            f"Оцінка вхідних токенів: {estimated_input_tokens}; "
-            f"ліміт: {GROQ_TPM_LIMIT}; резерв: {GROQ_TPM_RESERVE}."
-        )
-
-    current_max_output_tokens = min(
-        max(GROQ_MIN_COMPLETION_TOKENS, int(max_output_tokens)),
-        available_output_tokens,
+    # Reserve input + requested completion against the shared rolling TPM
+    # window before sending the request. The database coordinates deploy overlap.
+    current_max_output_tokens, reservation_id, estimated_input_tokens = (
+        await reserve_groq_tokens(prompt, max_output_tokens)
     )
     if current_max_output_tokens < max_output_tokens:
         print(
@@ -870,6 +959,7 @@ async def _groq_request_unlocked(
 
                     usage = data.get("usage")
                     if isinstance(usage, dict):
+                        await update_groq_token_reservation(reservation_id, usage)
                         print(
                             "[GROQ] Usage: "
                             f"prompt={usage.get('prompt_tokens', 'unknown')} "
