@@ -4647,10 +4647,11 @@ async def process_order(
         # POST-DELIVERY CLIENT CONVERSATION
         # ====================================================
 
-        await post_delivery_conversation(
-            order,
-            thread
-        )
+        post_delivery_tasks.add(order.order_id)
+        try:
+            await post_delivery_conversation(order, thread)
+        finally:
+            post_delivery_tasks.discard(order.order_id)
 
     except Exception as error:
         # Do not leave a failed order marked WAITING_TZ or IN_PROGRESS.
