@@ -1565,7 +1565,7 @@ async def revise_and_test_website(
             html_code = await fix_site_code(
                 html_code,
                 qa_result["report"],
-                client_task or order.task
+                order.task
             )
         except Exception as error:
             print(
