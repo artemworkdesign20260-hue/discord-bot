@@ -379,20 +379,13 @@ async def initialize_database():
         orders[order.order_id] = order
         restored += 1
 
-    # In-memory Discord listeners/tasks cannot survive a Render restart.
-    # Mark unfinished orders as interrupted instead of leaving them falsely
-    # looking active forever after the process comes back online.
-    interrupted = 0
-    for order in orders.values():
-        if order.status in {"WAITING_TZ", "IN_PROGRESS"}:
-            order.status = "INTERRUPTED"
-            await save_order(order)
-            interrupted += 1
-
+    # Active orders are recovered by a stale-heartbeat worker. This avoids
+    # marking an order interrupted while an older Render instance is still
+    # processing it during a zero-downtime deploy.
     print(
         f"[DATABASE] Neon connected; restored {restored} saved order(s); "
         f"skipped {skipped_corrupt} malformed order(s); "
-        f"marked {interrupted} interrupted order(s)."
+        "stale-order recovery worker will monitor unfinished orders."
     )
 
 
@@ -429,6 +422,65 @@ async def save_order(order: Order):
             order.status,
             payload,
         )
+
+
+async def heartbeat_order(order_id: int):
+    """Keep a live order fresh so another Render instance will not recover it."""
+    while True:
+        await asyncio.sleep(45)
+        if db_pool is None:
+            return
+        try:
+            await db_pool.execute(
+                """
+                UPDATE grox_orders
+                SET updated_at = NOW()
+                WHERE order_id = $1 AND status IN ('WAITING_TZ', 'IN_PROGRESS')
+                """,
+                order_id,
+            )
+        except Exception as error:
+            print(
+                f"[ORDER HEARTBEAT] order=#{order_id} "
+                f"database update failed: {type(error).__name__}."
+            )
+
+
+async def recover_stale_orders():
+    """Mark orders interrupted only after their live-process heartbeat expires."""
+    while True:
+        await asyncio.sleep(60)
+        if db_pool is None:
+            return
+        try:
+            rows = await db_pool.fetch(
+                """
+                UPDATE grox_orders
+                SET status = 'INTERRUPTED',
+                    payload = jsonb_set(
+                        payload,
+                        '{status}',
+                        to_jsonb('INTERRUPTED'::text),
+                        true
+                    ),
+                    updated_at = NOW()
+                WHERE status IN ('WAITING_TZ', 'IN_PROGRESS')
+                  AND updated_at < NOW() - INTERVAL '3 minutes'
+                RETURNING order_id
+                """
+            )
+            for row in rows:
+                order = orders.get(row["order_id"])
+                if order is not None:
+                    order.status = "INTERRUPTED"
+            if rows:
+                print(
+                    f"[ORDER RECOVERY] Marked {len(rows)} stale order(s) as interrupted."
+                )
+        except Exception as error:
+            print(
+                f"[ORDER RECOVERY] Database scan failed: {type(error).__name__}."
+            )
 
 
 # ============================================================
@@ -4021,6 +4073,7 @@ async def process_order(
     active_clients[message.author.id] = (
         active_clients.get(message.author.id, 0) + 1
     )
+    heartbeat_task = None
 
     try:
         # ====================================================
@@ -4033,6 +4086,8 @@ async def process_order(
             # Discord message. The database uniqueness constraint is the
             # cross-instance source of truth; do not create another thread.
             return
+
+        heartbeat_task = asyncio.create_task(heartbeat_order(order.order_id))
 
         # ====================================================
         # CREATE THREAD
@@ -4429,6 +4484,10 @@ async def process_order(
             pass
 
     finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+
         if isinstance(locals().get("order"), Order):
             try:
                 await save_order(order)
@@ -4671,6 +4730,8 @@ async def main():
     attempt = 0
     loop = asyncio.get_running_loop()
 
+    recovery_task = None
+
     def request_shutdown():
         print("[SHUTDOWN] Signal received; closing Discord client gracefully.")
         if not bot.is_closed():
@@ -4685,6 +4746,7 @@ async def main():
 
     try:
         await initialize_database()
+        recovery_task = asyncio.create_task(recover_stale_orders())
         while True:
             attempt += 1
             discord_ready = False
@@ -4768,6 +4830,10 @@ async def main():
                 task.cancel()
             if pending_tasks:
                 await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+        if recovery_task is not None:
+            recovery_task.cancel()
+            await asyncio.gather(recovery_task, return_exceptions=True)
 
         for shutdown_signal in (signal.SIGTERM, signal.SIGINT):
             try:
