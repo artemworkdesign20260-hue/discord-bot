@@ -3,6 +3,7 @@ import signal
 import ast
 import sys
 import time
+import hashlib
 import os
 import re
 import uuid
@@ -294,8 +295,6 @@ post_delivery_tasks: set[int] = set()
 # Number of currently open orders per client (see MAX_ACTIVE_ORDERS_PER_USER).
 active_clients: dict[int, int] = {}
 
-# Names of Render services deployed with the shared Discord builder token.
-builder_token_services: list[str] = []
 
 db_pool: asyncpg.Pool | None = None
 
@@ -339,6 +338,18 @@ async def initialize_database():
                 id BIGSERIAL PRIMARY KEY,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 reserved_tokens INTEGER NOT NULL CHECK (reserved_tokens > 0)
+            )
+            """
+        )
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS grox_builder_token_usage (
+                token_fingerprint TEXT PRIMARY KEY,
+                order_id BIGINT NOT NULL,
+                service_name TEXT NOT NULL,
+                service_id TEXT,
+                status TEXT NOT NULL DEFAULT 'RESERVED',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """
         )
@@ -427,6 +438,66 @@ async def save_order(order: Order):
             order.status,
             payload,
         )
+
+
+async def reserve_builder_token(
+    token_fingerprint: str,
+    order_id: int,
+    service_name: str,
+):
+    """Persistently reserve a Discord token so it cannot run two bot services."""
+    if db_pool is None:
+        raise RuntimeError("Grox database is not initialized.")
+    async with db_pool.acquire() as connection:
+        async with connection.transaction():
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(8472011, 3)"
+            )
+            existing = await connection.fetchrow(
+                """
+                SELECT service_name, service_id, status
+                FROM grox_builder_token_usage
+                WHERE token_fingerprint = $1
+                """,
+                token_fingerprint,
+            )
+            if existing is not None:
+                return False, dict(existing)
+            await connection.execute(
+                """
+                INSERT INTO grox_builder_token_usage (
+                    token_fingerprint, order_id, service_name, status
+                )
+                VALUES ($1, $2, $3, 'RESERVED')
+                """,
+                token_fingerprint,
+                order_id,
+                service_name,
+            )
+            return True, None
+
+
+async def update_builder_token_service(
+    token_fingerprint: str,
+    order_id: int,
+    service_id: str,
+    service_name: str,
+    status: str = "CREATED",
+):
+    if db_pool is None:
+        raise RuntimeError("Grox database is not initialized.")
+    await db_pool.execute(
+        """
+        UPDATE grox_builder_token_usage
+        SET service_id = $1, service_name = $2, status = $3
+        WHERE token_fingerprint = $4 AND order_id = $5
+        """,
+        service_id,
+        service_name,
+        status,
+        token_fingerprint,
+        order_id,
+    )
 
 
 async def heartbeat_order(order_id: int):
@@ -3935,7 +4006,8 @@ async def deploy_project_to_render(
     service_name: str,
     root_dir: str,
     extra_env: dict[str, str] | None = None,
-    is_bot2_service: bool = False
+    is_bot2_service: bool = False,
+    on_service_created=None,
 ):
     if not RENDER_API_KEY:
         raise RuntimeError(
@@ -4089,6 +4161,12 @@ async def deploy_project_to_render(
     if not service_id:
         raise RuntimeError("Render створив відповідь без service ID; розгортання не підтверджено.")
 
+    if on_service_created is not None:
+        await on_service_created(
+            str(service_id),
+            str(service.get("name") or service_name),
+        )
+
     await wait_for_render_deploy(str(service_id), timeout_seconds=600)
 
     return {
@@ -4154,14 +4232,6 @@ async def build_and_deploy_software_bot(
         )
         return False
 
-    if generated_platform == "Discord" and builder_token_services:
-        await thread.send(
-            "⚠️ **Увага: токен `GROX_BUILDER_DISCORD_TOKEN` уже використовує "
-            "сервіс: " + ", ".join(builder_token_services[-3:]) + ".**\n\n"
-            "Два сервіси з одним токеном одночасно відповідатимуть двічі. "
-            "Для кожного окремого Discord-бота потрібен власний токен."
-        )
-
     await thread.send(
         "🤖 **Генерую програмний проєкт...**\n\n"
         + ("Для Bot 2 застосовую окреме Discord-only технічне завдання та перевірки."
@@ -4210,20 +4280,58 @@ async def build_and_deploy_software_bot(
         if BOT2_DATABASE_URL:
             render_env["DATABASE_URL"] = BOT2_DATABASE_URL
 
+    token_fingerprint = None
+    if generated_platform == "Discord":
+        token_fingerprint = hashlib.sha256(
+            GENERATED_DISCORD_TOKEN.encode("utf-8")
+        ).hexdigest()
+        reserved, existing_usage = await reserve_builder_token(
+            token_fingerprint,
+            order.order_id,
+            service_name,
+        )
+        if not reserved:
+            existing_name = (existing_usage or {}).get("service_name") or "невідомий сервіс"
+            existing_id = (existing_usage or {}).get("service_id")
+            await thread.send(
+                "🔒 **Цей Discord-токен уже закріплений за іншим Render-сервісом.**\\n\\n"
+                f"Сервіс: {existing_name}"
+                + (f" (ID: {existing_id})" if existing_id else "")
+                + "\\n\\nОдин токен не можна використовувати для двох ботів. "
+                "Створи окремий Discord application/bot і додай його токен у "
+                "GROX_BUILDER_DISCORD_TOKEN. Не надсилай токен у чат."
+            )
+            return False
+
+    async def record_created_service(service_id: str, actual_name: str):
+        if token_fingerprint is not None:
+            await update_builder_token_service(
+                token_fingerprint,
+                order.order_id,
+                service_id,
+                actual_name,
+                status="CREATED",
+            )
+
     render_info = await deploy_project_to_render(
         service_name,
         root_dir,
         extra_env=render_env,
-        is_bot2_service=bot2
+        is_bot2_service=bot2,
+        on_service_created=record_created_service if token_fingerprint else None,
     )
 
     order.render_service_id = render_info.get("id")
     order.deployment_url = render_info.get("url")
     await save_order(order)
 
-    if generated_platform == "Discord":
-        builder_token_services.append(
-            render_info.get("name") or service_name
+    if token_fingerprint is not None:
+        await update_builder_token_service(
+            token_fingerprint,
+            order.order_id,
+            str(render_info.get("id")),
+            str(render_info.get("name") or service_name),
+            status="ACTIVE",
         )
 
     if bot2:
