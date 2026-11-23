@@ -4294,10 +4294,10 @@ async def build_and_deploy_software_bot(
             existing_name = (existing_usage or {}).get("service_name") or "невідомий сервіс"
             existing_id = (existing_usage or {}).get("service_id")
             await thread.send(
-                "🔒 **Цей Discord-токен уже закріплений за іншим Render-сервісом.**\\n\\n"
+                "🔒 **Цей Discord-токен уже закріплений за іншим Render-сервісом.**\n\n"
                 f"Сервіс: {existing_name}"
                 + (f" (ID: {existing_id})" if existing_id else "")
-                + "\\n\\nОдин токен не можна використовувати для двох ботів. "
+                + "\n\nОдин токен не можна використовувати для двох ботів. "
                 "Створи окремий Discord application/bot і додай його токен у "
                 "GROX_BUILDER_DISCORD_TOKEN. Не надсилай токен у чат."
             )
