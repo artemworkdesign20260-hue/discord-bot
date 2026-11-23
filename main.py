@@ -239,7 +239,8 @@ intents.guilds = True
 
 bot = commands.Bot(
     command_prefix="!",
-    intents=intents
+    intents=intents,
+    allowed_mentions=discord.AllowedMentions.none(),
 )
 
 
@@ -2001,6 +2002,18 @@ async def test_website(url: str):
                     "Сторінка не повернула HTTP response."
                 )
 
+            elif response.status in (401, 403):
+                await browser.close()
+                return {
+                    "success": False,
+                    "infra_error": True,
+                    "report": (
+                        f"Vercel preview повернув HTTP {response.status}. "
+                        "Можливий Deployment Protection або обмеження доступу. "
+                        "Це не доказ помилки в HTML; перевір налаштування доступу Vercel."
+                    ),
+                }
+
             elif response.status >= 400:
                 errors.append(
                     f"HTTP помилка: {response.status}"
@@ -2029,6 +2042,16 @@ async def test_website(url: str):
                 errors.append(
                     "Відсутній <body>."
                 )
+            else:
+                visible_text = (await page.locator("body").inner_text()).strip()
+                meaningful_elements = await page.locator(
+                    "h1, h2, h3, p, a, button, input, textarea, select, img, "
+                    "video, canvas, form, main, article, section"
+                ).count()
+                if not visible_text and meaningful_elements == 0:
+                    errors.append(
+                        "Сторінка порожня: немає видимого тексту або змістовних елементів."
+                    )
 
             # ------------------------------------------------
             # FIND BUTTONS
@@ -3958,7 +3981,15 @@ async def process_order(
             return
 
         if len(final_task) > MAX_TASK_LENGTH:
-            final_task = final_task[:MAX_TASK_LENGTH]
+            await thread.send(
+                "❌ **Фінальне ТЗ перевищує допустимий розмір.**\\n\\n"
+                f"Максимум — {MAX_TASK_LENGTH} символів. Я не буду мовчки "
+                "обрізати вимоги, щоб не втратити важливу частину завдання. "
+                "Скоротіть ТЗ і створіть нове замовлення."
+            )
+            order.status = "ERROR"
+            await save_order(order)
+            return
 
         order.task = final_task
         await save_order(order)
