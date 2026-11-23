@@ -1986,7 +1986,7 @@ async def revise_and_test_website(
 
         # Reuse one Vercel project per order; revisions should create new
         # deployments inside that project, not a new project each time.
-        project_name = f"grox-order-{order.order_id}"
+        project_name = vercel_project_name(order.order_id)
 
         live_url = await deploy_to_vercel(
             project_name,
@@ -2275,6 +2275,11 @@ def schedule_post_delivery_resumes():
         task.add_done_callback(finished)
 
 
+
+
+def vercel_project_name(order_id: int) -> str:
+    """Use one stable Vercel project for all deployments of the same order."""
+    return f"grox-order-{int(order_id)}"
 
 
 async def deploy_to_vercel(
@@ -2869,7 +2874,7 @@ async def generate_test_and_fix_website(
         # ----------------------------------------------------
 
         # Keep every QA attempt for this order inside one Vercel project.
-        project_name = f"grox-order-{order.order_id}"
+        project_name = vercel_project_name(order.order_id)
 
         live_url = await deploy_to_vercel(
             project_name,
