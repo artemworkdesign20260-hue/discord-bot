@@ -4514,7 +4514,11 @@ async def build_and_deploy_software_bot(
     # Generated projects may use Groq independently of Grox. Pass the
     # dedicated Groq key only when the generated source explicitly references
     # GROQ_API_KEY; never copy Render/GitHub/Vercel or Grox database secrets.
-    if any("GROQ_API_KEY" in content for content in files.values()):
+    if any(
+        "GROQ_API_KEY" in content
+        for filename, content in files.items()
+        if filename.lower().endswith((".py", ".js", ".ts", ".mjs", ".cjs"))
+    ):
         render_env["GROQ_API_KEY"] = GROQ_API_KEY
 
     if generated_platform == "Discord":
