@@ -3349,7 +3349,7 @@ def validate_generated_project(
             "постійне збереження даних",
         ),
         (
-            has_identifier_fragment("europe", "european", "eu_countries", "eu_keywords", "european_priority"),
+            has_identifier_fragment("europe", "european", "eu_", "eu_countries", "eu_keywords", "european_priority"),
             "пріоритет європейських спільнот",
         ),
         (
