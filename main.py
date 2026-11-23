@@ -146,6 +146,10 @@ POST_DELIVERY_TIMEOUT = int(
     os.getenv("POST_DELIVERY_TIMEOUT", "86400")
 )
 
+ORDER_STALE_AFTER_SECONDS = int(
+    os.getenv("ORDER_STALE_AFTER_SECONDS", "600")
+)
+
 # Maximum number of clarification rounds before Grox builds the final TЗ.
 MAX_REQUIREMENT_ROUNDS = int(
     os.getenv("MAX_REQUIREMENT_ROUNDS", "3")
@@ -568,9 +572,10 @@ async def recover_stale_orders():
                     ),
                     updated_at = NOW()
                 WHERE status IN ('WAITING_TZ', 'IN_PROGRESS')
-                  AND updated_at < NOW() - INTERVAL '3 minutes'
+                  AND updated_at < NOW() - ($1 * INTERVAL '1 second')
                 RETURNING order_id
-                """
+                """,
+                ORDER_STALE_AFTER_SECONDS,
             )
             for row in rows:
                 order = orders.get(row["order_id"])
