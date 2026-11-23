@@ -12,7 +12,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import select_render_owner_id, validate_generated_project
+from main import detect_bot_platform, is_website_project, select_render_owner_id, validate_generated_project
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -99,6 +99,33 @@ class RenderOwnerSelectionTests(unittest.TestCase):
             ),
             "workspace-1",
         )
+
+
+class ProjectRoutingTests(unittest.TestCase):
+    def test_website_with_discord_integration_routes_to_website(self):
+        self.assertTrue(
+            is_website_project("Створи сайт компанії з інтеграцією Discord.")
+        )
+
+    def test_discord_bot_with_website_dashboard_routes_to_bot(self):
+        self.assertFalse(
+            is_website_project("Створи Discord bot з вебпанеллю керування.")
+        )
+
+    def test_discord_bot_with_telegram_notifications_stays_discord(self):
+        self.assertEqual(
+            detect_bot_platform("Створи Discord bot, який надсилає сповіщення в Telegram."),
+            "Discord",
+        )
+
+    def test_telegram_bot_with_discord_notifications_stays_telegram(self):
+        self.assertEqual(
+            detect_bot_platform("Створи Telegram bot з повідомленнями в Discord."),
+            "Telegram",
+        )
+
+    def test_bot2_is_always_discord(self):
+        self.assertEqual(detect_bot_platform("Bot 2 з інтеграцією Telegram"), "Discord")
 
 
 if __name__ == "__main__":
