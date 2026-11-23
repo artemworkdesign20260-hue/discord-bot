@@ -417,6 +417,12 @@ async def create_order(message: discord.Message) -> Order | None:
 
     async with db_pool.acquire() as connection:
         async with connection.transaction():
+            # Use the same advisory lock as startup sequence synchronization.
+            # This prevents a concurrent startup from rewinding the sequence
+            # between nextval() and a new order reservation.
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(8472011, 1)"
+            )
             order_id = await connection.fetchval(
                 "SELECT nextval('grox_order_id_seq')"
             )
