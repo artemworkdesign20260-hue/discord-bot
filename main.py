@@ -903,6 +903,7 @@ async def _groq_request_unlocked(
     timeout = aiohttp.ClientTimeout(total=CLIENT_TIMEOUT)
 
     for attempt in range(1, total_attempts + 1):
+        retry_after_seconds = None
         try:
             print(
                 f"[GROQ] Attempt {attempt}/{total_attempts} "
@@ -923,6 +924,12 @@ async def _groq_request_unlocked(
                         data = {}
 
                     if response.status >= 400:
+                        retry_after_header = response.headers.get("Retry-After") or response.headers.get("retry-after")
+                        if retry_after_header:
+                            try:
+                                retry_after_seconds = max(0.0, float(retry_after_header))
+                            except (TypeError, ValueError):
+                                retry_after_seconds = None
                         api_error = data.get("error") if isinstance(data, dict) else None
                         if isinstance(api_error, dict):
                             error_message = api_error.get("message") or response_text
@@ -1037,13 +1044,15 @@ async def _groq_request_unlocked(
                 break
             delay = min(60, (2 ** (attempt - 1)) + random.uniform(0.5, 2.0))
             retry_after_match = re.search(
-                r"(?:try again in|retry after)\s*([0-9]+(?:\.[0-9]+)?)\s*s",
+                r"(?:try again in|retry[- ]after)\s*([0-9]+(?:\.[0-9]+)?)\s*(?:s|sec(?:ond)?s?)?",
                 str(error),
                 re.IGNORECASE,
             )
             if retry_after_match:
                 provider_delay = float(retry_after_match.group(1))
                 delay = max(delay, provider_delay + random.uniform(0.25, 0.75))
+            if retry_after_seconds is not None:
+                delay = max(delay, retry_after_seconds + random.uniform(0.25, 0.75))
             delay = min(120, delay)
             print(f"[GROQ] Тимчасова помилка. Повтор через {delay:.1f}s...")
             await asyncio.sleep(delay)
