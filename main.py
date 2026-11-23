@@ -1689,13 +1689,12 @@ async def revise_and_test_website(
         )
 
         if not live_url:
-            if attempt >= MAX_WEBSITE_FIX_ATTEMPTS:
-                return False
             await thread.send(
-                "⚠️ Оновлений сайт не вдалося розгорнути. "
-                "Повторюю спробу."
+                "❌ **Vercel не підтвердив розгортання оновленого сайту.**\n\n"
+                "Не буду повторно публікувати той самий HTML без змін. "
+                "Перевір стан розгортання у Vercel."
             )
-            continue
+            return False
 
         qa_result = await test_website(live_url)
 
@@ -2557,18 +2556,10 @@ async def generate_test_and_fix_website(
         )
 
         if not live_url:
-            if attempt >= MAX_WEBSITE_FIX_ATTEMPTS:
-                raise RuntimeError(
-                    "Vercel не зміг виконати "
-                    "тестовий деплой."
-                )
-
-            await thread.send(
-                "⚠️ Тестовий деплой не вдався. "
-                "Повторюю."
+            raise RuntimeError(
+                "Vercel не підтвердив тестовий деплой. "
+                "Однаковий HTML не буде повторно публікуватися без змін."
             )
-
-            continue
 
         # ----------------------------------------------------
         # RUN QA
