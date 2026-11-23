@@ -12,7 +12,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import validate_generated_project
+from main import select_render_owner_id, validate_generated_project
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -78,6 +78,27 @@ class GeneratedProjectValidationTests(unittest.TestCase):
         self.files["requirements.txt"] = "aiohttp>=3.9\\n"
         errors = validate_generated_project(self.files)
         self.assertFalse(any("aiohttp" in error for error in errors))
+
+
+class RenderOwnerSelectionTests(unittest.TestCase):
+    def test_selects_the_only_available_owner(self):
+        self.assertEqual(
+            select_render_owner_id([{"id": "workspace-1"}]),
+            "workspace-1",
+        )
+
+    def test_requires_explicit_owner_when_multiple_are_available(self):
+        with self.assertRaises(RuntimeError):
+            select_render_owner_id([{"id": "personal"}, {"id": "workspace"}])
+
+    def test_selects_configured_nested_owner(self):
+        self.assertEqual(
+            select_render_owner_id(
+                [{"owner": {"id": "workspace-1"}}, {"id": "workspace-2"}],
+                "workspace-1",
+            ),
+            "workspace-1",
+        )
 
 
 if __name__ == "__main__":
