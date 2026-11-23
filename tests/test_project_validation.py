@@ -13,7 +13,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, is_order_message, is_revision_request, is_website_project, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, vercel_project_name
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_website_project, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, vercel_project_name
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -320,6 +320,18 @@ class RetryAfterParsingTests(unittest.TestCase):
 
     def test_parses_milliseconds(self):
         self.assertAlmostEqual(parse_retry_after_seconds("retry after 500ms"), 0.5)
+
+
+class GeneratedProjectBranchTests(unittest.TestCase):
+    def test_each_project_gets_a_separate_branch(self):
+        self.assertEqual(
+            generated_project_branch("generated_projects/order_1001_ab12cd"),
+            "generated-projects/order_1001_ab12cd",
+        )
+
+    def test_rejects_empty_project_path(self):
+        with self.assertRaises(ValueError):
+            generated_project_branch("")
 
 
 if __name__ == "__main__":
