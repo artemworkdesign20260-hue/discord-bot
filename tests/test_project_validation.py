@@ -13,7 +13,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, is_order_message, is_revision_request, is_website_project, missing_required_integration_settings, select_render_owner_id, validate_generated_project, vercel_project_name
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, is_order_message, is_revision_request, is_website_project, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, vercel_project_name
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -309,6 +309,17 @@ class AdditionalDangerousApiTests(unittest.TestCase):
             self.make_files('from os import posix_spawn as launch\nlaunch("sh", ["sh"])\n')
         )
         self.assertTrue(any("posix_spawn" in error for error in errors))
+
+
+class RetryAfterParsingTests(unittest.TestCase):
+    def test_parses_numeric_seconds(self):
+        self.assertEqual(parse_retry_after_seconds("3.5"), 3.5)
+
+    def test_parses_compound_minutes_and_seconds(self):
+        self.assertEqual(parse_retry_after_seconds("try again in 1m20s"), 80.0)
+
+    def test_parses_milliseconds(self):
+        self.assertAlmostEqual(parse_retry_after_seconds("retry after 500ms"), 0.5)
 
 
 if __name__ == "__main__":
