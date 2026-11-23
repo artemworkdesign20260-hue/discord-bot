@@ -1692,10 +1692,21 @@ JavaScript повинен бути робочим.
 {client_task}
 """
 
-    result = await groq_request(
+    generation = await groq_request(
         prompt,
-        max_output_tokens=30000
+        max_output_tokens=30000,
+        return_metadata=True,
     )
+    result = generation["content"]
+    if generation.get("finish_reason") == "length":
+        result, still_truncated = await continue_truncated_groq_output(
+            result,
+            context="Клієнтське ТЗ:\n" + client_task,
+            output_contract="Поверни продовження одного повного HTML-документа; CSS і JavaScript мають бути всередині HTML.",
+            max_rounds=3,
+        )
+        if still_truncated:
+            raise RuntimeError("Groq не зміг завершити HTML після трьох продовжень; сайт не буде розгорнуто.")
 
     return clean_html_output(result)
 
@@ -1746,10 +1757,24 @@ async def fix_site_code(
 {html_code}
 """
 
-    result = await groq_request(
+    generation = await groq_request(
         prompt,
-        max_output_tokens=30000
+        max_output_tokens=30000,
+        return_metadata=True,
     )
+    result = generation["content"]
+    if generation.get("finish_reason") == "length":
+        result, still_truncated = await continue_truncated_groq_output(
+            result,
+            context=(
+                "Клієнтське ТЗ:\n" + client_task
+                + "\nЗвіт QA:\n" + test_report
+            ),
+            output_contract="Поверни продовження повного виправленого HTML-документа; не повторюй попередній текст.",
+            max_rounds=3,
+        )
+        if still_truncated:
+            raise RuntimeError("Groq не зміг завершити виправлений HTML після трьох продовжень.")
 
     return clean_html_output(result)
 
@@ -1836,10 +1861,24 @@ async def revise_site_code(
 ПОВЕРНИ ПОВНУ ОНОВЛЕНУ ВЕРСІЮ САЙТУ.
 """
 
-    result = await groq_request(
+    generation = await groq_request(
         prompt,
-        max_output_tokens=30000
+        max_output_tokens=30000,
+        return_metadata=True,
     )
+    result = generation["content"]
+    if generation.get("finish_reason") == "length":
+        result, still_truncated = await continue_truncated_groq_output(
+            result,
+            context=(
+                "Поточне ТЗ:\n" + current_task
+                + "\nНова правка:\n" + client_revision
+            ),
+            output_contract="Поверни продовження повного оновленого HTML-документа; збережи всі попередні функції.",
+            max_rounds=3,
+        )
+        if still_truncated:
+            raise RuntimeError("Groq не зміг завершити HTML після трьох продовжень правки.")
 
     return clean_html_output(result)
 
