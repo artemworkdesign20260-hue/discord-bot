@@ -3313,7 +3313,6 @@ def validate_generated_project(
 
     bot2_imports: set[str] = set()
     bot2_identifiers: set[str] = set()
-    bot2_strings: set[str] = set()
     bot2_numbers: set[int] = set()
     for node in ast.walk(bot2_tree):
         if isinstance(node, ast.Import):
@@ -3325,13 +3324,15 @@ def validate_generated_project(
             name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else node.name
             bot2_identifiers.add(name.casefold())
         elif isinstance(node, ast.Constant):
-            if isinstance(node.value, str):
-                bot2_strings.add(node.value.casefold())
-            elif isinstance(node.value, int) and not isinstance(node.value, bool):
+            if isinstance(node.value, int) and not isinstance(node.value, bool):
                 bot2_numbers.add(node.value)
 
-    identifier_blob = " ".join(bot2_identifiers)
-    string_blob = " ".join(bot2_strings)
+    def has_identifier_fragment(*fragments: str) -> bool:
+        return any(
+            fragment in identifier
+            for identifier in bot2_identifiers
+            for fragment in fragments
+        )
 
     bot2_checks = [
         ("discord" in bot2_imports, "Discord.py"),
@@ -3339,33 +3340,28 @@ def validate_generated_project(
         (bool(bot2_identifiers & {"member_count", "bot2_min_guild_members", "min_guild_members"}), "фільтр серверів за кількістю учасників"),
         (500 in bot2_numbers or "bot2_min_guild_members" in bot2_identifiers, "мінімум 500 учасників"),
         (
-            bool(bot2_identifiers & {"moderator", "is_moderator", "is_mod", "approve", "approval", "approved", "has_permissions", "pending_approval"})
-            or any(term in string_blob for term in ("moderator", "approval", "модератор", "погодж")),
+            has_identifier_fragment("moderator", "approve", "approval", "mod_role", "has_permissions", "manage_messages"),
             "модерація та ручне підтвердження",
         ),
         (
             bool(bot2_imports & {"sqlite3", "asyncpg", "psycopg", "psycopg2", "sqlalchemy", "redis"})
-            or bool(bot2_identifiers & {"database_url", "db_pool", "database", "sqlite3", "asyncpg"}),
+            or has_identifier_fragment("database_url", "db_pool", "database", "sqlite3", "asyncpg"),
             "постійне збереження даних",
         ),
         (
-            bool(bot2_identifiers & {"europe", "european", "eu_countries", "eu_keywords", "european_priority"})
-            or any(term in string_blob for term in ("europe", "european", "європ", "eu countries")),
+            has_identifier_fragment("europe", "european", "eu_countries", "eu_keywords", "european_priority"),
             "пріоритет європейських спільнот",
         ),
         (
-            bool(bot2_identifiers & {"search", "search_requests", "search_jobs", "find_requests", "lead", "request", "project", "software", "website"})
-            or any(term in string_blob for term in ("website", "software", "замовлення", "вебсайт", "it project")),
+            has_identifier_fragment("search", "scan", "community", "keyword", "query", "request", "lead", "project", "job", "software", "website"),
             "пошук IT-замовлень",
         ),
         (
-            bool(bot2_identifiers & {"dedup", "duplicate", "processed", "seen", "discord_message_id", "message_id"})
-            or any(term in string_blob for term in ("duplicate", "дубл")),
+            has_identifier_fragment("dedup", "duplicate", "processed", "seen", "discord_message_id", "message_id"),
             "захист від дублікатів",
         ),
         (
-            bool(bot2_identifiers & {"health", "health_handler", "discord_ready", "is_ready"})
-            or "/health" in string_blob,
+            has_identifier_fragment("health", "discord_ready", "is_ready"),
             "перевірка готовності Discord у health endpoint",
         ),
     ]
