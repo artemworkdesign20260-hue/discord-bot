@@ -1677,16 +1677,44 @@ async def fix_site_code(
 
 def is_revision_request(text: str) -> bool:
     normalized = normalize_user_text(text)
+    if not normalized:
+        return False
 
-    revision_words = (
-        "правк", "змін", "додай", "добав", "прибери", "видали",
-        "зроби", "перероби", "виправ", "заміни", "хочу щоб",
-        "хочу, щоб", "потрібно змінити", "треба змінити",
-        "не подобається", "колір", "кнопк", "текст", "дизайн",
-        "секц", "блок", "додати", "прибрати",
+    explicit_action = re.search(
+        r"(?<!\w)(?:додай|добав|прибери|видали|заміни|виправ|перероби|зміни|"
+        r"change|add|remove|replace|fix|update)(?!\w)\s+\S+",
+        normalized,
+        re.IGNORECASE,
     )
+    if explicit_action:
+        return True
 
-    return any(word in normalized for word in revision_words)
+    make_specific_change = re.search(
+        r"(?<!\w)(?:зроби|make)(?!\w).{0,80}"
+        r"(?:кнопк\w*|колір\w*|текст\w*|фон\w*|розмір\w*|шрифт\w*|"
+        r"секц\w*|блок\w*|дизайн\w*|анімац\w*|посил\w*|форм\w*|"
+        r"зображ\w*|красив\w*|сучасн\w*|більш\w*|менш\w*)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if make_specific_change:
+        return True
+
+    issue_or_preference = (
+        "не працює",
+        "не відкривається",
+        "не натискається",
+        "не відображається",
+        "не подобається",
+        "потрібно змінити",
+        "треба змінити",
+        "хочу щоб",
+        "хочу, щоб",
+        "doesn't work",
+        "does not work",
+        "not working",
+    )
+    return any(phrase in normalized for phrase in issue_or_preference)
 
 
 async def revise_site_code(
