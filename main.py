@@ -288,13 +288,12 @@ active_clients: dict[int, int] = {}
 # Names of Render services deployed with the shared Discord builder token.
 builder_token_services: list[str] = []
 
-next_order_id = 1000
 db_pool: asyncpg.Pool | None = None
 
 
 async def initialize_database():
     """Create Grox's own tables and restore saved order records."""
-    global db_pool, next_order_id
+    global db_pool
 
     if not GROX_DATABASE_URL:
         raise RuntimeError("Відсутня Environment Variable: GROX_DATABASE_URL")
@@ -322,6 +321,27 @@ async def initialize_database():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        await connection.execute(
+            "CREATE SEQUENCE IF NOT EXISTS grox_order_id_seq START WITH 1000"
+        )
+        # Multiple Render instances can start during a deploy. Serialize
+        # sequence synchronization and never move it behind an ID already used.
+        async with connection.transaction():
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(8472011, 1)"
+            )
+            await connection.fetchval(
+                """
+                SELECT setval(
+                    'grox_order_id_seq',
+                    GREATEST(
+                        (SELECT last_value FROM grox_order_id_seq),
+                        COALESCE((SELECT MAX(order_id) FROM grox_orders), 1000)
+                    ),
+                    true
+                )
+                """
+            )
         rows = await connection.fetch(
             "SELECT payload FROM grox_orders ORDER BY order_id"
         )
@@ -334,9 +354,6 @@ async def initialize_database():
         order = Order(**payload)
         orders[order.order_id] = order
         restored += 1
-
-    if orders:
-        next_order_id = max(orders)
 
     # In-memory Discord listeners/tasks cannot survive a Render restart.
     # Mark unfinished orders as interrupted instead of leaving them falsely
@@ -393,26 +410,51 @@ async def save_order(order: Order):
 # ORDER HELPERS
 # ============================================================
 
-def create_order(message: discord.Message):
-    global next_order_id
+async def create_order(message: discord.Message) -> Order | None:
+    """Atomically allocate an order ID and reject duplicate Discord messages."""
+    if db_pool is None:
+        raise RuntimeError("Grox database is not initialized.")
 
-    next_order_id += 1
+    async with db_pool.acquire() as connection:
+        async with connection.transaction():
+            order_id = await connection.fetchval(
+                "SELECT nextval('grox_order_id_seq')"
+            )
+            order = Order(
+                order_id=order_id,
+                discord_message_id=message.id,
+                client_id=message.author.id,
+                client_name=message.author.name,
+            )
+            payload = json.dumps(asdict(order), ensure_ascii=False)
+            inserted_id = await connection.fetchval(
+                """
+                INSERT INTO grox_orders (
+                    order_id, discord_message_id, client_id, status, payload, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
+                ON CONFLICT (discord_message_id) DO NOTHING
+                RETURNING order_id
+                """,
+                order.order_id,
+                order.discord_message_id,
+                order.client_id,
+                order.status,
+                payload,
+            )
 
-    order = Order(
-        order_id=next_order_id,
-        discord_message_id=message.id,
-        client_id=message.author.id,
-        client_name=message.author.name,
-    )
+    if inserted_id is None:
+        print(
+            f"[ORDER DUPLICATE] message={message.id} already exists in database; "
+            "skipping duplicate event."
+        )
+        return None
 
     orders[order.order_id] = order
-
     print(
         f"[ORDER CREATED] #{order.order_id} "
-        f"client={order.client_id} "
-        f"message={message.id}"
+        f"client={order.client_id} message={message.id}"
     )
-
     return order
 
 
@@ -3641,10 +3683,12 @@ async def process_order(
         # CREATE ORDER
         # ====================================================
 
-        order = create_order(
-            message
-        )
-        await save_order(order)
+        order = await create_order(message)
+        if order is None:
+            # Another Render instance may already have processed this exact
+            # Discord message. The database uniqueness constraint is the
+            # cross-instance source of truth; do not create another thread.
+            return
 
         # ====================================================
         # CREATE THREAD
@@ -3996,7 +4040,7 @@ async def process_order(
     except Exception as error:
         # Do not leave a failed order marked WAITING_TZ or IN_PROGRESS.
         # Completed/expired/unsupported orders keep their terminal status.
-        if "order" in locals() and order.status not in {
+        if isinstance(locals().get("order"), Order) and order.status not in {
             "COMPLETED", "ERROR", "EXPIRED", "QA_FAILED",
             "UNSUPPORTED", "INTERRUPTED",
         }:
@@ -4033,7 +4077,7 @@ async def process_order(
             pass
 
     finally:
-        if "order" in locals():
+        if isinstance(locals().get("order"), Order):
             try:
                 await save_order(order)
             except Exception as persist_error:
