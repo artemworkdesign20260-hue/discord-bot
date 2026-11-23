@@ -12,7 +12,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import detect_bot_platform, is_website_project, select_render_owner_id, validate_generated_project
+from main import detect_bot_platform, is_revision_request, is_website_project, select_render_owner_id, validate_generated_project
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -126,6 +126,23 @@ class ProjectRoutingTests(unittest.TestCase):
 
     def test_bot2_is_always_discord(self):
         self.assertEqual(detect_bot_platform("Bot 2 з інтеграцією Telegram"), "Discord")
+
+
+class RevisionIntentTests(unittest.TestCase):
+    def test_question_about_color_is_not_a_revision(self):
+        self.assertFalse(is_revision_request("Який колір краще обрати для кнопки?"))
+
+    def test_question_about_button_is_not_a_revision(self):
+        self.assertFalse(is_revision_request("Поясни, для чого ця кнопка."))
+
+    def test_explicit_button_change_is_a_revision(self):
+        self.assertTrue(is_revision_request("Зроби кнопку синьою."))
+
+    def test_broken_button_is_a_revision(self):
+        self.assertTrue(is_revision_request("Кнопка не працює."))
+
+    def test_add_section_is_a_revision(self):
+        self.assertTrue(is_revision_request("Додай секцію контактів."))
 
 
 if __name__ == "__main__":
