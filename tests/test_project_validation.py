@@ -20,7 +20,7 @@ class GeneratedProjectValidationTests(unittest.TestCase):
     def setUp(self):
         self.files = {
             "main.py": "print('hello')\n",
-            "requirements.txt": "# no third-party dependencies\\n",
+            "requirements.txt": "# no third-party dependencies\n",
             "README.md": "Project setup and environment variables.\n",
         }
 
