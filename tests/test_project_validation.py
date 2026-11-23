@@ -13,7 +13,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, is_order_message, is_revision_request, is_website_project, select_render_owner_id, validate_generated_project
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, is_order_message, is_revision_request, is_website_project, missing_required_integration_settings, select_render_owner_id, validate_generated_project
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -247,6 +247,41 @@ class NewOrderIntentTests(unittest.TestCase):
 
     def test_build_web_app_opens_order(self):
         self.assertTrue(is_order_message("Build a web app for my project."))
+
+
+class IntegrationPreflightTests(unittest.TestCase):
+    def test_website_only_requires_vercel(self):
+        with patch("main.VERCEL_TOKEN", None):
+            self.assertEqual(
+                missing_required_integration_settings("Створи сайт для магазину."),
+                ["VERCEL_TOKEN"],
+            )
+
+    def test_discord_bot_reports_missing_owner_integrations(self):
+        with (
+            patch("main.GITHUB_TOKEN", None),
+            patch("main.GITHUB_REPO", None),
+            patch("main.RENDER_API_KEY", None),
+            patch("main.GENERATED_DISCORD_TOKEN", None),
+        ):
+            missing = missing_required_integration_settings("Створи Discord bot.")
+        self.assertEqual(
+            missing,
+            ["GITHUB_TOKEN", "GITHUB_REPO", "RENDER_API_KEY", "GROX_BUILDER_DISCORD_TOKEN"],
+        )
+
+    def test_unsupported_platform_fails_before_questionnaire(self):
+        with (
+            patch("main.GITHUB_TOKEN", None),
+            patch("main.GITHUB_REPO", None),
+            patch("main.RENDER_API_KEY", None),
+            patch("main.GENERATED_DISCORD_TOKEN", None),
+        ):
+            missing = missing_required_integration_settings("Створи Telegram bot.")
+        self.assertEqual(
+            missing,
+            ["автоматичне розгортання зараз підтримує лише Discord-ботів"],
+        )
 
 
 if __name__ == "__main__":
