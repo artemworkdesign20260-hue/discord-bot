@@ -2311,7 +2311,7 @@ async def resume_post_delivery_conversation(order: Order):
 def schedule_post_delivery_resumes():
     """Start one listener per completed order whose persisted idle window is live."""
     now = int(time.time())
-    for order in orders.values():
+    for order in list(orders.values()):
         if (
             order.status != "COMPLETED"
             or not order.thread_id
