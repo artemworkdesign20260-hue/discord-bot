@@ -1,0 +1,72 @@
+import os
+import unittest
+
+# main.py validates its required configuration at import time. These dummy
+# values are used only by the unit-test process; no network connection starts.
+os.environ.setdefault("DISCORD_TOKEN", "unit-test-discord-token")
+os.environ.setdefault("GROQ_API_KEY", "unit-test-groq-key")
+os.environ.setdefault("CLIENT_CHANNEL_ID", "123456789")
+os.environ.setdefault("GROX_OWNER_ID", "123456789")
+os.environ.setdefault(
+    "GROX_DATABASE_URL",
+    "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
+)
+
+from main import validate_generated_project
+
+
+class GeneratedProjectValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.files = {
+            "main.py": "print('hello')\n",
+            "requirements.txt": "",
+            "README.md": "Project setup and environment variables.\n",
+        }
+
+    def test_accepts_simple_valid_project(self):
+        self.assertEqual(
+            validate_generated_project(self.files),
+            [],
+        )
+
+    def test_checks_syntax_of_secondary_python_files(self):
+        self.files["helper.py"] = "def broken_function(:\n    pass\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("helper.py" in error and "Синтаксична помилка" in error for error in errors))
+
+    def test_detects_aliased_os_system_import(self):
+        self.files["main.py"] = "from os import system as run_command\nrun_command('whoami')\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("небезпечної функції run_command" in error for error in errors))
+
+    def test_detects_aliased_os_popen(self):
+        self.files["helper.py"] = "import os as operating_system\noperating_system.popen('id')\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("os.popen" in error for error in errors))
+
+    def test_detects_subprocess_in_secondary_file(self):
+        self.files["worker.py"] = "from subprocess import run\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("worker.py" in error and "subprocess" in error for error in errors))
+
+    def test_detects_internal_secret_access_through_environ_get(self):
+        self.files["helper.py"] = "import os as operating_system\noperating_system.environ.get('GITHUB_TOKEN')\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("GITHUB_TOKEN" in error for error in errors))
+
+    def test_allows_bot2_database_url(self):
+        self.files["main.py"] = "import os\nDATABASE_URL = os.getenv('DATABASE_URL')\n"
+        errors = validate_generated_project(self.files)
+        self.assertFalse(any("DATABASE_URL" in error for error in errors))
+
+    def test_does_not_flag_comments_or_string_literals(self):
+        self.files["main.py"] = (
+            "# subprocess and os.system are mentioned in this comment\n"
+            "message = 'os.system(\\'not executed\\')'\n"
+        )
+        errors = validate_generated_project(self.files)
+        self.assertFalse(any("subprocess" in error or "os.system" in error for error in errors))
+
+
+if __name__ == "__main__":
+    unittest.main()
