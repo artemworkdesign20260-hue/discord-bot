@@ -1227,12 +1227,12 @@ async def groq_request(
 # ============================================================
 
 CREDENTIAL_REQUEST_PATTERN = re.compile(
-    r"(?i)\\b(?:github\\s*)?(?:personal\\s+access\\s+token|pat|token|"
-    r"api[\\s-]*key|access[\\s-]*key|private[\\s-]*key|secret[\\s-]*key|"
-    r"парол\\w*|токен\\w*|api[\\s-]*ключ\\w*|"
-    r"ключ(?:і)?\\s+(?:доступу|api|приватн\\w*|секретн\\w*|авторизац\\w*)|"
-    r"приватн\\w*\\s+ключ\\w*|секретн\\w*\\s+ключ\\w*|"
-    r"секрет\\w*|database\\s*url|\\.env)\\b"
+    r"(?i)\b(?:github\s*)?(?:personal\s+access\s+token|pat|token|"
+    r"api[\s-]*key|access[\s-]*key|private[\s-]*key|secret[\s-]*key|"
+    r"парол\w*|токен\w*|api[\s-]*ключ\w*|"
+    r"ключ(?:і)?\s+(?:доступу|api|приватн\w*|секретн\w*|авторизац\w*)|"
+    r"приватн\w*\s+ключ\w*|секретн\w*\s+ключ\w*|"
+    r"секрет\w*|database\s*url|\.env)\b"
 )
 
 
