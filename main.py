@@ -38,9 +38,12 @@ RENDER_API_KEY = os.getenv("RENDER_API_KEY")
 RENDER_OWNER_ID = os.getenv("RENDER_OWNER_ID", "").strip()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
-GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip() or "main"
 # Keep generated-project commits off Grox's auto-deploy branch by default.
-GROX_PROJECTS_BRANCH = os.getenv("GROX_PROJECTS_BRANCH", "generated-projects").strip()
+GROX_PROJECTS_BRANCH = (
+    os.getenv("GROX_PROJECTS_BRANCH", "generated-projects").strip().strip("/")
+    or "generated-projects"
+)
 
 # Optional Telegram credentials passed to generated Telegram projects.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
