@@ -989,9 +989,6 @@ def extract_budget(text: str):
 # GROQ REQUEST
 # ============================================================
 
-GROQ_REQUEST_LOCK = asyncio.Lock()
-
-
 def estimate_groq_prompt_tokens(prompt: str) -> int:
     """
     Conservative local estimate without another tokenizer dependency.
@@ -1305,13 +1302,12 @@ async def groq_request(
     max_output_tokens: int,
     return_metadata: bool = False,
 ):
-    """Serialize requests and retries against the shared organization TPM quota."""
-    async with GROQ_REQUEST_LOCK:
-        return await _groq_request_unlocked(
-            prompt,
-            max_output_tokens,
-            return_metadata=return_metadata,
-        )
+    """Use PostgreSQL token reservations to coordinate concurrent Groq calls."""
+    return await _groq_request_unlocked(
+        prompt,
+        max_output_tokens,
+        return_metadata=return_metadata,
+    )
 
 
 async def continue_truncated_groq_output(
