@@ -2,6 +2,7 @@ import asyncio
 import signal
 import ast
 import sys
+import time
 import os
 import re
 import uuid
@@ -278,6 +279,8 @@ class Order:
     render_service_id: str | None = None
 
     status: str = "WAITING_TZ"
+    delivered_at: int | None = None
+    post_delivery_expires_at: int | None = None
 
     # Used to prevent stale/duplicate approval handling.
     approval_message_id: int = 0
@@ -286,6 +289,7 @@ class Order:
 orders: dict[int, Order] = {}
 active_orders: set[int] = set()
 processing_tasks: set[asyncio.Task] = set()
+post_delivery_tasks: set[int] = set()
 
 # Number of currently open orders per client (see MAX_ACTIVE_ORDERS_PER_USER).
 active_clients: dict[int, int] = {}
@@ -1787,27 +1791,27 @@ async def answer_client_message(
 
 async def post_delivery_conversation(
     order: Order,
-    thread: discord.Thread
+    thread: discord.Thread,
+    send_intro: bool = True,
 ):
-    await thread.send(
-        "💬 **Grox залишається на зв'язку.**\n\n"
-        "Можете поставити питання або написати, що потрібно змінити "
-        "у проєкті. Якщо це правка сайту — я внесу її, перевірю "
-        "результат і надішлю оновлену версію."
-    )
+    if send_intro:
+        await thread.send(
+            "💬 **Grox залишається на зв'язку.**\n\n"
+            "Можете поставити питання або написати, що потрібно змінити "
+            "у проєкті. Якщо це правка сайту — я внесу її, перевірю "
+            "результат і надішлю оновлену версію."
+        )
 
-    started_at = asyncio.get_running_loop().time()
+    if order.delivered_at is None:
+        order.delivered_at = int(time.time())
+    if order.post_delivery_expires_at is None:
+        order.post_delivery_expires_at = int(time.time()) + POST_DELIVERY_TIMEOUT
+        await save_order(order)
 
     while True:
-        elapsed = (
-            asyncio.get_running_loop().time()
-            - started_at
-        )
-
-        remaining_timeout = max(
-            1,
-            POST_DELIVERY_TIMEOUT - int(elapsed)
-        )
+        remaining_timeout = int(order.post_delivery_expires_at - time.time())
+        if remaining_timeout <= 0:
+            return
 
         def check(msg: discord.Message):
             return (
@@ -1820,13 +1824,12 @@ async def post_delivery_conversation(
             client_message = await bot.wait_for(
                 "message",
                 check=check,
-                timeout=remaining_timeout
+                timeout=max(1, remaining_timeout),
             )
         except asyncio.TimeoutError:
             return
 
         text = client_message.content.strip()
-
         if not text:
             continue
 
@@ -1836,6 +1839,11 @@ async def post_delivery_conversation(
                 f"Максимум: {MAX_TASK_LENGTH} символів."
             )
             continue
+
+        # Persist the idle timeout before doing any slow AI or deploy work.
+        # If Render restarts now, on_ready can resume this conversation.
+        order.post_delivery_expires_at = int(time.time()) + POST_DELIVERY_TIMEOUT
+        await save_order(order)
 
         print(
             f"[CLIENT FOLLOW-UP] "
@@ -1889,7 +1897,6 @@ async def post_delivery_conversation(
                     "Можете описати її ще раз."
                 )
 
-            started_at = asyncio.get_running_loop().time()
             continue
 
         try:
@@ -1910,12 +1917,61 @@ async def post_delivery_conversation(
                 "що саме потрібно зробити або змінити."
             )
 
-        started_at = asyncio.get_running_loop().time()
+
+async def resume_post_delivery_conversation(order: Order):
+    """Resume an unexpired completed order after a Discord/Render restart."""
+    try:
+        channel = bot.get_channel(order.thread_id)
+        if channel is None:
+            channel = await bot.fetch_channel(order.thread_id)
+        if not isinstance(channel, discord.Thread):
+            print(
+                f"[POST-DELIVERY RESUME] order=#{order.order_id}: "
+                "saved channel is not a Discord thread."
+            )
+            return
+        if channel.archived:
+            try:
+                await channel.edit(archived=False)
+            except discord.HTTPException:
+                print(
+                    f"[POST-DELIVERY RESUME] order=#{order.order_id}: "
+                    "could not unarchive thread."
+                )
+                return
+        await post_delivery_conversation(order, channel, send_intro=False)
+    except Exception as error:
+        print(
+            f"[POST-DELIVERY RESUME] order=#{order.order_id} "
+            f"failed: {type(error).__name__}."
+        )
 
 
-# ============================================================
-# VERCEL DEPLOY
-# ============================================================
+def schedule_post_delivery_resumes():
+    """Start one listener per completed order whose persisted idle window is live."""
+    now = int(time.time())
+    for order in orders.values():
+        if (
+            order.status != "COMPLETED"
+            or not order.thread_id
+            or not order.post_delivery_expires_at
+            or order.post_delivery_expires_at <= now
+            or order.order_id in post_delivery_tasks
+        ):
+            continue
+
+        post_delivery_tasks.add(order.order_id)
+        task = asyncio.create_task(resume_post_delivery_conversation(order))
+        processing_tasks.add(task)
+
+        def finished(done_task, order_id=order.order_id):
+            processing_tasks.discard(done_task)
+            post_delivery_tasks.discard(order_id)
+
+        task.add_done_callback(finished)
+
+
+
 
 async def deploy_to_vercel(
     project_name: str,
@@ -4548,6 +4604,8 @@ async def process_order(
         # ====================================================
 
         order.status = "COMPLETED"
+        order.delivered_at = int(time.time())
+        order.post_delivery_expires_at = order.delivered_at + POST_DELIVERY_TIMEOUT
         await save_order(order)
 
         # ====================================================
@@ -4706,6 +4764,8 @@ async def on_ready():
     print(
         "🚀 Grox готовий!"
     )
+
+    schedule_post_delivery_resumes()
 
     print(
         "========================================"
