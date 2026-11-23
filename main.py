@@ -1,6 +1,7 @@
 import asyncio
 import signal
 import ast
+import sys
 import os
 import re
 import uuid
@@ -2593,6 +2594,64 @@ def validate_generated_project(
         "execv", "execve", "execvp", "execvpe",
     }
 
+    requirement_names: set[str] = set()
+    for requirement_line in files.get("requirements.txt", "").splitlines():
+        clean_line = requirement_line.split("#", 1)[0].strip()
+        if not clean_line or clean_line.startswith("-"):
+            continue
+        if " @ " in clean_line:
+            clean_line = clean_line.split(" @ ", 1)[0].strip()
+        package_name = re.split(r"[<>=!~;\\[]", clean_line, maxsplit=1)[0]
+        if package_name:
+            requirement_names.add(package_name.casefold().replace("_", "-").replace(".", "-"))
+
+    known_import_distributions = {
+        "aiohttp": {"aiohttp"},
+        "asyncpg": {"asyncpg"},
+        "discord": {"discord-py", "py-cord"},
+        "PIL": {"pillow"},
+        "cv2": {"opencv-python", "opencv-python-headless"},
+        "yaml": {"pyyaml"},
+        "bs4": {"beautifulsoup4"},
+        "dotenv": {"python-dotenv"},
+        "dateutil": {"python-dateutil"},
+        "jwt": {"pyjwt"},
+        "sklearn": {"scikit-learn"},
+        "telegram": {"python-telegram-bot", "aiogram", "telethon"},
+        "google": {"google-genai", "google-generativeai", "google-api-python-client"},
+        "openai": {"openai"},
+        "requests": {"requests"},
+        "flask": {"flask"},
+        "fastapi": {"fastapi"},
+        "uvicorn": {"uvicorn"},
+        "sqlalchemy": {"sqlalchemy"},
+        "psycopg": {"psycopg", "psycopg2", "psycopg2-binary"},
+        "psycopg2": {"psycopg2", "psycopg2-binary"},
+        "redis": {"redis"},
+        "playwright": {"playwright"},
+        "numpy": {"numpy"},
+        "pandas": {"pandas"},
+        "pydantic": {"pydantic"},
+        "stripe": {"stripe"},
+        "boto3": {"boto3"},
+        "supabase": {"supabase"},
+        "firebase_admin": {"firebase-admin"},
+        "qrcode": {"qrcode"},
+        "cryptography": {"cryptography"},
+        "websockets": {"websockets"},
+    }
+    standard_library = set(getattr(sys, "stdlib_module_names", ()))
+    local_modules = {
+        os.path.splitext(os.path.basename(name))[0]
+        for name in python_sources
+    }
+    local_modules.update(
+        name.split("/", 1)[0]
+        for name in python_sources
+        if "/" in name
+    )
+    imported_modules: set[str] = set()
+
     for filename, source in python_sources.items():
         try:
             tree = ast.parse(source, filename=filename)
@@ -2616,6 +2675,7 @@ def validate_generated_project(
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     root = alias.name.split(".", 1)[0]
+                    imported_modules.add(root)
                     bound_name = alias.asname or root
                     if root == "os":
                         os_modules.add(bound_name)
@@ -2630,6 +2690,8 @@ def validate_generated_project(
 
             elif isinstance(node, ast.ImportFrom):
                 module = (node.module or "").split(".", 1)[0]
+                if module:
+                    imported_modules.add(module)
                 if module == "subprocess":
                     add_error(f"У {filename} заборонено імпорт subprocess.")
                 elif module == "pickle":
@@ -2734,6 +2796,17 @@ def validate_generated_project(
                             add_error(
                                 f"У {filename} заборонено читати захищену змінну {key.value}."
                             )
+
+    for module in sorted(imported_modules):
+        if module in standard_library or module in local_modules:
+            continue
+        expected_distributions = known_import_distributions.get(module)
+        if expected_distributions and not (expected_distributions & requirement_names):
+            expected = " або ".join(sorted(expected_distributions))
+            add_error(
+                f"У requirements.txt не вказана залежність для імпорту {module} "
+                f"(додай одну з: {expected})."
+            )
 
     if require_discord:
         requirements = files.get("requirements.txt", "")
