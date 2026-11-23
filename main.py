@@ -1492,7 +1492,8 @@ async def revise_site_code(
 async def revise_and_test_website(
     order: Order,
     thread: discord.Thread,
-    html_code: str
+    html_code: str,
+    client_task: str | None = None,
 ):
     for attempt in range(
         1,
@@ -1526,6 +1527,13 @@ async def revise_and_test_website(
 
         qa_result = await test_website(live_url)
 
+        if qa_result.get("infra_error"):
+            await thread.send(
+                "⚠️ **QA-середовище не змогло перевірити оновлений сайт.**\\n\\n"
+                "Я не буду переписувати код через помилку браузера або тестового середовища."
+            )
+            return False
+
         if qa_result["success"]:
             order.site_url = live_url
             order.site_code = html_code
@@ -1554,7 +1562,7 @@ async def revise_and_test_website(
             html_code = await fix_site_code(
                 html_code,
                 qa_result["report"],
-                order.task
+                client_task or order.task
             )
         except Exception as error:
             print(
@@ -1686,16 +1694,19 @@ async def post_delivery_conversation(
                     text
                 )
 
-                order.task = updated_task
-                await save_order(order)
-
                 success = await revise_and_test_website(
                     order,
                     thread,
-                    revised_html
+                    revised_html,
+                    client_task=updated_task,
                 )
 
-                if not success:
+                if success:
+                    # Commit the task history only after the revised site has
+                    # passed QA and its new URL/code have been saved.
+                    order.task = updated_task
+                    await save_order(order)
+                else:
                     await thread.send(
                         "⚠️ Правку я зрозумів, але не буду "
                         "вважати її готовою, поки сайт не пройде "
@@ -2346,7 +2357,7 @@ async def generate_test_and_fix_website(
             html_code = await fix_site_code(
                 html_code,
                 qa_result["report"],
-                order.task
+                client_task or order.task
             )
 
         except Exception as error:
