@@ -68,5 +68,17 @@ class GeneratedProjectValidationTests(unittest.TestCase):
         self.assertFalse(any("subprocess" in error or "os.system" in error for error in errors))
 
 
+    def test_checks_known_external_import_dependencies(self):
+        self.files["main.py"] = "import aiohttp\\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("aiohttp" in error and "requirements.txt" in error for error in errors))
+
+    def test_accepts_declared_external_import_dependency(self):
+        self.files["main.py"] = "import aiohttp\\n"
+        self.files["requirements.txt"] = "aiohttp>=3.9\\n"
+        errors = validate_generated_project(self.files)
+        self.assertFalse(any("aiohttp" in error for error in errors))
+
+
 if __name__ == "__main__":
     unittest.main()
