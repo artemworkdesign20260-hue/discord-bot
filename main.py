@@ -3343,6 +3343,21 @@ async def generate_software_project(client_task: str):
     )
     result = generation_result["content"]
     generation_truncated = generation_result["finish_reason"] == "length"
+    if generation_truncated:
+        result, generation_truncated = await continue_truncated_groq_output(
+            result,
+            context=(
+                "Клієнтське ТЗ:\\n" + client_task
+                + "\\nПлатформа:\\n" + platform
+                + "\\nСпеціальні вимоги:\\n" + special_requirements
+            ),
+            output_contract=(
+                "Поверни рівно три повні файли з маркерами ===FILE: main.py===, "
+                "===FILE: requirements.txt=== та ===FILE: README.md===. "
+                "Кожен файл має бути повним і придатним до запуску."
+            ),
+            max_rounds=3,
+        )
 
     def extract_project_files(raw_response: str) -> dict[str, str]:
         """Extract named project files, tolerating common harmless LLM formatting variations."""
