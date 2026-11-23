@@ -1704,6 +1704,8 @@ async def revise_and_test_website(
         if qa_result["success"]:
             order.site_url = live_url
             order.site_code = html_code
+            if client_task is not None:
+                order.task = client_task
             await save_order(order)
             await thread.send(
                 "✅ **Правку внесено та перевірено!**\n\n"
@@ -1868,12 +1870,7 @@ async def post_delivery_conversation(
                     client_task=updated_task,
                 )
 
-                if success:
-                    # Commit the task history only after the revised site has
-                    # passed QA and its new URL/code have been saved.
-                    order.task = updated_task
-                    await save_order(order)
-                else:
+                if not success:
                     await thread.send(
                         "⚠️ Правку я зрозумів, але не буду "
                         "вважати її готовою, поки сайт не пройде "
