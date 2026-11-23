@@ -4058,21 +4058,23 @@ async def build_and_deploy_software_bot(
 # ============================================================
 
 async def process_order(
-    message: discord.Message
+    message: discord.Message,
+    slot_reserved: bool = False,
 ):
     if message.author.id != GROX_OWNER_ID:
         return
 
-    if message.id in active_orders:
-        return
+    if not slot_reserved:
+        if message.id in active_orders:
+            return
+        active_orders.add(message.id)
+        active_clients[message.author.id] = (
+            active_clients.get(message.author.id, 0) + 1
+        )
+    elif message.id not in active_orders:
+        # Defensive fallback for an internal caller that reserved only a slot.
+        active_orders.add(message.id)
 
-    active_orders.add(
-        message.id
-    )
-
-    active_clients[message.author.id] = (
-        active_clients.get(message.author.id, 0) + 1
-    )
     heartbeat_task = None
 
     try:
@@ -4628,13 +4630,21 @@ async def on_message(
             pass
         return
 
+    # Reserve the in-memory slot synchronously before scheduling the task.
+    # Without this, several messages arriving in one event-loop turn can all
+    # pass the limit check before process_order increments the counter.
+    active_orders.add(message.id)
+    active_clients[message.author.id] = (
+        active_clients.get(message.author.id, 0) + 1
+    )
+
     print(
         f"[ORDER DETECTED] user_id={message.author.id} "
         f"message_id={message.id} "
         f"message_length={len(message.content)}"
     )
 
-    task = asyncio.create_task(process_order(message))
+    task = asyncio.create_task(process_order(message, slot_reserved=True))
     processing_tasks.add(task)
     task.add_done_callback(processing_tasks.discard)
 
