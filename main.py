@@ -3596,6 +3596,139 @@ def _safe_github_error_detail(status: int, body: str, request_id: str | None = N
     return f"HTTP {status}. " + " | ".join(parts)
 
 
+async def github_publish_project(
+    root_dir: str,
+    files: dict[str, str],
+    commit_message: str,
+):
+    """Publish every project file through one atomic Git commit."""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        raise RuntimeError("GITHUB_TOKEN або GITHUB_REPO не налаштований.")
+
+    repo = validate_github_repo(GITHUB_REPO)
+    branch = GITHUB_BRANCH
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    base_url = f"{GITHUB_API_URL}/repos/{repo}"
+    timeout = aiohttp.ClientTimeout(total=60)
+
+    async with GITHUB_WRITE_LOCK:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async def request_json(method: str, url: str, payload=None):
+                request_kwargs = {"headers": headers}
+                if payload is not None:
+                    request_kwargs["json"] = payload
+                async with session.request(method, url, **request_kwargs) as response:
+                    body = await response.text()
+                    if response.status not in (200, 201):
+                        request_id = response.headers.get("X-GitHub-Request-Id")
+                        detail = _safe_github_error_detail(
+                            response.status,
+                            body,
+                            request_id,
+                        )
+                        raise RuntimeError(f"GitHub atomic publish failed: {detail}")
+                    try:
+                        data = json.loads(body)
+                    except json.JSONDecodeError as error:
+                        raise RuntimeError(
+                            "GitHub повернув некоректний JSON під час атомарної публікації."
+                        ) from error
+                    if not isinstance(data, dict):
+                        raise RuntimeError(
+                            "GitHub повернув відповідь неочікуваного формату під час публікації."
+                        )
+                    return data
+
+            branch_ref_url = (
+                f"{base_url}/git/ref/heads/{quote(branch, safe='/')}"
+            )
+            ref_data = await request_json("GET", branch_ref_url)
+            parent_sha = (ref_data.get("object") or {}).get("sha")
+            if not isinstance(parent_sha, str) or not parent_sha:
+                raise RuntimeError("GitHub не повернув commit SHA поточної гілки.")
+
+            parent_commit = await request_json(
+                "GET",
+                f"{base_url}/git/commits/{quote(parent_sha, safe='')}",
+            )
+            base_tree_sha = (parent_commit.get("tree") or {}).get("sha")
+            if not isinstance(base_tree_sha, str) or not base_tree_sha:
+                raise RuntimeError("GitHub не повернув tree SHA поточного commit.")
+
+            tree_entries = []
+            for filename, content in files.items():
+                if (
+                    not isinstance(filename, str)
+                    or not filename
+                    or filename in {".", ".."}
+                    or "/" in filename
+                    or "\\" in filename
+                    or not isinstance(content, str)
+                ):
+                    raise ValueError("Некоректний шлях або вміст файлу проєкту.")
+
+                blob = await request_json(
+                    "POST",
+                    f"{base_url}/git/blobs",
+                    {"content": content, "encoding": "utf-8"},
+                )
+                blob_sha = blob.get("sha")
+                if not isinstance(blob_sha, str) or not blob_sha:
+                    raise RuntimeError(f"GitHub не повернув blob SHA для {filename}.")
+
+                tree_entries.append({
+                    "path": f"{root_dir}/{filename}",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": blob_sha,
+                })
+
+            if not tree_entries:
+                raise RuntimeError("Немає файлів для публікації в GitHub.")
+
+            tree = await request_json(
+                "POST",
+                f"{base_url}/git/trees",
+                {
+                    "base_tree": base_tree_sha,
+                    "tree": tree_entries,
+                },
+            )
+            tree_sha = tree.get("sha")
+            if not isinstance(tree_sha, str) or not tree_sha:
+                raise RuntimeError("GitHub не повернув tree SHA нового проєкту.")
+
+            commit = await request_json(
+                "POST",
+                f"{base_url}/git/commits",
+                {
+                    "message": commit_message,
+                    "tree": tree_sha,
+                    "parents": [parent_sha],
+                },
+            )
+            commit_sha = commit.get("sha")
+            if not isinstance(commit_sha, str) or not commit_sha:
+                raise RuntimeError("GitHub не повернув SHA нового commit.")
+
+            # A non-forced ref update prevents overwriting a concurrent push.
+            await request_json(
+                "PATCH",
+                f"{base_url}/git/refs/heads/{quote(branch, safe='/')}",
+                {"sha": commit_sha, "force": False},
+            )
+
+    print(
+        f"[GITHUB] Published {len(tree_entries)} project file(s) "
+        f"atomically in commit {commit_sha}."
+    )
+    return commit_sha
+
+
 async def github_upsert_file(
     repo_path: str,
     file_path: str,
@@ -4072,15 +4205,14 @@ async def build_and_deploy_software_bot(
     root_dir = f"generated_projects/order_{order.order_id}_{suffix}"
     service_name = f"grox-order-{order.order_id}-{suffix}"
 
-    await thread.send("📦 **Публікую перевірені файли в GitHub...**")
-
-    for filename, content in files.items():
-        await github_upsert_file(
-            root_dir,
-            f"{root_dir}/{filename}",
-            content,
-            f"Grox: generate order #{order.order_id} - {filename}"
-        )
+    await thread.send(
+        "📦 **Публікую перевірені файли в GitHub одним атомарним комітом...**"
+    )
+    await github_publish_project(
+        root_dir,
+        files,
+        f"Grox: generate order #{order.order_id}",
+    )
 
     order.project_repo_path = root_dir
     await save_order(order)
