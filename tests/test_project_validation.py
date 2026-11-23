@@ -70,13 +70,13 @@ class GeneratedProjectValidationTests(unittest.TestCase):
 
 
     def test_checks_known_external_import_dependencies(self):
-        self.files["main.py"] = "import aiohttp\\n"
+        self.files["main.py"] = "import aiohttp\n"
         errors = validate_generated_project(self.files)
         self.assertTrue(any("aiohttp" in error and "requirements.txt" in error for error in errors))
 
     def test_accepts_declared_external_import_dependency(self):
-        self.files["main.py"] = "import aiohttp\\n"
-        self.files["requirements.txt"] = "aiohttp>=3.9\\n"
+        self.files["main.py"] = "import aiohttp\n"
+        self.files["requirements.txt"] = "aiohttp>=3.9\n"
         errors = validate_generated_project(self.files)
         self.assertFalse(any("aiohttp" in error for error in errors))
 
@@ -197,18 +197,18 @@ class Bot2ValidationTests(unittest.TestCase):
     def setUp(self):
         self.files = {
             "main.py": (
-                "import discord\\n"
-                "import sqlite3\\n"
-                "BOT2_MIN_GUILD_MEMBERS = 500\\n"
-                "async def on_message(message):\\n    pass\\n"
-                "def is_moderator(member):\\n    return True\\n"
-                "EU_COUNTRIES = ['DE', 'PL']\\n"
-                "def search_requests():\\n    pass\\n"
-                "processed_message_ids = set()\\n"
-                "async def health_handler():\\n    pass\\n"
+                "import discord\n"
+                "import sqlite3\n"
+                "BOT2_MIN_GUILD_MEMBERS = 500\n"
+                "async def on_message(message):\n    pass\n"
+                "def is_moderator(member):\n    return True\n"
+                "EU_COUNTRIES = ['DE', 'PL']\n"
+                "def search_requests():\n    pass\n"
+                "processed_message_ids = set()\n"
+                "async def health_handler():\n    pass\n"
             ),
-            "requirements.txt": "discord.py>=2.0\\n",
-            "README.md": "Discord bot setup and Environment Variables.\\n",
+            "requirements.txt": "discord.py>=2.0\n",
+            "README.md": "Discord bot setup and Environment Variables.\n",
         }
 
     def test_accepts_required_bot2_ast_signals(self):
@@ -221,8 +221,8 @@ class Bot2ValidationTests(unittest.TestCase):
 
     def test_comments_and_strings_cannot_fake_bot2_features(self):
         self.files["main.py"] = (
-            "# import discord on_message member_count moderator approval\\n"
-            "description = '500 sqlite EU search duplicate /health'\\n"
+            "# import discord on_message member_count moderator approval\n"
+            "description = '500 sqlite EU search duplicate /health'\n"
         )
         errors = validate_generated_project(
             self.files,
