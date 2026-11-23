@@ -360,11 +360,22 @@ async def initialize_database():
         )
 
     restored = 0
+    skipped_corrupt = 0
     for row in rows:
-        payload = row["payload"]
-        if isinstance(payload, str):
-            payload = json.loads(payload)
-        order = Order(**payload)
+        try:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if not isinstance(payload, dict):
+                raise ValueError("Order payload is not an object.")
+            order = Order(**payload)
+        except Exception as error:
+            skipped_corrupt += 1
+            print(
+                "[DATABASE WARNING] Skipped one malformed saved order: "
+                f"{type(error).__name__}; record details omitted."
+            )
+            continue
         orders[order.order_id] = order
         restored += 1
 
@@ -380,6 +391,7 @@ async def initialize_database():
 
     print(
         f"[DATABASE] Neon connected; restored {restored} saved order(s); "
+        f"skipped {skipped_corrupt} malformed order(s); "
         f"marked {interrupted} interrupted order(s)."
     )
 
