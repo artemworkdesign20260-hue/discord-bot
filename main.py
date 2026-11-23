@@ -3594,6 +3594,22 @@ async def generate_software_project(client_task: str):
 
         repaired_result = repair_generation["content"]
         repair_truncated = repair_generation["finish_reason"] == "length"
+        if repair_truncated:
+            repaired_result, repair_truncated = await continue_truncated_groq_output(
+                repaired_result,
+                context=(
+                    "Клієнтське ТЗ:\\n" + client_task
+                    + "\\nПлатформа:\\n" + platform
+                    + "\\nПомилки перевірки:\\n" + "\\n".join(validation_errors)
+                    + "\\nПоточні цільові файли:\\n" + current_files_context
+                ),
+                output_contract=(
+                    "Поверни продовження повних файлів: "
+                    + ", ".join(repair_targets)
+                    + ". Не повторюй уже видані частини."
+                ),
+                max_rounds=3,
+            )
         repaired_files = extract_project_files(repaired_result)
         returned_targets = [
             name for name in repair_targets
