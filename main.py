@@ -1939,10 +1939,9 @@ async def revise_and_test_website(
             "кнопки, посилання та форми."
         )
 
-        project_name = (
-            f"grox-revision-"
-            f"{uuid.uuid4().hex[:12]}"
-        )
+        # Reuse one Vercel project per order; revisions should create new
+        # deployments inside that project, not a new project each time.
+        project_name = f"grox-order-{order.order_id}"
 
         live_url = await deploy_to_vercel(
             project_name,
@@ -2824,10 +2823,8 @@ async def generate_test_and_fix_website(
         # DEPLOY TEST VERSION
         # ----------------------------------------------------
 
-        project_name = (
-            f"grox-job-"
-            f"{uuid.uuid4().hex[:12]}"
-        )
+        # Keep every QA attempt for this order inside one Vercel project.
+        project_name = f"grox-order-{order.order_id}"
 
         live_url = await deploy_to_vercel(
             project_name,
