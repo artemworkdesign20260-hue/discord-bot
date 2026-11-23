@@ -1257,7 +1257,7 @@ async def _groq_request_unlocked(
                 error,
                 (asyncio.TimeoutError, aiohttp.ClientError)
             ) or any(code in error_text for code in (
-                "413", "429", "rate limit", "resource exhausted", "503",
+                "408", "413", "429", "500", "rate limit", "resource exhausted", "503",
                 "unavailable", "temporarily", "deadline", "timeout",
                 "overloaded", "service unavailable", "502", "504",
             ))
