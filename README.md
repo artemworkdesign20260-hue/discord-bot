@@ -54,6 +54,7 @@ If a required integration is not configured, the corresponding publishing step c
 - `MAX_TASK_LENGTH` — maximum task/message size (default 12000).
 - `MAX_WEBSITE_FIX_ATTEMPTS` — website QA/fix attempts (default 4).
 - `POST_DELIVERY_TIMEOUT` — follow-up window in seconds (default 86400).
+- `ORDER_STALE_AFTER_SECONDS` — heartbeat age before an unfinished order is marked interrupted (default 600).
 - `MAX_ACTIVE_ORDERS_PER_USER` — maximum simultaneous tasks (default 3).
 - `PORT` — health server port (default 10000).
 
