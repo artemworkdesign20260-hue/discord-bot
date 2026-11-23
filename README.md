@@ -32,7 +32,8 @@ Do not post tokens or API keys in Discord, GitHub, or this README. Set them only
 | `VERCEL_TOKEN` | Deploy generated websites |
 | `GITHUB_TOKEN` | Write generated project files to GitHub |
 | `GITHUB_REPO` | Target repository in `owner/repository` format |
-| `GITHUB_BRANCH` | Target branch; defaults to `main` |
+| `GITHUB_BRANCH` | Base branch used to create the generated-projects branch; defaults to `main` |
+| `GROX_PROJECTS_BRANCH` | Branch where generated projects are committed and deployed; defaults to `generated-projects` so publishing a project does not redeploy Grox itself |
 | `RENDER_API_KEY` | Create Render services for generated bots |
 | `RENDER_OWNER_ID` | Optional explicit Render workspace/owner ID when the API returns multiple owners |
 | `GROX_BUILDER_DISCORD_TOKEN` | Discord token injected into a generated Discord bot service |
