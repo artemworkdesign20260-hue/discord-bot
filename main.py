@@ -33,6 +33,7 @@ VERCEL_TOKEN = os.getenv("VERCEL_TOKEN")
 # Optional GitHub/Render integration for generated software bots.
 # These are intentionally optional so Grox can still run for website-only work.
 RENDER_API_KEY = os.getenv("RENDER_API_KEY")
+RENDER_OWNER_ID = os.getenv("RENDER_OWNER_ID", "").strip()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
@@ -3711,6 +3712,41 @@ async def github_upsert_file(
 # RENDER DEPLOY
 # ============================================================
 
+def select_render_owner_id(owners, configured_owner_id: str = "") -> str:
+    """Select a Render owner explicitly; never silently choose the first account."""
+    valid_owners = []
+    for record in owners if isinstance(owners, list) else []:
+        if not isinstance(record, dict):
+            continue
+        nested = record.get("owner")
+        candidate = (
+            nested.get("id")
+            if isinstance(nested, dict)
+            else record.get("id")
+        )
+        if candidate is not None:
+            valid_owners.append(str(candidate))
+
+    if configured_owner_id:
+        if configured_owner_id in valid_owners:
+            return configured_owner_id
+        raise RuntimeError(
+            "RENDER_OWNER_ID не знайдено серед доступних Render owners. "
+            "Перевір значення змінної середовища."
+        )
+
+    unique_owners = list(dict.fromkeys(valid_owners))
+    if len(unique_owners) == 1:
+        return unique_owners[0]
+    if not unique_owners:
+        raise RuntimeError("Render API не повернув жодного коректного owner ID.")
+    raise RuntimeError(
+        "Render API повернув кілька доступних owners. "
+        "Щоб уникнути створення сервісу не в тому workspace, "
+        "налаштуй RENDER_OWNER_ID у Environment Variables Grox."
+    )
+
+
 async def deploy_project_to_render(
     service_name: str,
     root_dir: str,
@@ -3771,22 +3807,7 @@ async def deploy_project_to_render(
         else:
             owners = []
 
-        if not owners or not isinstance(owners[0], dict):
-            raise RuntimeError(
-                "Render API не повернув коректний список owner; відповідь API приховано."
-            )
-
-        first_owner = owners[0]
-        nested_owner = first_owner.get("owner")
-        if isinstance(nested_owner, dict):
-            owner_id = nested_owner.get("id") or first_owner.get("id")
-        else:
-            owner_id = first_owner.get("id")
-
-        if not owner_id:
-            raise RuntimeError(
-                "Не вдалося визначити ownerId Render."
-            )
+        owner_id = select_render_owner_id(owners, RENDER_OWNER_ID)
 
         repo_url = (
             f"https://github.com/{repo}.git"
