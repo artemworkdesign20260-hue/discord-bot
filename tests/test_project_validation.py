@@ -13,7 +13,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, is_order_message, is_revision_request, is_website_project, missing_required_integration_settings, select_render_owner_id, validate_generated_project
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, is_order_message, is_revision_request, is_website_project, missing_required_integration_settings, select_render_owner_id, validate_generated_project, vercel_project_name
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -282,6 +282,12 @@ class IntegrationPreflightTests(unittest.TestCase):
             missing,
             ["автоматичне розгортання зараз підтримує лише Discord-ботів"],
         )
+
+
+class VercelProjectNamingTests(unittest.TestCase):
+    def test_project_name_is_stable_for_an_order(self):
+        self.assertEqual(vercel_project_name(1001), "grox-order-1001")
+        self.assertEqual(vercel_project_name("1001"), "grox-order-1001")
 
 
 if __name__ == "__main__":
