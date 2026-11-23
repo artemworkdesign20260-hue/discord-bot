@@ -12,7 +12,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import detect_bot_platform, is_revision_request, is_website_project, select_render_owner_id, validate_generated_project
+from main import contains_credential_request, detect_bot_platform, is_revision_request, is_website_project, select_render_owner_id, validate_generated_project
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -143,6 +143,17 @@ class RevisionIntentTests(unittest.TestCase):
 
     def test_add_section_is_a_revision(self):
         self.assertTrue(is_revision_request("Додай секцію контактів."))
+
+
+class CredentialRequestDetectionTests(unittest.TestCase):
+    def test_key_features_are_not_a_credential_request(self):
+        self.assertFalse(contains_credential_request("Опиши ключові функції застосунку."))
+
+    def test_api_key_is_a_credential_request(self):
+        self.assertTrue(contains_credential_request("Надішліть API key для інтеграції."))
+
+    def test_private_key_is_a_credential_request(self):
+        self.assertTrue(contains_credential_request("Потрібен приватний ключ доступу."))
 
 
 if __name__ == "__main__":
