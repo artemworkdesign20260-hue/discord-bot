@@ -2994,6 +2994,44 @@ def is_website_project(task: str) -> bool:
     return bot_position is None or website_position < bot_position
 
 
+def missing_required_integration_settings(task: str) -> list[str]:
+    """Return missing owner-side settings before Grox starts a long questionnaire."""
+    missing = []
+
+    if is_website_project(task):
+        if not VERCEL_TOKEN:
+            missing.append("VERCEL_TOKEN")
+        return missing
+
+    if is_software_bot_project(task):
+        if not GITHUB_TOKEN:
+            missing.append("GITHUB_TOKEN")
+        if not GITHUB_REPO:
+            missing.append("GITHUB_REPO")
+        else:
+            try:
+                validate_github_repo(GITHUB_REPO)
+            except Exception:
+                missing.append("GITHUB_REPO (перевір формат owner/repository)")
+
+        if not RENDER_API_KEY:
+            missing.append("RENDER_API_KEY")
+
+        platform = detect_bot_platform(task)
+        if platform != "Discord":
+            missing.append(
+                "автоматичне розгортання зараз підтримує лише Discord-ботів"
+            )
+        elif not GENERATED_DISCORD_TOKEN:
+            missing.append("GROX_BUILDER_DISCORD_TOKEN")
+        elif GENERATED_DISCORD_TOKEN == DISCORD_TOKEN:
+            missing.append(
+                "окремий токен Discord-бота (не токен самого Grox)"
+            )
+
+    return missing
+
+
 def detect_bot_platform(task: str) -> str:
     # Bot 2 is explicitly Discord-only, even if the description mentions
     # other platforms while explaining what must NOT be supported.
@@ -4812,6 +4850,18 @@ async def process_order(
             await save_order(order)
             return
 
+        missing_settings = missing_required_integration_settings(first_task)
+        if missing_settings:
+            await thread.send(
+                "⚙️ **Не можу почати уточнення вимог: не налаштовані інтеграції.**\n\n"
+                "В Render → Environment перевір такі змінні:\n"
+                + "\n".join(f"• {item}" for item in missing_settings)
+                + "\n\nНе надсилай токени або ключі в Discord."
+            )
+            order.status = "ERROR"
+            await save_order(order)
+            return
+
         # ====================================================
         # CONVERSATIONAL REQUIREMENT DISCOVERY
         # ====================================================
@@ -4833,6 +4883,18 @@ async def process_order(
                 f"Максимум — {MAX_TASK_LENGTH} символів. Я не буду мовчки "
                 "обрізати вимоги, щоб не втратити важливу частину завдання. "
                 "Скоротіть ТЗ і створіть нове замовлення."
+            )
+            order.status = "ERROR"
+            await save_order(order)
+            return
+
+        missing_settings = missing_required_integration_settings(final_task)
+        if missing_settings:
+            await thread.send(
+                "⚙️ **Не можу почати розробку: не налаштовані інтеграції.**\n\n"
+                "В Render → Environment перевір такі змінні:\n"
+                + "\n".join(f"• {item}" for item in missing_settings)
+                + "\n\nНе надсилай токени або ключі в Discord."
             )
             order.status = "ERROR"
             await save_order(order)
