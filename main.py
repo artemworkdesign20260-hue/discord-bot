@@ -477,6 +477,26 @@ async def reserve_builder_token(
             return True, None
 
 
+async def release_builder_token_reservation(
+    token_fingerprint: str,
+    order_id: int,
+):
+    """Release only an unused reservation before any Render service exists."""
+    if db_pool is None:
+        return
+    await db_pool.execute(
+        """
+        DELETE FROM grox_builder_token_usage
+        WHERE token_fingerprint = $1
+          AND order_id = $2
+          AND service_id IS NULL
+          AND status = 'RESERVED'
+        """,
+        token_fingerprint,
+        order_id,
+    )
+
+
 async def update_builder_token_service(
     token_fingerprint: str,
     order_id: int,
@@ -4515,14 +4535,42 @@ async def build_and_deploy_software_bot(
     root_dir = f"generated_projects/order_{order.order_id}_{suffix}"
     service_name = f"grox-order-{order.order_id}-{suffix}"
 
+    token_fingerprint = hashlib.sha256(
+        GENERATED_DISCORD_TOKEN.encode("utf-8")
+    ).hexdigest()
+    reserved, existing_usage = await reserve_builder_token(
+        token_fingerprint,
+        order.order_id,
+        service_name,
+    )
+    if not reserved:
+        existing_name = (existing_usage or {}).get("service_name") or "невідомий сервіс"
+        existing_id = (existing_usage or {}).get("service_id")
+        await thread.send(
+            "🔒 **Цей Discord-токен уже закріплений за іншим Render-сервісом.**\n\n"
+            f"Сервіс: {existing_name}"
+            + (f" (ID: {existing_id})" if existing_id else "")
+            + "\n\nОдин токен не можна використовувати для двох ботів. "
+            "Створи окремий Discord application/bot і додай його токен у "
+            "GROX_BUILDER_DISCORD_TOKEN. Не надсилай токен у чат."
+        )
+        return False
+
     await thread.send(
         "📦 **Публікую перевірені файли в GitHub одним атомарним комітом...**"
     )
-    await github_publish_project(
-        root_dir,
-        files,
-        f"Grox: generate order #{order.order_id}",
-    )
+    try:
+        await github_publish_project(
+            root_dir,
+            files,
+            f"Grox: generate order #{order.order_id}",
+        )
+    except Exception:
+        await release_builder_token_reservation(
+            token_fingerprint,
+            order.order_id,
+        )
+        raise
 
     order.project_repo_path = root_dir
     await save_order(order)
@@ -4550,32 +4598,8 @@ async def build_and_deploy_software_bot(
         if BOT2_DATABASE_URL:
             render_env["DATABASE_URL"] = BOT2_DATABASE_URL
 
-    token_fingerprint = None
-    if generated_platform == "Discord":
-        token_fingerprint = hashlib.sha256(
-            GENERATED_DISCORD_TOKEN.encode("utf-8")
-        ).hexdigest()
-        reserved, existing_usage = await reserve_builder_token(
-            token_fingerprint,
-            order.order_id,
-            service_name,
-        )
-        if not reserved:
-            existing_name = (existing_usage or {}).get("service_name") or "невідомий сервіс"
-            existing_id = (existing_usage or {}).get("service_id")
-            await thread.send(
-                "🔒 **Цей Discord-токен уже закріплений за іншим Render-сервісом.**\n\n"
-                f"Сервіс: {existing_name}"
-                + (f" (ID: {existing_id})" if existing_id else "")
-                + "\n\nОдин токен не можна використовувати для двох ботів. "
-                "Створи окремий Discord application/bot і додай його токен у "
-                "GROX_BUILDER_DISCORD_TOKEN. Не надсилай токен у чат."
-            )
-            return False
-
     async def record_created_service(service_id: str, actual_name: str):
-        if token_fingerprint is not None:
-            await update_builder_token_service(
+        await update_builder_token_service(
                 token_fingerprint,
                 order.order_id,
                 service_id,
@@ -4588,15 +4612,14 @@ async def build_and_deploy_software_bot(
         root_dir,
         extra_env=render_env,
         is_bot2_service=bot2,
-        on_service_created=record_created_service if token_fingerprint else None,
+        on_service_created=record_created_service,
     )
 
     order.render_service_id = render_info.get("id")
     order.deployment_url = render_info.get("url")
     await save_order(order)
 
-    if token_fingerprint is not None:
-        await update_builder_token_service(
+    await update_builder_token_service(
             token_fingerprint,
             order.order_id,
             str(render_info.get("id")),
