@@ -2529,104 +2529,191 @@ from DISCORD_TOKEN, and never print or commit secrets.
 """
 
 
-# Constructs that a generated customer bot has no legitimate need for.
-# Best-effort static screening: it cannot make LLM-written code "safe",
-# it only blocks the most obvious dangerous patterns before publishing.
-DANGEROUS_CODE_PATTERNS = (
-    (r"\bos\s*\.\s*system\s*\(", "os.system()"),
-    (r"\bsubprocess\b", "subprocess"),
-    (r"(?<![\w.])(?:eval|exec)\s*\(", "eval()/exec()"),
-    (r"__import__\s*\(", "__import__()"),
-    (r"\bpickle\s*\.\s*loads?\s*\(", "pickle.load()"),
-    (
-        r"GITHUB_TOKEN|RENDER_API_KEY|VERCEL_TOKEN",
-        "доступ до секретів Grox",
-    ),
-)
-
-
 def validate_generated_project(
     files: dict[str, str],
     bot2: bool = False,
     require_discord: bool = False,
 ) -> list[str]:
-    """Perform deterministic checks before any generated files are published."""
+    """Validate every generated Python file before any file is published."""
     errors: list[str] = []
+    reported: set[str] = set()
+
+    def add_error(message: str):
+        if message not in reported:
+            reported.add(message)
+            errors.append(message)
 
     for required in ("main.py", "requirements.txt", "README.md"):
-        if not files.get(required, "").strip():
-            errors.append(f"Відсутній або порожній файл {required}.")
+        if not isinstance(files.get(required), str) or not files[required].strip():
+            add_error(f"Відсутній або порожній файл {required}.")
 
     main_code = files.get("main.py", "")
-    if main_code:
+    python_sources = {
+        name: content
+        for name, content in files.items()
+        if isinstance(name, str)
+        and name.lower().endswith(".py")
+        and isinstance(content, str)
+    }
+
+    forbidden_secrets = {
+        "GITHUB_TOKEN",
+        "RENDER_API_KEY",
+        "VERCEL_TOKEN",
+        "GROX_DATABASE_URL",
+        "DATABASE_URL",
+    }
+    dangerous_os_calls = {
+        "system", "popen",
+        "spawnl", "spawnle", "spawnlp", "spawnlpe",
+        "spawnv", "spawnve", "spawnvp", "spawnvpe",
+        "execl", "execle", "execlp", "execlpe",
+        "execv", "execve", "execvp", "execvpe",
+    }
+
+    for filename, source in python_sources.items():
         try:
-            tree = ast.parse(main_code, filename="generated_main.py")
+            tree = ast.parse(source, filename=filename)
         except SyntaxError as error:
-            errors.append(
-                f"Синтаксична помилка main.py: рядок {error.lineno}: {error.msg}."
+            add_error(
+                f"Синтаксична помилка {filename}: рядок {error.lineno}: {error.msg}."
             )
-            tree = None
+            continue
 
-        # Inspect executable syntax rather than comments or string literals.
-        if tree is not None:
-            forbidden_secrets = {
-                "GITHUB_TOKEN", "RENDER_API_KEY",
-                "VERCEL_TOKEN", "GROX_DATABASE_URL",
-            }
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    modules = {alias.name.split(".", 1)[0] for alias in node.names}
-                    if "subprocess" in modules:
-                        errors.append("У main.py заборонено імпорт subprocess.")
-                    if "pickle" in modules:
-                        errors.append("У main.py заборонено імпорт pickle.")
-                elif isinstance(node, ast.ImportFrom):
-                    module = (node.module or "").split(".", 1)[0]
-                    if module == "subprocess":
-                        errors.append("У main.py заборонено імпорт subprocess.")
-                    if module == "pickle":
-                        errors.append("У main.py заборонено імпорт pickle.")
+        # Resolve import aliases before inspecting calls. This catches aliased
+        # os modules and functions imported directly from os or builtins.
+        os_modules = {"os"}
+        pickle_modules = {"pickle"}
+        builtins_modules = {"builtins"}
+        subprocess_modules = {"subprocess"}
+        dangerous_function_aliases: set[str] = set()
+        getenv_aliases: set[str] = set()
+        environ_aliases: set[str] = set()
 
-                if isinstance(node, ast.Call):
-                    function = node.func
-                    if isinstance(function, ast.Name) and function.id in {"eval", "exec", "__import__"}:
-                        errors.append(f"У main.py заборонено виклик {function.id}().")
-                    if (
-                        isinstance(function, ast.Attribute)
-                        and isinstance(function.value, ast.Name)
-                        and function.value.id == "os"
-                        and function.attr == "system"
-                    ):
-                        errors.append("У main.py заборонено виклик os.system().")
-                    if (
-                        isinstance(function, ast.Attribute)
-                        and isinstance(function.value, ast.Name)
-                        and function.value.id == "subprocess"
-                    ):
-                        errors.append("У main.py заборонено виклики subprocess.")
-                    if (
-                        isinstance(function, ast.Attribute)
-                        and isinstance(function.value, ast.Name)
-                        and function.value.id == "pickle"
-                        and function.attr in {"load", "loads"}
-                    ):
-                        errors.append("У main.py заборонено десеріалізацію через pickle.")
-                    if (
-                        isinstance(function, ast.Attribute)
-                        and isinstance(function.value, ast.Name)
-                        and function.value.id == "os"
-                        and function.attr == "getenv"
-                        and node.args
-                        and isinstance(node.args[0], ast.Constant)
-                        and node.args[0].value in forbidden_secrets
-                    ):
-                        errors.append(
-                            f"У main.py заборонено читати захищену змінну {node.args[0].value}."
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".", 1)[0]
+                    bound_name = alias.asname or root
+                    if root == "os":
+                        os_modules.add(bound_name)
+                    elif root == "pickle":
+                        pickle_modules.add(bound_name)
+                        add_error(f"У {filename} заборонено імпорт pickle.")
+                    elif root == "subprocess":
+                        subprocess_modules.add(bound_name)
+                        add_error(f"У {filename} заборонено імпорт subprocess.")
+                    elif root == "builtins":
+                        builtins_modules.add(bound_name)
+
+            elif isinstance(node, ast.ImportFrom):
+                module = (node.module or "").split(".", 1)[0]
+                if module == "subprocess":
+                    add_error(f"У {filename} заборонено імпорт subprocess.")
+                elif module == "pickle":
+                    add_error(f"У {filename} заборонено імпорт pickle.")
+                elif module == "os":
+                    for alias in node.names:
+                        bound_name = alias.asname or alias.name
+                        if alias.name in dangerous_os_calls:
+                            dangerous_function_aliases.add(bound_name)
+                        elif alias.name == "getenv":
+                            getenv_aliases.add(bound_name)
+                        elif alias.name == "environ":
+                            environ_aliases.add(bound_name)
+                elif module == "builtins":
+                    for alias in node.names:
+                        if alias.name in {"eval", "exec", "__import__"}:
+                            dangerous_function_aliases.add(alias.asname or alias.name)
+
+        def is_secret_argument(call_node: ast.Call) -> bool:
+            return bool(
+                call_node.args
+                and isinstance(call_node.args[0], ast.Constant)
+                and isinstance(call_node.args[0].value, str)
+                and call_node.args[0].value in forbidden_secrets
+            )
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                function = node.func
+
+                if isinstance(function, ast.Name):
+                    if function.id in {"eval", "exec", "__import__"}:
+                        add_error(f"У {filename} заборонено виклик {function.id}().")
+                    elif function.id in dangerous_function_aliases:
+                        add_error(
+                            f"У {filename} заборонено виклик небезпечної функції "
+                            f"{function.id}()."
+                        )
+                    if function.id in getenv_aliases and is_secret_argument(node):
+                        add_error(
+                            f"У {filename} заборонено читати захищену змінну "
+                            f"{node.args[0].value}."
                         )
 
-    # Require the Discord runtime dependency only for projects routed to
-    # Discord. Telegram and other software projects must not be rejected for
-    # correctly omitting a Discord library.
+                elif isinstance(function, ast.Attribute):
+                    owner = function.value
+                    if isinstance(owner, ast.Name):
+                        if owner.id in os_modules and function.attr in dangerous_os_calls:
+                            add_error(
+                                f"У {filename} заборонено виклик os.{function.attr}()."
+                            )
+                        if owner.id in os_modules and function.attr == "getenv" and is_secret_argument(node):
+                            add_error(
+                                f"У {filename} заборонено читати захищену змінну "
+                                f"{node.args[0].value}."
+                            )
+                        if owner.id in pickle_modules and function.attr in {"load", "loads"}:
+                            add_error(
+                                f"У {filename} заборонено десеріалізацію через pickle."
+                            )
+                        if owner.id in builtins_modules and function.attr in {"eval", "exec", "__import__"}:
+                            add_error(
+                                f"У {filename} заборонено виклик builtins.{function.attr}()."
+                            )
+                        if owner.id in subprocess_modules:
+                            add_error(
+                                f"У {filename} заборонено виклики subprocess."
+                            )
+
+                    elif isinstance(owner, ast.Attribute):
+                        if (
+                            isinstance(owner.value, ast.Name)
+                            and owner.value.id in os_modules
+                            and owner.attr == "environ"
+                            and function.attr in {"get", "__getitem__"}
+                            and is_secret_argument(node)
+                        ):
+                            add_error(
+                                f"У {filename} заборонено читати захищену змінну "
+                                f"{node.args[0].value}."
+                            )
+                    elif isinstance(owner, ast.Name):
+                        if owner.id in environ_aliases and function.attr in {"get", "__getitem__"} and is_secret_argument(node):
+                            add_error(
+                                f"У {filename} заборонено читати захищену змінну "
+                                f"{node.args[0].value}."
+                            )
+
+            elif isinstance(node, ast.Subscript):
+                owner = node.value
+                key = node.slice
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    if key.value in forbidden_secrets:
+                        if (
+                            isinstance(owner, ast.Attribute)
+                            and isinstance(owner.value, ast.Name)
+                            and owner.value.id in os_modules
+                            and owner.attr == "environ"
+                        ) or (
+                            isinstance(owner, ast.Name)
+                            and owner.id in environ_aliases
+                        ):
+                            add_error(
+                                f"У {filename} заборонено читати захищену змінну {key.value}."
+                            )
+
     if require_discord:
         requirements = files.get("requirements.txt", "")
         requirement_lines = [
@@ -2643,7 +2730,7 @@ def validate_generated_project(
             for line in requirement_lines
         )
         if not has_discord_dependency:
-            errors.append(
+            add_error(
                 "У requirements.txt не вказана залежність discord.py або py-cord."
             )
 
@@ -2664,11 +2751,11 @@ def validate_generated_project(
     ]
     for pattern, label in checks:
         if not re.search(pattern, main_code, re.IGNORECASE):
-            errors.append(f"У main.py не знайдено реалізацію: {label}.")
+            add_error(f"У main.py не знайдено реалізацію: {label}.")
 
     readme = files.get("README.md", "").casefold()
     if "discord" not in readme or not re.search(r"environment|змін", readme):
-        errors.append("README.md не містить достатніх інструкцій Discord та Environment Variables.")
+        add_error("README.md не містить достатніх інструкцій Discord та Environment Variables.")
 
     return errors
 
