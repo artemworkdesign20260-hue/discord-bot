@@ -2206,8 +2206,10 @@ async def test_website(url: str):
             else:
                 visible_text = (await page.locator("body").inner_text()).strip()
                 meaningful_elements = await page.locator(
-                    "h1, h2, h3, p, a, button, input, textarea, select, img, "
-                    "video, canvas, form, main, article, section"
+                    "h1:visible, h2:visible, h3:visible, p:visible, a:visible, "
+                    "button:visible, input:visible, textarea:visible, select:visible, "
+                    "img:visible, video:visible, canvas:visible, form:visible, "
+                    "main:visible, article:visible, section:visible"
                 ).count()
                 if not visible_text and meaningful_elements == 0:
                     errors.append(
