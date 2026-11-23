@@ -282,6 +282,7 @@ class Order:
 
     # Generated software-bot deployment information.
     project_repo_path: str | None = None
+    project_branch: str | None = None
     deployment_url: str | None = None
     render_service_id: str | None = None
 
@@ -4127,13 +4128,14 @@ async def github_publish_project(
     root_dir: str,
     files: dict[str, str],
     commit_message: str,
+    branch: str | None = None,
 ):
     """Publish every project file through one atomic Git commit."""
     if not GITHUB_TOKEN or not GITHUB_REPO:
         raise RuntimeError("GITHUB_TOKEN або GITHUB_REPO не налаштований.")
 
     repo = validate_github_repo(GITHUB_REPO)
-    branch = GROX_PROJECTS_BRANCH or "generated-projects"
+    branch = (branch or f"{GROX_PROJECTS_BRANCH}/{root_dir.split('/')[-1]}").strip("/")
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
@@ -4399,6 +4401,7 @@ async def deploy_project_to_render(
     extra_env: dict[str, str] | None = None,
     is_bot2_service: bool = False,
     on_service_created=None,
+    project_branch: str | None = None,
 ):
     if not RENDER_API_KEY:
         raise RuntimeError(
@@ -4488,7 +4491,7 @@ async def deploy_project_to_render(
             "name": service_name,
             "ownerId": owner_id,
             "repo": repo_url,
-            "branch": GROX_PROJECTS_BRANCH or "generated-projects",
+            "branch": (project_branch or f"{GROX_PROJECTS_BRANCH}/{root_dir.split('/')[-1]}").strip("/"),
             "rootDir": root_dir,
             "envVars": env_vars,
             "serviceDetails": {
@@ -4639,6 +4642,7 @@ async def build_and_deploy_software_bot(
     suffix = uuid.uuid4().hex[:6]
     root_dir = f"generated_projects/order_{order.order_id}_{suffix}"
     service_name = f"grox-order-{order.order_id}-{suffix}"
+    project_branch = f"{GROX_PROJECTS_BRANCH}/{root_dir.split('/')[-1]}"
 
     token_fingerprint = hashlib.sha256(
         GENERATED_DISCORD_TOKEN.encode("utf-8")
@@ -4669,6 +4673,7 @@ async def build_and_deploy_software_bot(
             root_dir,
             files,
             f"Grox: generate order #{order.order_id}",
+            branch=project_branch,
         )
     except Exception:
         await release_builder_token_reservation(
@@ -4678,6 +4683,7 @@ async def build_and_deploy_software_bot(
         raise
 
     order.project_repo_path = root_dir
+    order.project_branch = project_branch
     await save_order(order)
     await thread.send("☁️ **Створюю окремий Render-сервіс...**")
 
@@ -4718,6 +4724,7 @@ async def build_and_deploy_software_bot(
         extra_env=render_env,
         is_bot2_service=bot2,
         on_service_created=record_created_service,
+        project_branch=project_branch,
     )
 
     order.render_service_id = render_info.get("id")
