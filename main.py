@@ -1096,6 +1096,51 @@ async def update_groq_token_reservation(reservation_id: int, usage):
         print(f"[GROQ TPM] Could not reconcile usage: {type(error).__name__}.")
 
 
+def parse_retry_after_seconds(value) -> float | None:
+    """Parse numeric seconds and compound provider delays such as 1m20s."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        numeric = float(raw)
+        return max(0.0, numeric)
+    except (TypeError, ValueError):
+        pass
+
+    unit_seconds = {
+        "ms": 0.001,
+        "millisecond": 0.001,
+        "milliseconds": 0.001,
+        "s": 1.0,
+        "sec": 1.0,
+        "secs": 1.0,
+        "second": 1.0,
+        "seconds": 1.0,
+        "m": 60.0,
+        "min": 60.0,
+        "mins": 60.0,
+        "minute": 60.0,
+        "minutes": 60.0,
+        "h": 3600.0,
+        "hr": 3600.0,
+        "hour": 3600.0,
+        "hours": 3600.0,
+    }
+    matches = re.findall(
+        r"(\d+(?:\.\d+)?)\s*(milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b",
+        raw,
+        re.IGNORECASE,
+    )
+    if not matches:
+        return None
+    return sum(
+        float(amount) * unit_seconds[unit.casefold()]
+        for amount, unit in matches
+    )
+
+
 async def _groq_request_unlocked(
     prompt: str,
     max_output_tokens: int,
@@ -1155,10 +1200,9 @@ async def _groq_request_unlocked(
                     if response.status >= 400:
                         retry_after_header = response.headers.get("Retry-After") or response.headers.get("retry-after")
                         if retry_after_header:
-                            try:
-                                retry_after_seconds = max(0.0, float(retry_after_header))
-                            except (TypeError, ValueError):
-                                retry_after_seconds = None
+                            retry_after_seconds = parse_retry_after_seconds(
+                                retry_after_header
+                            )
                         api_error = data.get("error") if isinstance(data, dict) else None
                         if isinstance(api_error, dict):
                             error_message = api_error.get("message") or response_text
@@ -1272,16 +1316,11 @@ async def _groq_request_unlocked(
             if attempt >= total_attempts:
                 break
             delay = min(60, (2 ** (attempt - 1)) + random.uniform(0.5, 2.0))
-            retry_after_match = re.search(
-                r"(?:try again in|retry[- ]after)\s*([0-9]+(?:\.[0-9]+)?)\s*(?:s|sec(?:ond)?s?)?",
-                str(error),
-                re.IGNORECASE,
-            )
-            if retry_after_match:
-                provider_delay = float(retry_after_match.group(1))
+            provider_delay = retry_after_seconds
+            if provider_delay is None:
+                provider_delay = parse_retry_after_seconds(str(error))
+            if provider_delay is not None:
                 delay = max(delay, provider_delay + random.uniform(0.25, 0.75))
-            if retry_after_seconds is not None:
-                delay = max(delay, retry_after_seconds + random.uniform(0.25, 0.75))
             delay = min(120, delay)
             print(f"[GROQ] Тимчасова помилка. Повтор через {delay:.1f}s...")
             await asyncio.sleep(delay)
