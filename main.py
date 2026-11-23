@@ -1222,6 +1222,87 @@ async def groq_request(
         )
 
 
+async def continue_truncated_groq_output(
+    partial_output: str,
+    context: str,
+    output_contract: str,
+    max_rounds: int = 3,
+):
+    """Continue a truncated response using a bounded tail context, never a full replay."""
+    result = partial_output or ""
+    if len(context) > 6000:
+        context = context[:3000] + "\n...[середину контексту скорочено]...\n" + context[-3000:]
+
+    still_truncated = True
+    for round_number in range(1, max_rounds + 1):
+        tail = result[-6000:]
+        continuation_prompt = f"""
+Ти продовжуєш відповідь, яку Groq обрізав за лімітом токенів.
+
+КОНТЕКСТ ЗАВДАННЯ:
+{context}
+
+ФОРМАТ РЕЗУЛЬТАТУ:
+{output_contract}
+
+ОСТАННІЙ ФРАГМЕНТ, ЯКИЙ ВЖЕ БУЛО ВИДАНО (ЛИШЕ ДЛЯ КОНТЕКСТУ):
+<<<ALREADY_OUTPUT>>>
+{tail}
+<<<END_ALREADY_OUTPUT>>>
+
+ПРОДОВЖУЙ:
+- Продовжуй точно з наступного символу після наведеного фрагмента.
+- Не повторюй жодного рядка з уже виданого фрагмента.
+- Не починай файл або відповідь спочатку.
+- Якщо обірвався рядок чи вираз, продовж його без повторення попередньої частини.
+- Заверши поточний файл/документ і поверни всі решту обов'язкових частин.
+- Поверни лише продовження результату, без пояснень.
+"""
+
+        try:
+            continuation = await groq_request(
+                continuation_prompt,
+                max_output_tokens=5000,
+                return_metadata=True,
+            )
+        except Exception as error:
+            print(
+                f"[GROQ CONTINUATION] round={round_number}/{max_rounds} "
+                f"failed={type(error).__name__}."
+            )
+            break
+
+        addition = continuation.get("content", "")
+        if not isinstance(addition, str) or not addition.strip():
+            print(
+                f"[GROQ CONTINUATION] round={round_number}/{max_rounds} "
+                "returned empty content."
+            )
+            break
+
+        # Remove an exact repeated suffix/prefix if the model repeats a small
+        # amount of context despite the instruction not to repeat it.
+        overlap_limit = min(3000, len(result), len(addition))
+        overlap = 0
+        for size in range(overlap_limit, 0, -1):
+            if result.endswith(addition[:size]):
+                overlap = size
+                break
+        result += addition[overlap:]
+
+        finish_reason = continuation.get("finish_reason")
+        print(
+            f"[GROQ CONTINUATION] round={round_number}/{max_rounds} "
+            f"added_chars={len(addition) - overlap} "
+            f"finish_reason={finish_reason}."
+        )
+        if finish_reason != "length":
+            still_truncated = False
+            break
+
+    return result, still_truncated
+
+
 # ============================================================
 # REQUIREMENT DISCOVERY / CLIENT CONVERSATION
 # ============================================================
