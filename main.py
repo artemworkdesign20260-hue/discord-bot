@@ -1226,6 +1226,20 @@ async def groq_request(
 # REQUIREMENT DISCOVERY / CLIENT CONVERSATION
 # ============================================================
 
+CREDENTIAL_REQUEST_PATTERN = re.compile(
+    r"(?i)\\b(?:github\\s*)?(?:personal\\s+access\\s+token|pat|token|"
+    r"api[\\s-]*key|access[\\s-]*key|private[\\s-]*key|secret[\\s-]*key|"
+    r"парол\\w*|токен\\w*|api[\\s-]*ключ\\w*|"
+    r"ключ(?:і)?\\s+(?:доступу|api|приватн\\w*|секретн\\w*|авторизац\\w*)|"
+    r"приватн\\w*\\s+ключ\\w*|секретн\\w*\\s+ключ\\w*|"
+    r"секрет\\w*|database\\s*url|\\.env)\\b"
+)
+
+
+def contains_credential_request(text: str) -> bool:
+    return bool(CREDENTIAL_REQUEST_PATTERN.search(text or ""))
+
+
 async def analyze_requirements(conversation: str):
     prompt = f"""
 Ти — Grox, AI-менеджер IT-проєктів.
@@ -1301,26 +1315,15 @@ FINAL_TZ: ...
     final_tz = final_match.group(1).strip() if final_match else ""
 
     # Never let the requirements model ask a client to disclose credentials.
-    # Integrations are configured by the owner in the server environment.
-    credential_request = re.search(
-        r"(?i)\b(?:github\s*)?(?:pat|token|api\s*key|access\s*key|"
-        r"парол\w*|токен\w*|ключ\w*|секрет\w*|"
-        r"database\s*url|\.env)\b",
-        question
-    )
+    # Match credential phrases specifically: the Ukrainian word "ключові"
+    # (key/important features) must not be mistaken for an API key.
+    credential_request = contains_credential_request(question)
     if credential_request:
-        if GITHUB_TOKEN:
-            # The credential is already configured server-side; it is not a
-            # client requirement. Continue using the provided task description.
-            ready = True
-            final_tz = final_tz or conversation
-        else:
-            # Do not expose a request for secrets to the client.
-            ready = False
-            question = (
-                "Внутрішня конфігурація інтеграції потребує перевірки "
-                "власником Grox. Будь ласка, продовжуйте описувати функції проєкту."
-            )
+        # Credentials are configured by the owner in server environment
+        # variables. Their absence is reported during the deployment phase.
+        ready = True
+        question = ""
+        final_tz = final_tz or conversation
 
     return {
         "ready": ready,
