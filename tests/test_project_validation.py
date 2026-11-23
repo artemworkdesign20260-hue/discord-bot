@@ -300,13 +300,13 @@ class AdditionalDangerousApiTests(unittest.TestCase):
 
     def test_detects_asyncio_subprocess_shell(self):
         errors = validate_generated_project(
-            self.make_files('import asyncio\\nasyncio.create_subprocess_shell("id")\\n')
+            self.make_files('import asyncio\nasyncio.create_subprocess_shell("id")\n')
         )
         self.assertTrue(any("asyncio" in error for error in errors))
 
     def test_detects_aliased_os_posix_spawn(self):
         errors = validate_generated_project(
-            self.make_files('from os import posix_spawn as launch\\nlaunch("sh", ["sh"])\\n')
+            self.make_files('from os import posix_spawn as launch\nlaunch("sh", ["sh"])\n')
         )
         self.assertTrue(any("posix_spawn" in error for error in errors))
 
