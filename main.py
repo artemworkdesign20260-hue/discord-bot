@@ -3347,9 +3347,9 @@ async def generate_software_project(client_task: str):
         result, generation_truncated = await continue_truncated_groq_output(
             result,
             context=(
-                "Клієнтське ТЗ:\\n" + client_task
-                + "\\nПлатформа:\\n" + platform
-                + "\\nСпеціальні вимоги:\\n" + special_requirements
+                "Клієнтське ТЗ:\n" + client_task
+                + "\nПлатформа:\n" + platform
+                + "\nСпеціальні вимоги:\n" + special_requirements
             ),
             output_contract=(
                 "Поверни рівно три повні файли з маркерами ===FILE: main.py===, "
