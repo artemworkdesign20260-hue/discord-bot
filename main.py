@@ -1978,6 +1978,13 @@ async def revise_and_test_website(
     html_code: str,
     client_task: str | None = None,
 ):
+    if order.site_code and html_code.strip() == order.site_code.strip():
+        await thread.send(
+            "⚠️ Groq не запропонував змін у HTML. Я не буду створювати новий "
+            "деплой без фактичної зміни коду. Уточніть потрібну правку."
+        )
+        return False
+
     for attempt in range(
         1,
         MAX_WEBSITE_FIX_ATTEMPTS + 1
@@ -2042,11 +2049,18 @@ async def revise_and_test_website(
             return False
 
         try:
+            previous_html = html_code
             html_code = await fix_site_code(
                 html_code,
                 qa_result["report"],
                 client_task or order.task
             )
+            if html_code.strip() == previous_html.strip():
+                await thread.send(
+                    "⚠️ QA не пройшов, а автоматичне виправлення не змінило HTML. "
+                    "Зупиняю повторні однакові деплої."
+                )
+                return False
         except Exception as error:
             print(
                 f"[REVISION FIX ERROR] "
@@ -2954,11 +2968,18 @@ async def generate_test_and_fix_website(
         # ----------------------------------------------------
 
         try:
+            previous_html = html_code
             html_code = await fix_site_code(
                 html_code,
                 qa_result["report"],
-order.task
+                order.task
             )
+            if html_code.strip() == previous_html.strip():
+                await thread.send(
+                    "⚠️ QA не пройшов, а автоматичне виправлення не змінило HTML. "
+                    "Зупиняю повторні однакові деплої."
+                )
+                return False
 
         except Exception as error:
             print(
