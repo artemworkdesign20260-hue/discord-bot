@@ -13,7 +13,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, is_revision_request, is_website_project, select_render_owner_id, validate_generated_project
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, is_order_message, is_revision_request, is_website_project, select_render_owner_id, validate_generated_project
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -230,6 +230,23 @@ class Bot2ValidationTests(unittest.TestCase):
             require_discord=True,
         )
         self.assertGreaterEqual(len(errors), 5)
+
+
+class NewOrderIntentTests(unittest.TestCase):
+    def test_casual_site_mention_does_not_open_order(self):
+        self.assertFalse(is_order_message("У мене є сайт і бот, вони працюють."))
+
+    def test_broken_existing_bot_does_not_open_new_order(self):
+        self.assertFalse(is_order_message("Мій bot is down."))
+
+    def test_explicit_create_website_opens_order(self):
+        self.assertTrue(is_order_message("Створи сайт для магазину."))
+
+    def test_need_discord_bot_opens_order(self):
+        self.assertTrue(is_order_message("Мені потрібен Discord bot."))
+
+    def test_build_web_app_opens_order(self):
+        self.assertTrue(is_order_message("Build a web app for my project."))
 
 
 if __name__ == "__main__":
