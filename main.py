@@ -556,6 +556,30 @@ async def heartbeat_order(order_id: int):
             )
 
 
+async def notify_interrupted_order(order: Order):
+    if not bot.is_ready() or not order.thread_id:
+        return
+    try:
+        channel = bot.get_channel(order.thread_id)
+        if channel is None:
+            channel = await bot.fetch_channel(order.thread_id)
+        if not isinstance(channel, discord.Thread):
+            return
+        if channel.archived:
+            await channel.edit(archived=False)
+        await channel.send(
+            "⚠️ **Попереднє виконання було перерване перезапуском Grox.**\n\n"
+            "Твоє технічне завдання та збережені файли залишилися в історії, "
+            "але автоматичне продовження перерваної генерації поки не підтримується. "
+            "Щоб продовжити роботу, надішли нове завдання."
+        )
+    except Exception as error:
+        print(
+            f"[ORDER RECOVERY] Could not notify order #{order.order_id}: "
+            f"{type(error).__name__}."
+        )
+
+
 async def recover_stale_orders():
     """Mark orders interrupted only after their live-process heartbeat expires."""
     while True:
@@ -584,6 +608,7 @@ async def recover_stale_orders():
                 order = orders.get(row["order_id"])
                 if order is not None:
                     order.status = "INTERRUPTED"
+                    await notify_interrupted_order(order)
             if rows:
                 print(
                     f"[ORDER RECOVERY] Marked {len(rows)} stale order(s) as interrupted."
