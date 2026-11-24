@@ -41,8 +41,8 @@ class GeneratedProjectFileParsingTests(unittest.TestCase):
 
     def test_rejects_duplicate_file_markers_instead_of_silently_overwriting(self):
         response = (
-            "===FILE: src/worker.py===\\nprint('first')\\n"
-            "===FILE: src/worker.py===\\nprint('second')\\n"
+            "===FILE: src/worker.py===\nprint('first')\n"
+            "===FILE: src/worker.py===\nprint('second')\n"
         )
         files, errors = extract_marked_project_files(response, return_errors=True)
         self.assertNotIn("src/worker.py", files)
@@ -51,8 +51,8 @@ class GeneratedProjectFileParsingTests(unittest.TestCase):
 
     def test_rejects_case_insensitive_duplicate_file_markers(self):
         response = (
-            "===FILE: src/Worker.py===\\nprint('first')\\n"
-            "===FILE: src/worker.py===\\nprint('second')\\n"
+            "===FILE: src/Worker.py===\nprint('first')\n"
+            "===FILE: src/worker.py===\nprint('second')\n"
         )
         files, errors = extract_marked_project_files(response, return_errors=True)
         self.assertEqual(files, {})
