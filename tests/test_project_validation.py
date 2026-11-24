@@ -13,7 +13,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_same_origin_url, is_website_project, website_navigation_failure, has_meaningful_page_content, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, vercel_project_name
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_same_origin_url, is_website_project, website_navigation_failure, has_meaningful_page_content, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, is_safe_project_file_path, vercel_project_name
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -34,6 +34,33 @@ class GeneratedProjectValidationTests(unittest.TestCase):
         self.files["helper.py"] = "def broken_function(:\n    pass\n"
         errors = validate_generated_project(self.files)
         self.assertTrue(any("helper.py" in error and "Синтаксична помилка" in error for error in errors))
+
+    def test_checks_syntax_of_nested_python_modules(self):
+        self.files["src/bot/worker.py"] = "def broken_function(:\\n    pass\\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("src/bot/worker.py" in error and "Синтаксична помилка" in error for error in errors))
+
+    def test_accepts_nested_project_paths(self):
+        for path in ("src/bot.py", "tests/test_bot.py", ".github/workflows/ci.yml", ".env.example"):
+            with self.subTest(path=path):
+                self.assertTrue(is_safe_project_file_path(path))
+
+    def test_rejects_unsafe_project_paths(self):
+        for path in ("../secrets.txt", "/etc/passwd", "src/../../escape.py", "src\\\\bot.py", "C:/temp/file.py", "src//bot.py"):
+            with self.subTest(path=path):
+                self.assertFalse(is_safe_project_file_path(path))
+
+    def test_rejects_case_insensitive_duplicate_paths(self):
+        self.files["src/Bot.py"] = "VALUE = 1\\n"
+        self.files["src/bot.py"] = "VALUE = 2\\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("Дубльований шлях" in error for error in errors))
+
+    def test_rejects_project_with_too_many_files(self):
+        files = dict(self.files)
+        files.update({f"modules/module_{index}.py": "VALUE = 1\\n" for index in range(98)})
+        errors = validate_generated_project(files)
+        self.assertTrue(any("понад 100 файлів" in error for error in errors))
 
     def test_detects_aliased_os_system_import(self):
         self.files["main.py"] = "from os import system as run_command\nrun_command('whoami')\n"
