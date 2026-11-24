@@ -268,8 +268,8 @@ class Bot2ValidationTests(unittest.TestCase):
 
     def test_rejects_unconditional_allow_all_moderator_function(self):
         self.files["main.py"] = self.files["main.py"].replace(
-            "def is_moderator(member):\\n    return member.guild_permissions.manage_messages",
-            "def is_moderator(member):\\n    return True",
+            "def is_moderator(member):\n    return member.guild_permissions.manage_messages",
+            "def is_moderator(member):\n    return True",
         )
         errors = validate_generated_project(
             self.files,
