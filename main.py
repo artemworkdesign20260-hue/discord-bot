@@ -3315,6 +3315,22 @@ from DISCORD_TOKEN, and never print or commit secrets.
 """
 
 
+def is_safe_project_file_path(filename: str) -> bool:
+    """Accept portable relative project paths; reject traversal and absolute paths."""
+    if not isinstance(filename, str) or not filename or len(filename) > 240:
+        return False
+    if "\\\\" in filename or filename.startswith("/"):
+        return False
+    if re.match(r"^[A-Za-z]:", filename):
+        return False
+    parts = filename.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return False
+    if any(not re.fullmatch(r"[A-Za-z0-9_.@+-]+", part) for part in parts):
+        return False
+    return True
+
+
 def validate_generated_project(
     files: dict[str, str],
     bot2: bool = False,
@@ -3323,6 +3339,30 @@ def validate_generated_project(
     """Validate every generated Python file before any file is published."""
     errors: list[str] = []
     reported: set[str] = set()
+
+    if not isinstance(files, dict):
+        return ["Список файлів проєкту має некоректний формат."]
+    if len(files) > 100:
+        add_message = "Проєкт містить понад 100 файлів; розбий його на менші модулі."
+        return [add_message]
+    total_bytes = 0
+    normalized_paths: set[str] = set()
+    for filename, content in files.items():
+        if not is_safe_project_file_path(filename):
+            errors.append(f"Некоректний або небезпечний шлях файлу: {str(filename)[:120]}.")
+            continue
+        normalized = filename.casefold()
+        if normalized in normalized_paths:
+            errors.append(f"Дубльований шлях файлу без урахування регістру: {filename}.")
+        normalized_paths.add(normalized)
+        if not isinstance(content, str):
+            errors.append(f"Вміст файлу {filename} має бути текстом.")
+            continue
+        total_bytes += len(content.encode("utf-8"))
+        if len(content.encode("utf-8")) > 1_000_000:
+            errors.append(f"Файл {filename} перевищує ліміт 1 МБ.")
+    if total_bytes > 5_000_000:
+        errors.append("Загальний розмір проєкту перевищує ліміт 5 МБ.")
 
     def add_error(message: str):
         if message not in reported:
@@ -3736,11 +3776,19 @@ async def generate_software_project(client_task: str):
 - main.py має запускати health server паралельно з основним ботом.
 - Якщо credentials відсутні, повідомляй про це зрозуміло й без витоку секретів.
 - Якщо це Bot 2, суворо дотримуйся Discord-only вимог вище; не додавай інші платформи.
+- Використовуй модульну структуру: за потреби створи окремі .py-модулі, папки, конфігурацію, шаблони, статичні файли та тести.
+- Усі імпорти між локальними модулями мають відповідати реальній структурі папок.
+- Не дублюй код у різних файлах. Не створюй файли, які не використовуються.
+- Максимум 100 файлів; кожен текстовий файл до 1 МБ, увесь проєкт до 5 МБ.
+- Завжди повертай main.py, requirements.txt і README.md, навіть якщо додаткові файли не потрібні.
 
-ПОВЕРНИ РІВНО ТРИ ФАЙЛИ В ТАКОМУ ФОРМАТІ:
+ПОВЕРНИ КОЖЕН ФАЙЛ ПОВНІСТЮ, КОЖЕН З ОКРЕМИМ МАРКЕРОМ:
 
 ===FILE: main.py===
 <повний код>
+
+===FILE: package/module.py===
+<повний код додаткового модуля; шлях від кореня проєкту>
 
 ===FILE: requirements.txt===
 <повний вміст>
@@ -3748,7 +3796,7 @@ async def generate_software_project(client_task: str):
 ===FILE: README.md===
 <повний вміст>
 
-Не використовуй Markdown fences навколо файлів.
+Для файлів у підпапках використовуй відносні шляхи з /, наприклад src/bot.py або tests/test_bot.py. Не використовуй абсолютні шляхи, .., зворотні слеші чи Markdown fences навколо файлів. Не додавай пояснень поза файлами.
 """
 
     generation_result = await groq_request(
@@ -3779,11 +3827,13 @@ async def generate_software_project(client_task: str):
         extracted: dict[str, str] = {}
         marker = re.compile(
             r"(?im)^\s*(?:```[^\n]*\n\s*)?===\s*FILE\s*:\s*"
-            r"(main\.py|requirements\.txt|README\.md)\s*===\s*$"
+            r"([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*)\s*===\s*$"
         )
         matches = list(marker.finditer(raw_response or ""))
         for index, match in enumerate(matches):
             filename = match.group(1)
+            if not is_safe_project_file_path(filename):
+                continue
             body_start = match.end()
             body_end = matches[index + 1].start() if index + 1 < len(matches) else len(raw_response)
             body = raw_response[body_start:body_end].strip()
@@ -3895,6 +3945,14 @@ async def generate_software_project(client_task: str):
         repair_targets = list(missing_files)
 
         error_text = "\n".join(validation_errors)
+        # Include every explicitly named file with a syntax/dependency error,
+        # including nested modules, so repairs do not silently ignore them.
+        for candidate in re.findall(
+            r"(?<![A-Za-z0-9_.@+-])([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*\.py)",
+            error_text,
+        ):
+            if is_safe_project_file_path(candidate) and candidate in files and candidate not in repair_targets:
+                repair_targets.append(candidate)
         if "main.py" in error_text and "main.py" not in repair_targets:
             repair_targets.insert(0, "main.py")
         if "requirements.txt" in error_text and "requirements.txt" not in repair_targets:
@@ -4417,11 +4475,7 @@ async def github_publish_project(
             tree_entries = []
             for filename, content in files.items():
                 if (
-                    not isinstance(filename, str)
-                    or not filename
-                    or filename in {".", ".."}
-                    or "/" in filename
-                    or "\\" in filename
+                    not is_safe_project_file_path(filename)
                     or not isinstance(content, str)
                 ):
                     raise ValueError("Некоректний шлях або вміст файлу проєкту.")
