@@ -2509,6 +2509,11 @@ async def deploy_to_vercel(
 # WEBSITE QA TEST
 # ============================================================
 
+def has_meaningful_page_content(visible_text: str, meaningful_element_count: int) -> bool:
+    """Reject empty semantic wrappers while allowing text, media, and usable controls."""
+    return bool((visible_text or "").strip()) or meaningful_element_count > 0
+
+
 def website_navigation_failure(error: Exception) -> dict:
     """Treat an unreachable preview as a QA infrastructure/deployment failure, not an HTML defect."""
     return {
@@ -2709,12 +2714,10 @@ async def test_website(url: str):
             else:
                 visible_text = (await page.locator("body").inner_text()).strip()
                 meaningful_elements = await page.locator(
-                    "h1:visible, h2:visible, h3:visible, p:visible, a:visible, "
-                    "button:visible, input:visible, textarea:visible, select:visible, "
-                    "img:visible, video:visible, canvas:visible, form:visible, "
-                    "main:visible, article:visible, section:visible"
+                    "input:visible, textarea:visible, select:visible, "
+                    "img:visible[src], video:visible[src], canvas:visible, iframe:visible"
                 ).count()
-                if not visible_text and meaningful_elements == 0:
+                if not has_meaningful_page_content(visible_text, meaningful_elements):
                     errors.append(
                         "Сторінка порожня: немає видимого тексту або змістовних елементів."
                     )
