@@ -330,6 +330,44 @@ class GroqContinuationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(still_truncated)
         self.assertTrue(result.startswith("start"))
 
+    async def test_preflights_and_shrinks_continuation_prompt_to_tpm_budget(self):
+        with (
+            patch("main.GROQ_TPM_LIMIT", 1000),
+            patch("main.GROQ_TPM_RESERVE", 100),
+            patch("main.GROQ_MIN_COMPLETION_TOKENS", 100),
+            patch("main.estimate_groq_prompt_tokens", side_effect=lambda prompt: len(prompt) // 2),
+            patch(
+                "main.groq_request",
+                new=AsyncMock(return_value={"content": "continued", "finish_reason": "stop"}),
+            ) as mocked,
+        ):
+            result, still_truncated = await continue_truncated_groq_output(
+                "x" * 10000, "context " * 10000, "return the rest"
+            )
+
+        self.assertFalse(still_truncated)
+        self.assertTrue(result.endswith("continued"))
+        self.assertEqual(mocked.await_count, 1)
+        prompt = mocked.await_args.args[0]
+        self.assertLessEqual(len(prompt) // 2, 800)
+        self.assertLessEqual(mocked.await_args.kwargs["max_output_tokens"], 5000)
+
+    async def test_skips_continuation_when_even_minimum_prompt_exceeds_budget(self):
+        with (
+            patch("main.GROQ_TPM_LIMIT", 200),
+            patch("main.GROQ_TPM_RESERVE", 100),
+            patch("main.GROQ_MIN_COMPLETION_TOKENS", 100),
+            patch("main.estimate_groq_prompt_tokens", return_value=999),
+            patch("main.groq_request", new=AsyncMock()) as mocked,
+        ):
+            result, still_truncated = await continue_truncated_groq_output(
+                "partial", "context", "contract"
+            )
+
+        self.assertEqual(result, "partial")
+        self.assertTrue(still_truncated)
+        mocked.assert_not_awaited()
+
 
 class Bot2ValidationTests(unittest.TestCase):
     def setUp(self):
