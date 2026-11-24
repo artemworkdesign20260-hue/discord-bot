@@ -3974,7 +3974,10 @@ async def generate_software_project(client_task: str):
         )
     # Run a bounded repair/validation cycle. Never publish files unless the
     # deterministic validator reports zero errors after a complete repair.
-    max_repair_rounds = 3
+    # Repair one file per Groq call so a large project does not send
+    # several complete source files in a single TPM-heavy prompt.
+    # Keep the process bounded even for projects with many modules.
+    max_repair_rounds = min(12, max(3, len(files) + 3))
     repair_round = 0
 
     while validation_errors and repair_round < max_repair_rounds:
@@ -4016,11 +4019,16 @@ async def generate_software_project(client_task: str):
                 generation_markers[-1].group(1)
                 if generation_markers else "main.py"
             )
-            if truncated_target not in repair_targets:
-                repair_targets.append(truncated_target)
+            if truncated_target in repair_targets:
+                repair_targets.remove(truncated_target)
+            repair_targets.insert(0, truncated_target)
 
         if not repair_targets:
             repair_targets = ["main.py"]
+
+        # Repair exactly one target per request. The validator runs again
+        # after each successful response and selects the next unresolved file.
+        repair_targets = repair_targets[:1]
 
         requested_files = "\n".join(
             f"===FILE: {name}===\n<повний виправлений вміст {name}>"
