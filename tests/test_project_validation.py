@@ -13,7 +13,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_same_origin_url, is_website_project, website_navigation_failure, has_meaningful_page_content, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, is_safe_project_file_path, extract_marked_project_files, vercel_project_name
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_same_origin_url, is_website_project, website_navigation_failure, has_meaningful_page_content, missing_required_integration_settings, parse_retry_after_seconds, reserve_groq_tokens, select_render_owner_id, validate_generated_project, is_safe_project_file_path, extract_marked_project_files, vercel_project_name
 
 
 class GeneratedProjectFileParsingTests(unittest.TestCase):
@@ -497,6 +497,137 @@ class AdditionalDangerousApiTests(unittest.TestCase):
             self.make_files('from os import posix_spawn as launch\nlaunch("sh", ["sh"])\n')
         )
         self.assertTrue(any("posix_spawn" in error for error in errors))
+
+
+class GroqTokenReservationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_waits_for_requested_completion_budget_instead_of_sending_tiny_reply(self):
+        class FakeTransaction:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class FakeConnection:
+            def __init__(self):
+                self.usage_values = iter([500, 0])
+                self.inserted_reservations = []
+
+            def transaction(self):
+                return FakeTransaction()
+
+            async def execute(self, query, *args):
+                return "DELETE 0"
+
+            async def fetchval(self, query, *args):
+                if "pg_advisory_xact_lock" in query:
+                    return None
+                if "COALESCE(SUM(reserved_tokens)" in query:
+                    return next(self.usage_values)
+                if "EXTRACT(EPOCH FROM" in query:
+                    return 0.1
+                if "INSERT INTO grox_groq_token_usage" in query:
+                    self.inserted_reservations.append(args[0])
+                    return 77
+                raise AssertionError(f"Unexpected SQL in token reservation test: {query}")
+
+        class FakeAcquire:
+            def __init__(self, connection):
+                self.connection = connection
+
+            async def __aenter__(self):
+                return self.connection
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class FakePool:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def acquire(self):
+                return FakeAcquire(self.connection)
+
+        connection = FakeConnection()
+        with (
+            patch("main.db_pool", FakePool(connection)),
+            patch("main.GROQ_TPM_LIMIT", 1000),
+            patch("main.GROQ_TPM_RESERVE", 100),
+            patch("main.GROQ_MIN_COMPLETION_TOKENS", 100),
+            patch("main.estimate_groq_prompt_tokens", return_value=200),
+            patch("main.asyncio.sleep", new=AsyncMock()) as mocked_sleep,
+        ):
+            output_tokens, reservation_id, input_tokens = await reserve_groq_tokens(
+                "repair prompt", 500
+            )
+
+        self.assertEqual(mocked_sleep.await_count, 1)
+        self.assertEqual(output_tokens, 500)
+        self.assertEqual(reservation_id, 77)
+        self.assertEqual(input_tokens, 200)
+        self.assertEqual(connection.inserted_reservations, [700])
+
+    async def test_caps_requested_completion_at_configured_tpm_limit(self):
+        class FakeTransaction:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class FakeConnection:
+            def __init__(self):
+                self.inserted_reservations = []
+
+            def transaction(self):
+                return FakeTransaction()
+
+            async def execute(self, query, *args):
+                return "DELETE 0"
+
+            async def fetchval(self, query, *args):
+                if "pg_advisory_xact_lock" in query:
+                    return None
+                if "COALESCE(SUM(reserved_tokens)" in query:
+                    return 0
+                if "INSERT INTO grox_groq_token_usage" in query:
+                    self.inserted_reservations.append(args[0])
+                    return 78
+                raise AssertionError(f"Unexpected SQL in token reservation test: {query}")
+
+        class FakeAcquire:
+            def __init__(self, connection):
+                self.connection = connection
+
+            async def __aenter__(self):
+                return self.connection
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class FakePool:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def acquire(self):
+                return FakeAcquire(self.connection)
+
+        connection = FakeConnection()
+        with (
+            patch("main.db_pool", FakePool(connection)),
+            patch("main.GROQ_TPM_LIMIT", 1000),
+            patch("main.GROQ_TPM_RESERVE", 100),
+            patch("main.GROQ_MIN_COMPLETION_TOKENS", 100),
+            patch("main.estimate_groq_prompt_tokens", return_value=200),
+        ):
+            output_tokens, reservation_id, input_tokens = await reserve_groq_tokens(
+                "repair prompt", 5000
+            )
+
+        self.assertEqual(output_tokens, 700)
+        self.assertEqual(reservation_id, 78)
+        self.assertEqual(input_tokens, 200)
+        self.assertEqual(connection.inserted_reservations, [900])
 
 
 class RetryAfterParsingTests(unittest.TestCase):
