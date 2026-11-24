@@ -248,7 +248,7 @@ class Bot2ValidationTests(unittest.TestCase):
                 "import sqlite3\n"
                 "BOT2_MIN_GUILD_MEMBERS = 500\n"
                 "async def on_message(message):\n    pass\n"
-                "def is_moderator(member):\n    return True\n"
+                "def is_moderator(member):\n    return member.guild_permissions.manage_messages\n"
                 "EU_COUNTRIES = ['DE', 'PL']\n"
                 "def search_requests():\n    pass\n"
                 "processed_message_ids = set()\n"
@@ -265,6 +265,18 @@ class Bot2ValidationTests(unittest.TestCase):
             require_discord=True,
         )
         self.assertEqual(errors, [])
+
+    def test_rejects_unconditional_allow_all_moderator_function(self):
+        self.files["main.py"] = self.files["main.py"].replace(
+            "def is_moderator(member):\\n    return member.guild_permissions.manage_messages",
+            "def is_moderator(member):\\n    return True",
+        )
+        errors = validate_generated_project(
+            self.files,
+            bot2=True,
+            require_discord=True,
+        )
+        self.assertTrue(any("безумовно повертає True" in error for error in errors))
 
     def test_comments_and_strings_cannot_fake_bot2_features(self):
         self.files["main.py"] = (
