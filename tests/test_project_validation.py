@@ -13,7 +13,40 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_same_origin_url, is_website_project, website_navigation_failure, has_meaningful_page_content, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, is_safe_project_file_path, vercel_project_name
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_same_origin_url, is_website_project, website_navigation_failure, has_meaningful_page_content, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, is_safe_project_file_path, extract_marked_project_files, vercel_project_name
+
+
+class GeneratedProjectFileParsingTests(unittest.TestCase):
+    def test_extracts_nested_files_and_required_files(self):
+        response = (
+            "===FILE: main.py===\\nprint('ready')\\n"
+            "===FILE: src/bot/worker.py===\\nasync def run():\\n    return True\\n"
+            "===FILE: requirements.txt===\\ndiscord.py>=2.0\\n"
+            "===FILE: README.md===\\nDiscord setup and Environment Variables\\n"
+        )
+        files = extract_marked_project_files(response)
+        self.assertEqual(
+            set(files),
+            {"main.py", "src/bot/worker.py", "requirements.txt", "README.md"},
+        )
+        self.assertIn("async def run()", files["src/bot/worker.py"])
+
+    def test_ignores_unsafe_paths_in_markers(self):
+        response = (
+            "===FILE: ../escape.py===\\nprint('bad')\\n"
+            "===FILE: main.py===\\nprint('safe')\\n"
+        )
+        files = extract_marked_project_files(response)
+        self.assertEqual(files, {"main.py": "print('safe')"})
+
+    def test_extracts_files_wrapped_in_code_fences(self):
+        response = (
+            "===FILE: src/config.json===\\n"
+            "```json\\n{\\n  \"enabled\": true\\n}\\n```\\n"
+        )
+        files = extract_marked_project_files(response)
+        self.assertIn("src/config.json", files)
+        self.assertIn('"enabled": true', files["src/config.json"])
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
