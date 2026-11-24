@@ -13,7 +13,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_same_origin_url, is_website_project, website_navigation_failure, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, vercel_project_name
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_same_origin_url, is_website_project, website_navigation_failure, has_meaningful_page_content, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, vercel_project_name
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -79,6 +79,17 @@ class GeneratedProjectValidationTests(unittest.TestCase):
         self.files["requirements.txt"] = "aiohttp>=3.9\n"
         errors = validate_generated_project(self.files)
         self.assertFalse(any("aiohttp" in error for error in errors))
+
+
+class WebsiteContentTests(unittest.TestCase):
+    def test_empty_semantic_wrappers_do_not_count_as_page_content(self):
+        self.assertFalse(has_meaningful_page_content("   ", 0))
+
+    def test_visible_text_counts_as_page_content(self):
+        self.assertTrue(has_meaningful_page_content("Welcome to our shop", 0))
+
+    def test_visible_media_or_form_controls_count_as_page_content(self):
+        self.assertTrue(has_meaningful_page_content("", 1))
 
 
 class WebsiteNavigationFailureTests(unittest.TestCase):
