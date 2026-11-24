@@ -3448,7 +3448,7 @@ def validate_generated_project(
                         original_name = dangerous_function_aliases[function.id]
                         add_error(
                             f"У {filename} заборонено виклик небезпечної функції "
-                            f"{original_name}() через псевдонім {function.id}()."
+                            f"{function.id}() (оригінальна функція: {original_name}())."
                         )
                     if function.id in getenv_aliases and is_secret_argument(node):
                         add_error(
