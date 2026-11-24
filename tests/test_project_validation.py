@@ -227,6 +227,18 @@ class GroqContinuationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "abcdefghi")
         self.assertFalse(still_truncated)
 
+    async def test_removes_repeated_overlap_longer_than_3000_characters(self):
+        repeated = "x" * 4500
+        with patch(
+            "main.groq_request",
+            new=AsyncMock(return_value={"content": repeated + "continued", "finish_reason": "stop"}),
+        ):
+            result, still_truncated = await continue_truncated_groq_output(
+                "prefix" + repeated, "task context", "plain text"
+            )
+        self.assertEqual(result, "prefix" + repeated + "continued")
+        self.assertFalse(still_truncated)
+
     async def test_reports_still_truncated_after_bounded_rounds(self):
         with patch(
             "main.groq_request",
