@@ -13,7 +13,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_same_origin_url, is_website_project, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, vercel_project_name
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_same_origin_url, is_website_project, website_navigation_failure, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, vercel_project_name
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -79,6 +79,15 @@ class GeneratedProjectValidationTests(unittest.TestCase):
         self.files["requirements.txt"] = "aiohttp>=3.9\n"
         errors = validate_generated_project(self.files)
         self.assertFalse(any("aiohttp" in error for error in errors))
+
+
+class WebsiteNavigationFailureTests(unittest.TestCase):
+    def test_navigation_failure_is_infrastructure_error(self):
+        result = website_navigation_failure(TimeoutError("preview timed out"))
+        self.assertFalse(result["success"])
+        self.assertTrue(result["infra_error"])
+        self.assertIn("TimeoutError", result["report"])
+        self.assertNotIn("preview timed out", result["report"])
 
 
 class WebsiteOriginTests(unittest.TestCase):
