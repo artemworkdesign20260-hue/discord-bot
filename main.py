@@ -3658,6 +3658,31 @@ def validate_generated_project(
         if not passed:
             add_error(f"У main.py не знайдено реалізацію: {label}.")
 
+    # Reject the most dangerous obvious moderator-auth bypass: a moderator
+    # predicate that unconditionally returns True. Identifier names alone
+    # are not evidence that authorization is actually enforced.
+    for node in ast.walk(bot2_tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        function_name = node.name.casefold()
+        if not any(term in function_name for term in ("moderator", "authorized", "is_admin", "has_permission")):
+            continue
+        has_true_return = any(
+            isinstance(child, ast.Return)
+            and isinstance(child.value, ast.Constant)
+            and child.value.value is True
+            for child in ast.walk(node)
+        )
+        has_guard = any(
+            isinstance(child, (ast.If, ast.IfExp, ast.Compare, ast.BoolOp))
+            for child in ast.walk(node)
+        )
+        if has_true_return and not has_guard:
+            add_error(
+                f"Функція {node.name}() безумовно повертає True; "
+                "це дозволяє всім учасникам обійти перевірку модератора."
+            )
+
     readme = files.get("README.md", "").casefold()
     if "discord" not in readme or not re.search(r"environment|змін", readme):
         add_error("README.md не містить достатніх інструкцій Discord та Environment Variables.")
