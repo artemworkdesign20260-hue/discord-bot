@@ -3331,6 +3331,28 @@ def is_safe_project_file_path(filename: str) -> bool:
     return True
 
 
+def extract_marked_project_files(raw_response: str) -> dict[str, str]:
+    """Parse complete files from ===FILE: relative/path=== markers."""
+    extracted: dict[str, str] = {}
+    marker = re.compile(
+        r"(?im)^\s*(?:```[^\n]*\n\s*)?===\s*FILE\s*:\s*"
+        r"([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*)\s*===\s*$"
+    )
+    matches = list(marker.finditer(raw_response or ""))
+    for index, match in enumerate(matches):
+        filename = match.group(1)
+        if not is_safe_project_file_path(filename):
+            continue
+        body_start = match.end()
+        body_end = matches[index + 1].start() if index + 1 < len(matches) else len(raw_response or "")
+        body = (raw_response or "")[body_start:body_end].strip()
+        body = re.sub(r"^\s*```(?:python|py|text|markdown|json|yaml|yml|javascript|typescript)?\s*", "", body, flags=re.IGNORECASE)
+        body = re.sub(r"\s*```\s*$", "", body)
+        if body.strip():
+            extracted[filename] = body.strip()
+    return extracted
+
+
 def validate_generated_project(
     files: dict[str, str],
     bot2: bool = False,
@@ -3815,33 +3837,22 @@ async def generate_software_project(client_task: str):
                 + "\nСпеціальні вимоги:\n" + special_requirements
             ),
             output_contract=(
-                "Поверни рівно три повні файли з маркерами ===FILE: main.py===, "
-                "===FILE: requirements.txt=== та ===FILE: README.md===. "
-                "Кожен файл має бути повним і придатним до запуску."
+                "Продовжуй повний багатофайловий проєкт з маркерами "
+                "===FILE: відносний/шлях/файлу===. Не повторюй уже завершені файли. "
+                "Обов'язково збережи main.py, requirements.txt і README.md та поверни "
+                "всі решту файлів, які ще не були завершені."
             ),
             max_rounds=3,
         )
 
     def extract_project_files(raw_response: str) -> dict[str, str]:
         """Extract named project files, tolerating common harmless LLM formatting variations."""
-        extracted: dict[str, str] = {}
+        extracted = extract_marked_project_files(raw_response)
         marker = re.compile(
             r"(?im)^\s*(?:```[^\n]*\n\s*)?===\s*FILE\s*:\s*"
             r"([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*)\s*===\s*$"
         )
         matches = list(marker.finditer(raw_response or ""))
-        for index, match in enumerate(matches):
-            filename = match.group(1)
-            if not is_safe_project_file_path(filename):
-                continue
-            body_start = match.end()
-            body_end = matches[index + 1].start() if index + 1 < len(matches) else len(raw_response)
-            body = raw_response[body_start:body_end].strip()
-            body = re.sub(r"^\s*```(?:python|text|markdown)?\s*", "", body, flags=re.IGNORECASE)
-            body = re.sub(r"\s*```\s*$", "", body)
-            if body.strip():
-                extracted[filename] = body.strip()
-
         # Some models omit the main.py marker or wrap the file in a Python
         # code fence. Recover only syntactically valid, recognisable entry-point
         # code; never treat arbitrary README snippets as the project main file.
@@ -3964,9 +3975,12 @@ async def generate_software_project(client_task: str):
         if repair_round == 1 and generation_truncated:
             file_marker = re.compile(
                 r"(?im)^\s*===\s*FILE\s*:\s*"
-                r"(main\.py|requirements\.txt|README\.md)\s*===\s*$"
+                r"([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*)\s*===\s*$"
             )
-            generation_markers = list(file_marker.finditer(result or ""))
+            generation_markers = [
+                match for match in file_marker.finditer(result or "")
+                if is_safe_project_file_path(match.group(1))
+            ]
             truncated_target = (
                 generation_markers[-1].group(1)
                 if generation_markers else "main.py"
