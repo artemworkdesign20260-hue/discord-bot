@@ -1380,19 +1380,31 @@ async def continue_truncated_groq_output(
     output_contract: str,
     max_rounds: int = 3,
 ):
-    """Continue a truncated response using a bounded tail context, never a full replay."""
+    """Continue truncated output while preflighting every continuation prompt."""
     result = partial_output or ""
-    if len(context) > 6000:
-        context = context[:3000] + "\n...[середину контексту скорочено]...\n" + context[-3000:]
-
     still_truncated = True
+    max_input_tokens = (
+        GROQ_TPM_LIMIT - GROQ_TPM_RESERVE - GROQ_MIN_COMPLETION_TOKENS
+    )
+
     for round_number in range(1, max_rounds + 1):
-        tail = result[-6000:]
-        continuation_prompt = f"""
+        # Preserve the newest output first: it is the strongest signal for the
+        # exact point where generation stopped. Shrink optional context before
+        # shrinking this tail so continuation still has enough local syntax.
+        context_budget = min(len(context), 3000)
+        tail_budget = min(len(result), 6000)
+        continuation_prompt = ""
+
+        while True:
+            context_part = context[:context_budget]
+            if context_budget < len(context):
+                context_part += "\n...[контекст скорочено]..."
+            tail = result[-tail_budget:] if tail_budget else ""
+            continuation_prompt = f"""
 Ти продовжуєш відповідь, яку Groq обрізав за лімітом токенів.
 
 КОНТЕКСТ ЗАВДАННЯ:
-{context}
+{context_part}
 
 ФОРМАТ РЕЗУЛЬТАТУ:
 {output_contract}
@@ -1410,11 +1422,38 @@ async def continue_truncated_groq_output(
 - Заверши поточний файл/документ і поверни всі решту обов'язкових частин.
 - Поверни лише продовження результату, без пояснень.
 """
+            estimated_input = estimate_groq_prompt_tokens(continuation_prompt)
+            if estimated_input <= max_input_tokens:
+                break
+            if context_budget > 0:
+                context_budget = max(0, context_budget // 2)
+            elif tail_budget > 750:
+                tail_budget = max(750, tail_budget // 2)
+            else:
+                continuation_prompt = ""
+                break
+
+        if not continuation_prompt:
+            print(
+                f"[GROQ CONTINUATION] round={round_number}/{max_rounds} "
+                f"skipped_over_budget estimated_input_tokens={estimated_input} "
+                f"max_input_tokens={max_input_tokens}."
+            )
+            break
+
+        available_output = max_input_tokens - estimated_input
+        requested_output = min(5000, available_output)
+        if requested_output < GROQ_MIN_COMPLETION_TOKENS:
+            print(
+                f"[GROQ CONTINUATION] round={round_number}/{max_rounds} "
+                "skipped_insufficient_completion_budget."
+            )
+            break
 
         try:
             continuation = await groq_request(
                 continuation_prompt,
-                max_output_tokens=5000,
+                max_output_tokens=requested_output,
                 return_metadata=True,
             )
         except Exception as error:
@@ -1432,9 +1471,7 @@ async def continue_truncated_groq_output(
             )
             break
 
-        # Remove the complete exact suffix/prefix overlap. The KMP prefix
-        # table keeps this linear-time even when a model repeats thousands of
-        # characters, instead of silently duplicating anything beyond 3,000.
+        # Remove the complete exact suffix/prefix overlap using KMP.
         pattern = addition
         prefix = [0] * len(pattern)
         matched = 0
@@ -1446,17 +1483,16 @@ async def continue_truncated_groq_output(
             prefix[index] = matched
 
         overlap = 0
-        tail = result[-min(len(result), len(pattern)):]
-        for index, char in enumerate(tail):
+        previous_tail = result[-min(len(result), len(pattern)):]
+        for index, char in enumerate(previous_tail):
             while overlap and char != pattern[overlap]:
                 overlap = prefix[overlap - 1]
             if char == pattern[overlap]:
                 overlap += 1
-            if overlap == len(pattern) and index != len(tail) - 1:
+            if overlap == len(pattern) and index != len(previous_tail) - 1:
                 overlap = prefix[overlap - 1]
 
         result += addition[overlap:]
-
         finish_reason = continuation.get("finish_reason")
         print(
             f"[GROQ CONTINUATION] round={round_number}/{max_rounds} "
