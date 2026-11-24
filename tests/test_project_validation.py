@@ -19,10 +19,10 @@ from main import contains_credential_request, continue_truncated_groq_output, de
 class GeneratedProjectFileParsingTests(unittest.TestCase):
     def test_extracts_nested_files_and_required_files(self):
         response = (
-            "===FILE: main.py===\\nprint('ready')\\n"
-            "===FILE: src/bot/worker.py===\\nasync def run():\\n    return True\\n"
-            "===FILE: requirements.txt===\\ndiscord.py>=2.0\\n"
-            "===FILE: README.md===\\nDiscord setup and Environment Variables\\n"
+            "===FILE: main.py===\nprint('ready')\n"
+            "===FILE: src/bot/worker.py===\nasync def run():\n    return True\n"
+            "===FILE: requirements.txt===\ndiscord.py>=2.0\n"
+            "===FILE: README.md===\nDiscord setup and Environment Variables\n"
         )
         files = extract_marked_project_files(response)
         self.assertEqual(
@@ -33,16 +33,16 @@ class GeneratedProjectFileParsingTests(unittest.TestCase):
 
     def test_ignores_unsafe_paths_in_markers(self):
         response = (
-            "===FILE: ../escape.py===\\nprint('bad')\\n"
-            "===FILE: main.py===\\nprint('safe')\\n"
+            "===FILE: ../escape.py===\nprint('bad')\n"
+            "===FILE: main.py===\nprint('safe')\n"
         )
         files = extract_marked_project_files(response)
         self.assertEqual(files, {"main.py": "print('safe')"})
 
     def test_extracts_files_wrapped_in_code_fences(self):
         response = (
-            "===FILE: src/config.json===\\n"
-            "```json\\n{\\n  \"enabled\": true\\n}\\n```\\n"
+            "===FILE: src/config.json===\n"
+            "```json\n{\n  \"enabled\": true\n}\n```\n"
         )
         files = extract_marked_project_files(response)
         self.assertIn("src/config.json", files)
@@ -69,7 +69,7 @@ class GeneratedProjectValidationTests(unittest.TestCase):
         self.assertTrue(any("helper.py" in error and "Синтаксична помилка" in error for error in errors))
 
     def test_checks_syntax_of_nested_python_modules(self):
-        self.files["src/bot/worker.py"] = "def broken_function(:\\n    pass\\n"
+        self.files["src/bot/worker.py"] = "def broken_function(:\n    pass\n"
         errors = validate_generated_project(self.files)
         self.assertTrue(any("src/bot/worker.py" in error and "Синтаксична помилка" in error for error in errors))
 
@@ -79,19 +79,19 @@ class GeneratedProjectValidationTests(unittest.TestCase):
                 self.assertTrue(is_safe_project_file_path(path))
 
     def test_rejects_unsafe_project_paths(self):
-        for path in ("../secrets.txt", "/etc/passwd", "src/../../escape.py", "src\\\\bot.py", "C:/temp/file.py", "src//bot.py"):
+        for path in ("../secrets.txt", "/etc/passwd", "src/../../escape.py", "src\\bot.py", "C:/temp/file.py", "src//bot.py"):
             with self.subTest(path=path):
                 self.assertFalse(is_safe_project_file_path(path))
 
     def test_rejects_case_insensitive_duplicate_paths(self):
-        self.files["src/Bot.py"] = "VALUE = 1\\n"
-        self.files["src/bot.py"] = "VALUE = 2\\n"
+        self.files["src/Bot.py"] = "VALUE = 1\n"
+        self.files["src/bot.py"] = "VALUE = 2\n"
         errors = validate_generated_project(self.files)
         self.assertTrue(any("Дубльований шлях" in error for error in errors))
 
     def test_rejects_project_with_too_many_files(self):
         files = dict(self.files)
-        files.update({f"modules/module_{index}.py": "VALUE = 1\\n" for index in range(98)})
+        files.update({f"modules/module_{index}.py": "VALUE = 1\n" for index in range(98)})
         errors = validate_generated_project(files)
         self.assertTrue(any("понад 100 файлів" in error for error in errors))
 
