@@ -1066,11 +1066,16 @@ async def reserve_groq_tokens(prompt: str, requested_output_tokens: int):
                     - int(used_tokens or 0)
                 )
 
-                if available_output_tokens >= GROQ_MIN_COMPLETION_TOKENS:
-                    output_tokens = min(
-                        max(GROQ_MIN_COMPLETION_TOKENS, int(requested_output_tokens)),
-                        available_output_tokens,
-                    )
+                # Do not silently send a request with only the minimum
+                # completion budget when the caller needs a larger response.
+                # That behavior produced tiny, truncated project repairs while
+                # appearing to have successfully reserved TPM capacity.
+                target_output_tokens = min(
+                    max(GROQ_MIN_COMPLETION_TOKENS, int(requested_output_tokens)),
+                    max_possible_output,
+                )
+                if available_output_tokens >= target_output_tokens:
+                    output_tokens = target_output_tokens
                     reservation_id = await connection.fetchval(
                         """
                         INSERT INTO grox_groq_token_usage (reserved_tokens)
@@ -1092,8 +1097,9 @@ async def reserve_groq_tokens(prompt: str, requested_output_tokens: int):
 
         delay = max(0.5, min(60.0, float(wait_seconds or 1.0) + 0.1))
         print(
-            f"[GROQ TPM] Shared 60-second budget is full; "
-            f"waiting {delay:.1f}s before reserving tokens."
+            f"[GROQ TPM] Waiting for requested completion budget "
+            f"({target_output_tokens} tokens; currently available "
+            f"{max(0, available_output_tokens)}); retry in {delay:.1f}s."
         )
         await asyncio.sleep(delay)
 
