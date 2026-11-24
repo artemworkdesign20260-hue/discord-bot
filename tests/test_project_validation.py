@@ -13,7 +13,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_same_origin_url, is_website_project, website_navigation_failure, has_meaningful_page_content, missing_required_integration_settings, parse_retry_after_seconds, reserve_groq_tokens, select_render_owner_id, validate_generated_project, is_safe_project_file_path, extract_marked_project_files, vercel_project_name
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, groq_request_budgets, is_order_message, is_revision_request, is_same_origin_url, is_website_project, website_navigation_failure, has_meaningful_page_content, missing_required_integration_settings, parse_retry_after_seconds, reserve_groq_tokens, select_render_owner_id, validate_generated_project, is_safe_project_file_path, extract_marked_project_files, vercel_project_name
 
 
 class GeneratedProjectFileParsingTests(unittest.TestCase):
@@ -497,6 +497,30 @@ class AdditionalDangerousApiTests(unittest.TestCase):
             self.make_files('from os import posix_spawn as launch\nlaunch("sh", ["sh"])\n')
         )
         self.assertTrue(any("posix_spawn" in error for error in errors))
+
+
+class GroqRequestBudgetTests(unittest.TestCase):
+    def test_repair_budget_leaves_room_for_a_complete_file_response(self):
+        with (
+            patch("main.GROQ_TPM_LIMIT", 8000),
+            patch("main.GROQ_TPM_RESERVE", 700),
+            patch("main.GROQ_MIN_COMPLETION_TOKENS", 256),
+        ):
+            output_budget, input_budget = groq_request_budgets(3500)
+
+        self.assertEqual(output_budget, 3500)
+        self.assertEqual(input_budget, 3800)
+
+    def test_budget_scales_down_for_smaller_tpm_limits(self):
+        with (
+            patch("main.GROQ_TPM_LIMIT", 1000),
+            patch("main.GROQ_TPM_RESERVE", 100),
+            patch("main.GROQ_MIN_COMPLETION_TOKENS", 100),
+        ):
+            output_budget, input_budget = groq_request_budgets(3500)
+
+        self.assertEqual(output_budget, 450)
+        self.assertEqual(input_budget, 450)
 
 
 class GroqTokenReservationTests(unittest.IsolatedAsyncioTestCase):
