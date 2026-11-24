@@ -1014,6 +1014,17 @@ def extract_budget(text: str):
 # GROQ REQUEST
 # ============================================================
 
+def groq_request_budgets(requested_output_tokens: int) -> tuple[int, int]:
+    """Return a safe completion target and the matching maximum input budget."""
+    available_tpm = GROQ_TPM_LIMIT - GROQ_TPM_RESERVE
+    minimum_output = GROQ_MIN_COMPLETION_TOKENS
+    desired_output = min(
+        max(minimum_output, int(requested_output_tokens)),
+        max(minimum_output, available_tpm // 2),
+    )
+    return desired_output, available_tpm - desired_output
+
+
 def estimate_groq_prompt_tokens(prompt: str) -> int:
     """
     Conservative local estimate without another tokenizer dependency.
@@ -4139,9 +4150,11 @@ async def generate_software_project(client_task: str):
                 f"prompt_chars={len(repair_prompt)}"
             )
 
-        max_repair_input_tokens = (
-            GROQ_TPM_LIMIT - GROQ_TPM_RESERVE - GROQ_MIN_COMPLETION_TOKENS
-        )
+        # Reserve a meaningful completion allowance for a complete file,
+        # not merely the provider's 256-token minimum. The TPM reservation
+        # helper will wait for this requested output budget when other calls
+        # temporarily occupy the shared rolling window.
+        repair_output_budget, max_repair_input_tokens = groq_request_budgets(3500)
         if repair_input_estimate > max_repair_input_tokens:
             message = (
                 "Автоматичне виправлення зупинено до запиту Groq: навіть "
@@ -4160,7 +4173,7 @@ async def generate_software_project(client_task: str):
         try:
             repair_generation = await groq_request(
                 repair_prompt,
-                max_output_tokens=3500,
+                max_output_tokens=repair_output_budget,
                 return_metadata=True,
             )
         except Exception as repair_error:
