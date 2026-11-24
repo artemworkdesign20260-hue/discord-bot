@@ -4048,15 +4048,51 @@ async def generate_software_project(client_task: str):
             + "\n\nПОТОЧНІ ФАЙЛИ:\n" + current_files_context
             + "\n\nПОМИЛКИ ПЕРЕВІРКИ:\n- "
             + "\n- ".join(validation_errors)
-            + "\n\nПОЧАТКОВЕ ТЕХНІЧНЕ ЗАВДАННЯ:\n" + client_task
-            + "\n\nПЛАТФОРМА:\n" + platform
-            + "\n\nСПЕЦІАЛЬНІ ВИМОГИ:\n" + special_requirements
+            + "\n\nКОНТЕКСТ ПРОЄКТУ (скорочено):\n"
+            + "Платформа: " + str(platform)[:100] + ". "
+            + "Виправляй лише перелічені помилки, зберігай наявну функціональність. "
+            + "Для Discord requirements.txt обов'язково має містити discord.py або py-cord. "
+            + "README.md має містити короткі інструкції запуску. "
+            + "Початкове ТЗ (обмежено 1200 символами):\\n"
+            + str(client_task)[:1200]
         )
+
+        # The previous repair prompt repeated the full task and special
+        # requirements every round. This could exceed the shared TPM budget
+        # and fail locally before a request reached Groq.
+        repair_input_estimate = estimate_groq_prompt_tokens(repair_prompt)
+        print(
+            "[PROJECT REPAIR] "
+            f"round={repair_round}/{max_repair_rounds} "
+            f"targets={repair_targets} "
+            f"estimated_input_tokens={repair_input_estimate} "
+            f"prompt_chars={len(repair_prompt)}"
+        )
+        if repair_input_estimate > (
+            GROQ_TPM_LIMIT - GROQ_TPM_RESERVE - GROQ_MIN_COMPLETION_TOKENS
+        ):
+            # Keep the full source of target files, but remove all optional
+            # task context and retain only the deterministic validation errors.
+            repair_prompt = (
+                "Виправ повністю зазначені файли, збережи їхню функціональність. "
+                "Поверни лише повні файли з маркерами ===FILE: шлях===. "
+                "Для Discord requirements.txt має містити discord.py або py-cord; "
+                "README.md — інструкції запуску.\\n\\n"
+                + "ЦІЛЬОВІ ФАЙЛИ: " + ", ".join(repair_targets)
+                + "\\n\\nПОТОЧНИЙ ВМІСТ:\\n" + current_files_context
+                + "\\n\\nПОМИЛКИ:\\n- " + "\\n- ".join(validation_errors)
+            )
+            repair_input_estimate = estimate_groq_prompt_tokens(repair_prompt)
+            print(
+                "[PROJECT REPAIR] compact_prompt="
+                f"estimated_input_tokens={repair_input_estimate} "
+                f"prompt_chars={len(repair_prompt)}"
+            )
 
         try:
             repair_generation = await groq_request(
                 repair_prompt,
-                max_output_tokens=30000,
+                max_output_tokens=3500,
                 return_metadata=True,
             )
         except Exception as repair_error:
