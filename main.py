@@ -4089,6 +4089,24 @@ async def generate_software_project(client_task: str):
                 f"prompt_chars={len(repair_prompt)}"
             )
 
+        max_repair_input_tokens = (
+            GROQ_TPM_LIMIT - GROQ_TPM_RESERVE - GROQ_MIN_COMPLETION_TOKENS
+        )
+        if repair_input_estimate > max_repair_input_tokens:
+            message = (
+                "Автоматичне виправлення зупинено до запиту Groq: навіть "
+                "скорочений контекст перевищує доступний TPM-бюджет "
+                f"({repair_input_estimate} > {max_repair_input_tokens}). "
+                "Потрібно розбити ремонт на менші частини."
+            )
+            print(
+                "[PROJECT REPAIR] skipped_over_budget="
+                f"estimated_input_tokens={repair_input_estimate} "
+                f"max_input_tokens={max_repair_input_tokens}"
+            )
+            validation_errors.append(message)
+            break
+
         try:
             repair_generation = await groq_request(
                 repair_prompt,
@@ -4105,6 +4123,13 @@ async def generate_software_project(client_task: str):
                 f"Раунд виправлення {repair_round}: запит до Groq не виконано "
                 f"({type(repair_error).__name__})."
             )
+            error_detail = str(repair_error).lower()
+            if "завеликий" in error_detail or "tpm" in error_detail:
+                print(
+                    "[PROJECT REPAIR] stopping_after_tpm_budget_error="
+                    f"round={repair_round}"
+                )
+                break
             continue
 
         repaired_result = repair_generation["content"]
