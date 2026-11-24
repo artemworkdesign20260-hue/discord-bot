@@ -3376,7 +3376,7 @@ def validate_generated_project(
         builtins_modules = {"builtins"}
         subprocess_modules = {"subprocess"}
         asyncio_modules = {"asyncio"}
-        dangerous_function_aliases: set[str] = set()
+        dangerous_function_aliases: dict[str, str] = {}
         getenv_aliases: set[str] = set()
         environ_aliases: set[str] = set()
 
@@ -3413,7 +3413,7 @@ def validate_generated_project(
                     for alias in node.names:
                         bound_name = alias.asname or alias.name
                         if alias.name in dangerous_os_calls:
-                            dangerous_function_aliases.add(bound_name)
+                            dangerous_function_aliases[bound_name] = f"os.{alias.name}"
                         elif alias.name == "getenv":
                             getenv_aliases.add(bound_name)
                         elif alias.name == "environ":
@@ -3421,11 +3421,11 @@ def validate_generated_project(
                 elif module == "builtins":
                     for alias in node.names:
                         if alias.name in {"eval", "exec", "__import__"}:
-                            dangerous_function_aliases.add(alias.asname or alias.name)
+                            dangerous_function_aliases[alias.asname or alias.name] = f"builtins.{alias.name}"
                 elif module == "asyncio":
                     for alias in node.names:
                         if alias.name in dangerous_asyncio_calls:
-                            dangerous_function_aliases.add(alias.asname or alias.name)
+                            dangerous_function_aliases[alias.asname or alias.name] = f"asyncio.{alias.name}"
                 elif module in {"pty", "commands"}:
                     add_error(f"У {filename} заборонено імпорт {module}.")
 
@@ -3445,9 +3445,10 @@ def validate_generated_project(
                     if function.id in {"eval", "exec", "__import__"}:
                         add_error(f"У {filename} заборонено виклик {function.id}().")
                     elif function.id in dangerous_function_aliases:
+                        original_name = dangerous_function_aliases[function.id]
                         add_error(
                             f"У {filename} заборонено виклик небезпечної функції "
-                            f"{function.id}()."
+                            f"{original_name}() через псевдонім {function.id}()."
                         )
                     if function.id in getenv_aliases and is_secret_argument(node):
                         add_error(
