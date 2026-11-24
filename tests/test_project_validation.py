@@ -13,7 +13,7 @@ os.environ.setdefault(
     "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
 )
 
-from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_website_project, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, vercel_project_name
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, is_order_message, is_revision_request, is_same_origin_url, is_website_project, missing_required_integration_settings, parse_retry_after_seconds, select_render_owner_id, validate_generated_project, vercel_project_name
 
 
 class GeneratedProjectValidationTests(unittest.TestCase):
@@ -79,6 +79,33 @@ class GeneratedProjectValidationTests(unittest.TestCase):
         self.files["requirements.txt"] = "aiohttp>=3.9\n"
         errors = validate_generated_project(self.files)
         self.assertFalse(any("aiohttp" in error for error in errors))
+
+
+class WebsiteOriginTests(unittest.TestCase):
+    def test_accepts_same_origin_url(self):
+        self.assertTrue(
+            is_same_origin_url("https://example.com/assets/app.js", "https://example.com/")
+        )
+
+    def test_accepts_default_https_port_equivalence(self):
+        self.assertTrue(
+            is_same_origin_url("https://example.com:443/app.js", "https://example.com/")
+        )
+
+    def test_rejects_host_with_matching_prefix(self):
+        self.assertFalse(
+            is_same_origin_url(
+                "https://example.com.attacker.invalid/app.js",
+                "https://example.com/",
+            )
+        )
+
+    def test_rejects_different_scheme_or_port(self):
+        self.assertFalse(is_same_origin_url("http://example.com/app.js", "https://example.com/"))
+        self.assertFalse(is_same_origin_url("https://example.com:8443/app.js", "https://example.com/"))
+
+    def test_rejects_malformed_url(self):
+        self.assertFalse(is_same_origin_url("https://[invalid", "https://example.com/"))
 
 
 class RenderOwnerSelectionTests(unittest.TestCase):
