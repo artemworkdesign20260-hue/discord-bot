@@ -1432,14 +1432,29 @@ async def continue_truncated_groq_output(
             )
             break
 
-        # Remove an exact repeated suffix/prefix if the model repeats a small
-        # amount of context despite the instruction not to repeat it.
-        overlap_limit = min(3000, len(result), len(addition))
+        # Remove the complete exact suffix/prefix overlap. The KMP prefix
+        # table keeps this linear-time even when a model repeats thousands of
+        # characters, instead of silently duplicating anything beyond 3,000.
+        pattern = addition
+        prefix = [0] * len(pattern)
+        matched = 0
+        for index in range(1, len(pattern)):
+            while matched and pattern[index] != pattern[matched]:
+                matched = prefix[matched - 1]
+            if pattern[index] == pattern[matched]:
+                matched += 1
+            prefix[index] = matched
+
         overlap = 0
-        for size in range(overlap_limit, 0, -1):
-            if result.endswith(addition[:size]):
-                overlap = size
-                break
+        tail = result[-min(len(result), len(pattern)):]
+        for index, char in enumerate(tail):
+            while overlap and char != pattern[overlap]:
+                overlap = prefix[overlap - 1]
+            if char == pattern[overlap]:
+                overlap += 1
+            if overlap == len(pattern) and index != len(tail) - 1:
+                overlap = prefix[overlap - 1]
+
         result += addition[overlap:]
 
         finish_reason = continuation.get("finish_reason")
