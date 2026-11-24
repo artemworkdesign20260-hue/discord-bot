@@ -3331,9 +3331,15 @@ def is_safe_project_file_path(filename: str) -> bool:
     return True
 
 
-def extract_marked_project_files(raw_response: str) -> dict[str, str]:
-    """Parse complete files from ===FILE: relative/path=== markers."""
+def extract_marked_project_files(
+    raw_response: str,
+    return_errors: bool = False,
+):
+    """Parse marked files and fail closed on duplicate paths."""
     extracted: dict[str, str] = {}
+    errors: list[str] = []
+    seen_paths: set[str] = set()
+    duplicate_paths: set[str] = set()
     marker = re.compile(
         r"(?im)^\s*(?:```[^\n]*\n\s*)?===\s*FILE\s*:\s*"
         r"([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*)\s*===\s*$"
@@ -3342,7 +3348,17 @@ def extract_marked_project_files(raw_response: str) -> dict[str, str]:
     for index, match in enumerate(matches):
         filename = match.group(1)
         if not is_safe_project_file_path(filename):
+            errors.append(f"Відхилено небезпечний шлях у маркері файлу: {filename[:120]}.")
             continue
+        normalized = filename.casefold()
+        if normalized in seen_paths:
+            duplicate_paths.add(normalized)
+            errors.append(
+                f"Файл {filename} позначено більше одного разу; неоднозначний вміст відхилено."
+            )
+            extracted.pop(filename, None)
+            continue
+        seen_paths.add(normalized)
         body_start = match.end()
         body_end = matches[index + 1].start() if index + 1 < len(matches) else len(raw_response or "")
         body = (raw_response or "")[body_start:body_end].strip()
@@ -3350,7 +3366,14 @@ def extract_marked_project_files(raw_response: str) -> dict[str, str]:
         body = re.sub(r"\s*```\s*$", "", body)
         if body.strip():
             extracted[filename] = body.strip()
-    return extracted
+
+    # A duplicate differing only by case must also invalidate the original.
+    if duplicate_paths:
+        extracted = {
+            name: content for name, content in extracted.items()
+            if name.casefold() not in duplicate_paths
+        }
+    return (extracted, errors) if return_errors else extracted
 
 
 def validate_generated_project(
@@ -3845,9 +3868,14 @@ async def generate_software_project(client_task: str):
             max_rounds=3,
         )
 
+    parse_errors: list[str] = []
+
     def extract_project_files(raw_response: str) -> dict[str, str]:
         """Extract named project files, tolerating common harmless LLM formatting variations."""
-        extracted = extract_marked_project_files(raw_response)
+        nonlocal parse_errors
+        extracted, parse_errors = extract_marked_project_files(
+            raw_response, return_errors=True
+        )
         marker = re.compile(
             r"(?im)^\s*(?:```[^\n]*\n\s*)?===\s*FILE\s*:\s*"
             r"([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*)\s*===\s*$"
@@ -3934,8 +3962,11 @@ async def generate_software_project(client_task: str):
         f"extracted={sorted(files)} "
         f"missing={[name for name in ('main.py', 'requirements.txt', 'README.md') if not files.get(name, '').strip()]}"
     )
-    validation_errors = validate_generated_project(
-        files, bot2=bot2, require_discord=(platform == "Discord")
+    validation_errors = list(parse_errors)
+    validation_errors.extend(
+        validate_generated_project(
+            files, bot2=bot2, require_discord=(platform == "Discord")
+        )
     )
     if generation_truncated:
         validation_errors.append(
