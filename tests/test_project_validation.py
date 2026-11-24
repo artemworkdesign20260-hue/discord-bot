@@ -39,6 +39,25 @@ class GeneratedProjectFileParsingTests(unittest.TestCase):
         files = extract_marked_project_files(response)
         self.assertEqual(files, {"main.py": "print('safe')"})
 
+    def test_rejects_duplicate_file_markers_instead_of_silently_overwriting(self):
+        response = (
+            "===FILE: src/worker.py===\\nprint('first')\\n"
+            "===FILE: src/worker.py===\\nprint('second')\\n"
+        )
+        files, errors = extract_marked_project_files(response, return_errors=True)
+        self.assertNotIn("src/worker.py", files)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("більше одного разу", errors[0])
+
+    def test_rejects_case_insensitive_duplicate_file_markers(self):
+        response = (
+            "===FILE: src/Worker.py===\\nprint('first')\\n"
+            "===FILE: src/worker.py===\\nprint('second')\\n"
+        )
+        files, errors = extract_marked_project_files(response, return_errors=True)
+        self.assertEqual(files, {})
+        self.assertEqual(len(errors), 1)
+
     def test_extracts_files_wrapped_in_code_fences(self):
         response = (
             "===FILE: src/config.json===\n"
