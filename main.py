@@ -3319,7 +3319,7 @@ def is_safe_project_file_path(filename: str) -> bool:
     """Accept portable relative project paths; reject traversal and absolute paths."""
     if not isinstance(filename, str) or not filename or len(filename) > 240:
         return False
-    if "\\\\" in filename or filename.startswith("/"):
+    if "\\" in filename or filename.startswith("/"):
         return False
     if re.match(r"^[A-Za-z]:", filename):
         return False
