@@ -2509,6 +2509,20 @@ async def deploy_to_vercel(
 # WEBSITE QA TEST
 # ============================================================
 
+def website_navigation_failure(error: Exception) -> dict:
+    """Treat an unreachable preview as a QA infrastructure/deployment failure, not an HTML defect."""
+    return {
+        "success": False,
+        "infra_error": True,
+        "report": (
+            "QA не змогла відкрити попередній перегляд сайту. "
+            "Це може бути мережева помилка, DNS/TLS, тайм-аут або недоступний preview. "
+            "Не змінюй HTML на підставі цього результату. "
+            f"Тип помилки: {type(error).__name__}."
+        ),
+    }
+
+
 def is_same_origin_url(candidate_url: str, reference_url: str) -> bool:
     """Compare URL origins structurally; string-prefix checks accept hostile lookalike hosts."""
     try:
@@ -2645,13 +2659,7 @@ async def test_website(url: str):
             except Exception as error:
                 await browser.close()
 
-                return {
-                    "success": False,
-                    "report": (
-                        "Сайт не вдалося відкрити.\n"
-                        f"Помилка: {error}"
-                    )
-                }
+                return website_navigation_failure(error)
 
             if response is None:
                 errors.append(
