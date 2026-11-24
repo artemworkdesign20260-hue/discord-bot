@@ -84,7 +84,7 @@ Grox requires a dedicated `GROX_DATABASE_URL` connection string. The application
 
 Use a Neon PostgreSQL connection string from the Neon Console. Keep it private and add it only to the Grox Render service's Environment settings. Do not use Bot 2's `DATABASE_URL` or `BOT2_DATABASE_URL` for Grox.
 
-The database preserves task records, order IDs, token reservations, and post-delivery conversation expiry. Active orders use heartbeats so an overlapping Render deploy does not incorrectly interrupt them; truly stale orders are marked `INTERRUPTED` after three minutes. Completed post-delivery conversations resume after a restart while their idle window remains active. A code-generation process interrupted mid-build is not automatically resumed yet. Neon Free also has usage limits, and compute can be suspended when monthly quotas are exhausted.
+The database preserves task records, order IDs, token reservations, and post-delivery conversation expiry. Active orders use heartbeats so an overlapping Render deploy does not incorrectly interrupt them; truly stale orders are marked `INTERRUPTED` after the configured heartbeat timeout (10 minutes by default). Completed post-delivery conversations resume after a restart while their idle window remains active. A code-generation process interrupted mid-build is not automatically resumed yet. Neon Free also has usage limits, and compute can be suspended when monthly quotas are exhausted.
 
 ## Local syntax check
 
