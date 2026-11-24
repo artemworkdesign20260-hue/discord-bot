@@ -4053,7 +4053,7 @@ async def generate_software_project(client_task: str):
             + "Виправляй лише перелічені помилки, зберігай наявну функціональність. "
             + "Для Discord requirements.txt обов'язково має містити discord.py або py-cord. "
             + "README.md має містити короткі інструкції запуску. "
-            + "Початкове ТЗ (обмежено 1200 символами):\\n"
+            + "Початкове ТЗ (обмежено 1200 символами):\n"
             + str(client_task)[:1200]
         )
 
@@ -4077,10 +4077,10 @@ async def generate_software_project(client_task: str):
                 "Виправ повністю зазначені файли, збережи їхню функціональність. "
                 "Поверни лише повні файли з маркерами ===FILE: шлях===. "
                 "Для Discord requirements.txt має містити discord.py або py-cord; "
-                "README.md — інструкції запуску.\\n\\n"
+                "README.md — інструкції запуску.\n\n"
                 + "ЦІЛЬОВІ ФАЙЛИ: " + ", ".join(repair_targets)
-                + "\\n\\nПОТОЧНИЙ ВМІСТ:\\n" + current_files_context
-                + "\\n\\nПОМИЛКИ:\\n- " + "\\n- ".join(validation_errors)
+                + "\n\nПОТОЧНИЙ ВМІСТ:\n" + current_files_context
+                + "\n\nПОМИЛКИ:\n- " + "\n- ".join(validation_errors)
             )
             repair_input_estimate = estimate_groq_prompt_tokens(repair_prompt)
             print(
