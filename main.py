@@ -2509,6 +2509,35 @@ async def deploy_to_vercel(
 # WEBSITE QA TEST
 # ============================================================
 
+def is_same_origin_url(candidate_url: str, reference_url: str) -> bool:
+    """Compare URL origins structurally; string-prefix checks accept hostile lookalike hosts."""
+    try:
+        candidate = urlsplit(candidate_url)
+        reference = urlsplit(reference_url)
+        if not candidate.scheme or not candidate.hostname:
+            return False
+        if not reference.scheme or not reference.hostname:
+            return False
+
+        def normalized_port(parsed):
+            explicit = parsed.port
+            if explicit is not None:
+                return explicit
+            return 443 if parsed.scheme.casefold() == "https" else 80 if parsed.scheme.casefold() == "http" else None
+
+        return (
+            candidate.scheme.casefold(),
+            candidate.hostname.casefold(),
+            normalized_port(candidate),
+        ) == (
+            reference.scheme.casefold(),
+            reference.hostname.casefold(),
+            normalized_port(reference),
+        )
+    except ValueError:
+        return False
+
+
 async def test_website(url: str):
     print(
         f"[QA] Starting website test: {url}"
@@ -2566,7 +2595,7 @@ async def test_website(url: str):
                     f"{request.method} {request.url} "
                     f"-> {request.failure}"
                 )
-                if request.url.startswith(site_origin):
+                if is_same_origin_url(request.url, url):
                     errors.append(
                         "Внутрішній ресурс сайту не завантажився: "
                         f"{urlsplit(request.url).path}."
@@ -2577,7 +2606,7 @@ async def test_website(url: str):
             def handle_response(response):
                 if (
                     response.status >= 400
-                    and response.url.startswith(site_origin)
+                    and is_same_origin_url(response.url, url)
                     and response.request.resource_type != "document"
                 ):
                     errors.append(
