@@ -4122,7 +4122,7 @@ async def generate_software_project(client_task: str):
             window_start = max(1, error_line - 6)
             window_end = min(len(source_lines), error_line + 6)
             snippet = "\n".join(
-                f"{number}: {source_lines[number - 1]}"
+                source_lines[number - 1]
                 for number in range(window_start, window_end + 1)
             )
             syntax_prompt = (
@@ -4176,7 +4176,7 @@ async def generate_software_project(client_task: str):
                     f"{type(syntax_repair_error).__name__}: {safe_error_detail(syntax_repair_error)}"
                 )
 
-        requested_files = "\\n".join(
+        requested_files = "\n".join(
             f"===FILE: {name}===\n<повний виправлений вміст {name}>"
             for name in repair_targets
         )
