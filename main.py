@@ -1476,7 +1476,7 @@ async def continue_truncated_groq_output(
         except Exception as error:
             print(
                 f"[GROQ CONTINUATION] round={round_number}/{max_rounds} "
-                f"failed={type(error).__name__}."
+                f"failed={type(error).__name__}: {safe_error_detail(error)}"
             )
             break
 
@@ -4007,8 +4007,32 @@ async def generate_software_project(client_task: str):
         return extracted
 
     files = extract_project_files(result)
-    print(
-        "[PROJECT GENERATION] "
+
+    # Create predictable Discord metadata locally instead of spending Groq TPM
+    # on files whose contents are deterministic.
+    if platform == "Discord":
+        existing_requirements = files.get("requirements.txt", "").strip()
+        requirement_lines = [
+            line.strip() for line in existing_requirements.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if not any(re.match(r"(?i)^(discord\.py|py-cord)(?:[<=>!~]|$)", line) for line in requirement_lines):
+            requirement_lines.insert(0, "discord.py")
+        files["requirements.txt"] = "\n".join(dict.fromkeys(requirement_lines)) + "\n"
+
+        if not files.get("README.md", "").strip():
+            files["README.md"] = (
+                "# Discord bot\n\n"
+                "## Запуск\n\n"
+                "1. Встановіть залежності командою pip install -r requirements.txt.\n"
+                "2. Додайте токен у змінну середовища DISCORD_TOKEN.\n"
+                "3. Запустіть командою python main.py.\n\n"
+                "## Environment variables\n\n"
+                "- DISCORD_TOKEN — токен Discord-бота.\n"
+                "- PORT — необов'язковий порт health endpoint (за замовчуванням 10000).\n"
+            )
+
+    print(        "[PROJECT GENERATION] "
         f"response_chars={len(result)} "
         f"finish_reason={generation_result.get('finish_reason')} "
         f"usage={generation_result.get('usage', {})} "
@@ -4150,11 +4174,10 @@ async def generate_software_project(client_task: str):
                 f"prompt_chars={len(repair_prompt)}"
             )
 
-        # Reserve a meaningful completion allowance for a complete file,
-        # not merely the provider's 256-token minimum. The TPM reservation
-        # helper will wait for this requested output budget when other calls
-        # temporarily occupy the shared rolling window.
-        repair_output_budget, max_repair_input_tokens = groq_request_budgets(3500)
+        # Keep the repair output budget smaller so source plus output fit the
+        # 8k-TPM window. A 3500-token reservation left only 3800 tokens for
+        # the prompt and rejected ordinary source-file repairs before API call.
+        repair_output_budget, max_repair_input_tokens = groq_request_budgets(1800)
         if repair_input_estimate > max_repair_input_tokens:
             message = (
                 "Автоматичне виправлення зупинено до запиту Groq: навіть "
@@ -4184,7 +4207,7 @@ async def generate_software_project(client_task: str):
             )
             validation_errors.append(
                 f"Раунд виправлення {repair_round}: запит до Groq не виконано "
-                f"({type(repair_error).__name__})."
+                f"({type(repair_error).__name__}; {safe_error_detail(repair_error)})."
             )
             error_detail = str(repair_error).lower()
             if "завеликий" in error_detail or "tpm" in error_detail:
