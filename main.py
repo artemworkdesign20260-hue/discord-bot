@@ -5684,9 +5684,16 @@ async def process_order(
 # ============================================================
 
 @bot.event
+async def on_connect():
+    # Confirms that the Discord Gateway WebSocket handshake succeeded.
+    print("[DISCORD] Gateway connected; waiting for READY event.", flush=True)
+
+
+@bot.event
 async def on_ready():
     global discord_ready
     discord_ready = True
+    print("[DISCORD] READY event received.", flush=True)
     print(
         "========================================"
     )
