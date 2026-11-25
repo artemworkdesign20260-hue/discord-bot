@@ -4032,7 +4032,8 @@ async def generate_software_project(client_task: str):
                 "- PORT — необов'язковий порт health endpoint (за замовчуванням 10000).\n"
             )
 
-    print(        "[PROJECT GENERATION] "
+    print(
+        "[PROJECT GENERATION] "
         f"response_chars={len(result)} "
         f"finish_reason={generation_result.get('finish_reason')} "
         f"usage={generation_result.get('usage', {})} "
