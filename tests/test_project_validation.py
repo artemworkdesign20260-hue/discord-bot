@@ -1,0 +1,681 @@
+import os
+import unittest
+from unittest.mock import AsyncMock, patch
+
+# main.py validates its required configuration at import time. These dummy
+# values are used only by the unit-test process; no network connection starts.
+os.environ.setdefault("DISCORD_TOKEN", "unit-test-discord-token")
+os.environ.setdefault("GROQ_API_KEY", "unit-test-groq-key")
+os.environ.setdefault("CLIENT_CHANNEL_ID", "123456789")
+os.environ.setdefault("GROX_OWNER_ID", "123456789")
+os.environ.setdefault(
+    "GROX_DATABASE_URL",
+    "postgresql://unit_test:unit_test@127.0.0.1:5432/unit_test",
+)
+
+from main import contains_credential_request, continue_truncated_groq_output, detect_bot_platform, generated_project_branch, groq_request_budgets, is_order_message, is_revision_request, is_same_origin_url, is_website_project, website_navigation_failure, has_meaningful_page_content, missing_required_integration_settings, parse_retry_after_seconds, reserve_groq_tokens, select_render_owner_id, validate_generated_project, is_safe_project_file_path, extract_marked_project_files, vercel_project_name
+
+
+class GeneratedProjectFileParsingTests(unittest.TestCase):
+    def test_extracts_nested_files_and_required_files(self):
+        response = (
+            "===FILE: main.py===\nprint('ready')\n"
+            "===FILE: src/bot/worker.py===\nasync def run():\n    return True\n"
+            "===FILE: requirements.txt===\ndiscord.py>=2.0\n"
+            "===FILE: README.md===\nDiscord setup and Environment Variables\n"
+        )
+        files = extract_marked_project_files(response)
+        self.assertEqual(
+            set(files),
+            {"main.py", "src/bot/worker.py", "requirements.txt", "README.md"},
+        )
+        self.assertIn("async def run()", files["src/bot/worker.py"])
+
+    def test_ignores_unsafe_paths_in_markers(self):
+        response = (
+            "===FILE: ../escape.py===\nprint('bad')\n"
+            "===FILE: main.py===\nprint('safe')\n"
+        )
+        files = extract_marked_project_files(response)
+        self.assertEqual(files, {"main.py": "print('safe')"})
+
+    def test_rejects_duplicate_file_markers_instead_of_silently_overwriting(self):
+        response = (
+            "===FILE: src/worker.py===\nprint('first')\n"
+            "===FILE: src/worker.py===\nprint('second')\n"
+        )
+        files, errors = extract_marked_project_files(response, return_errors=True)
+        self.assertNotIn("src/worker.py", files)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("більше одного разу", errors[0])
+
+    def test_rejects_case_insensitive_duplicate_file_markers(self):
+        response = (
+            "===FILE: src/Worker.py===\nprint('first')\n"
+            "===FILE: src/worker.py===\nprint('second')\n"
+        )
+        files, errors = extract_marked_project_files(response, return_errors=True)
+        self.assertEqual(files, {})
+        self.assertEqual(len(errors), 1)
+
+    def test_extracts_files_wrapped_in_code_fences(self):
+        response = (
+            "===FILE: src/config.json===\n"
+            "```json\n{\n  \"enabled\": true\n}\n```\n"
+        )
+        files = extract_marked_project_files(response)
+        self.assertIn("src/config.json", files)
+        self.assertIn('"enabled": true', files["src/config.json"])
+
+
+class GeneratedProjectValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.files = {
+            "main.py": "print('hello')\n",
+            "requirements.txt": "# no third-party dependencies\n",
+            "README.md": "Project setup and environment variables.\n",
+        }
+
+    def test_accepts_simple_valid_project(self):
+        self.assertEqual(
+            validate_generated_project(self.files),
+            [],
+        )
+
+    def test_checks_syntax_of_secondary_python_files(self):
+        self.files["helper.py"] = "def broken_function(:\n    pass\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("helper.py" in error and "Синтаксична помилка" in error for error in errors))
+
+    def test_checks_syntax_of_nested_python_modules(self):
+        self.files["src/bot/worker.py"] = "def broken_function(:\n    pass\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("src/bot/worker.py" in error and "Синтаксична помилка" in error for error in errors))
+
+    def test_accepts_nested_project_paths(self):
+        for path in ("src/bot.py", "tests/test_bot.py", ".github/workflows/ci.yml", ".env.example"):
+            with self.subTest(path=path):
+                self.assertTrue(is_safe_project_file_path(path))
+
+    def test_rejects_unsafe_project_paths(self):
+        for path in ("../secrets.txt", "/etc/passwd", "src/../../escape.py", "src\\bot.py", "C:/temp/file.py", "src//bot.py"):
+            with self.subTest(path=path):
+                self.assertFalse(is_safe_project_file_path(path))
+
+    def test_rejects_case_insensitive_duplicate_paths(self):
+        self.files["src/Bot.py"] = "VALUE = 1\n"
+        self.files["src/bot.py"] = "VALUE = 2\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("Дубльований шлях" in error for error in errors))
+
+    def test_rejects_project_with_too_many_files(self):
+        files = dict(self.files)
+        files.update({f"modules/module_{index}.py": "VALUE = 1\n" for index in range(98)})
+        errors = validate_generated_project(files)
+        self.assertTrue(any("понад 100 файлів" in error for error in errors))
+
+    def test_detects_aliased_os_system_import(self):
+        self.files["main.py"] = "from os import system as run_command\nrun_command('whoami')\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("небезпечної функції run_command" in error for error in errors))
+
+    def test_detects_aliased_os_popen(self):
+        self.files["helper.py"] = "import os as operating_system\noperating_system.popen('id')\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("os.popen" in error for error in errors))
+
+    def test_detects_subprocess_in_secondary_file(self):
+        self.files["worker.py"] = "from subprocess import run\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("worker.py" in error and "subprocess" in error for error in errors))
+
+    def test_detects_internal_secret_access_through_environ_get(self):
+        self.files["helper.py"] = "import os as operating_system\noperating_system.environ.get('GITHUB_TOKEN')\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("GITHUB_TOKEN" in error for error in errors))
+
+    def test_allows_bot2_database_url(self):
+        self.files["main.py"] = "import os\nDATABASE_URL = os.getenv('DATABASE_URL')\n"
+        errors = validate_generated_project(self.files)
+        self.assertFalse(any("DATABASE_URL" in error for error in errors))
+
+    def test_does_not_flag_comments_or_string_literals(self):
+        self.files["main.py"] = (
+            "# subprocess and os.system are mentioned in this comment\n"
+            "message = 'os.system(\\'not executed\\')'\n"
+        )
+        errors = validate_generated_project(self.files)
+        self.assertFalse(any("subprocess" in error or "os.system" in error for error in errors))
+
+
+    def test_checks_known_external_import_dependencies(self):
+        self.files["main.py"] = "import aiohttp\n"
+        errors = validate_generated_project(self.files)
+        self.assertTrue(any("aiohttp" in error and "requirements.txt" in error for error in errors))
+
+    def test_accepts_declared_external_import_dependency(self):
+        self.files["main.py"] = "import aiohttp\n"
+        self.files["requirements.txt"] = "aiohttp>=3.9\n"
+        errors = validate_generated_project(self.files)
+        self.assertFalse(any("aiohttp" in error for error in errors))
+
+
+class WebsiteContentTests(unittest.TestCase):
+    def test_empty_semantic_wrappers_do_not_count_as_page_content(self):
+        self.assertFalse(has_meaningful_page_content("   ", 0))
+
+    def test_visible_text_counts_as_page_content(self):
+        self.assertTrue(has_meaningful_page_content("Welcome to our shop", 0))
+
+    def test_visible_media_or_form_controls_count_as_page_content(self):
+        self.assertTrue(has_meaningful_page_content("", 1))
+
+
+class WebsiteNavigationFailureTests(unittest.TestCase):
+    def test_navigation_failure_is_infrastructure_error(self):
+        result = website_navigation_failure(TimeoutError("preview timed out"))
+        self.assertFalse(result["success"])
+        self.assertTrue(result["infra_error"])
+        self.assertIn("TimeoutError", result["report"])
+        self.assertNotIn("preview timed out", result["report"])
+
+
+class WebsiteOriginTests(unittest.TestCase):
+    def test_accepts_same_origin_url(self):
+        self.assertTrue(
+            is_same_origin_url("https://example.com/assets/app.js", "https://example.com/")
+        )
+
+    def test_accepts_default_https_port_equivalence(self):
+        self.assertTrue(
+            is_same_origin_url("https://example.com:443/app.js", "https://example.com/")
+        )
+
+    def test_rejects_host_with_matching_prefix(self):
+        self.assertFalse(
+            is_same_origin_url(
+                "https://example.com.attacker.invalid/app.js",
+                "https://example.com/",
+            )
+        )
+
+    def test_rejects_different_scheme_or_port(self):
+        self.assertFalse(is_same_origin_url("http://example.com/app.js", "https://example.com/"))
+        self.assertFalse(is_same_origin_url("https://example.com:8443/app.js", "https://example.com/"))
+
+    def test_rejects_malformed_url(self):
+        self.assertFalse(is_same_origin_url("https://[invalid", "https://example.com/"))
+
+
+class RenderOwnerSelectionTests(unittest.TestCase):
+    def test_selects_the_only_available_owner(self):
+        self.assertEqual(
+            select_render_owner_id([{"id": "workspace-1"}]),
+            "workspace-1",
+        )
+
+    def test_requires_explicit_owner_when_multiple_are_available(self):
+        with self.assertRaises(RuntimeError):
+            select_render_owner_id([{"id": "personal"}, {"id": "workspace"}])
+
+    def test_selects_configured_nested_owner(self):
+        self.assertEqual(
+            select_render_owner_id(
+                [{"owner": {"id": "workspace-1"}}, {"id": "workspace-2"}],
+                "workspace-1",
+            ),
+            "workspace-1",
+        )
+
+
+class ProjectRoutingTests(unittest.TestCase):
+    def test_website_with_discord_integration_routes_to_website(self):
+        self.assertTrue(
+            is_website_project("Створи сайт компанії з інтеграцією Discord.")
+        )
+
+    def test_discord_bot_with_website_dashboard_routes_to_bot(self):
+        self.assertFalse(
+            is_website_project("Створи Discord bot з вебпанеллю керування.")
+        )
+
+    def test_discord_bot_with_telegram_notifications_stays_discord(self):
+        self.assertEqual(
+            detect_bot_platform("Створи Discord bot, який надсилає сповіщення в Telegram."),
+            "Discord",
+        )
+
+    def test_telegram_bot_with_discord_notifications_stays_telegram(self):
+        self.assertEqual(
+            detect_bot_platform("Створи Telegram bot з повідомленнями в Discord."),
+            "Telegram",
+        )
+
+    def test_bot2_is_always_discord(self):
+        self.assertEqual(detect_bot_platform("Bot 2 з інтеграцією Telegram"), "Discord")
+
+
+class RevisionIntentTests(unittest.TestCase):
+    def test_question_about_color_is_not_a_revision(self):
+        self.assertFalse(is_revision_request("Який колір краще обрати для кнопки?"))
+
+    def test_question_about_button_is_not_a_revision(self):
+        self.assertFalse(is_revision_request("Поясни, для чого ця кнопка."))
+
+    def test_explicit_button_change_is_a_revision(self):
+        self.assertTrue(is_revision_request("Зроби кнопку синьою."))
+
+    def test_broken_button_is_a_revision(self):
+        self.assertTrue(is_revision_request("Кнопка не працює."))
+
+    def test_add_section_is_a_revision(self):
+        self.assertTrue(is_revision_request("Додай секцію контактів."))
+
+
+class CredentialRequestDetectionTests(unittest.TestCase):
+    def test_key_features_are_not_a_credential_request(self):
+        self.assertFalse(contains_credential_request("Опиши ключові функції застосунку."))
+
+    def test_api_key_is_a_credential_request(self):
+        self.assertTrue(contains_credential_request("Надішліть API key для інтеграції."))
+
+    def test_private_key_is_a_credential_request(self):
+        self.assertTrue(contains_credential_request("Потрібен приватний ключ доступу."))
+
+
+class GroqContinuationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_appends_continuation(self):
+        with patch(
+            "main.groq_request",
+            new=AsyncMock(return_value={"content": "def", "finish_reason": "stop"}),
+        ):
+            result, still_truncated = await continue_truncated_groq_output(
+                "abc", "task context", "plain text"
+            )
+        self.assertEqual(result, "abcdef")
+        self.assertFalse(still_truncated)
+
+    async def test_removes_repeated_overlap(self):
+        with patch(
+            "main.groq_request",
+            new=AsyncMock(return_value={"content": "defghi", "finish_reason": "stop"}),
+        ):
+            result, still_truncated = await continue_truncated_groq_output(
+                "abcdef", "task context", "plain text"
+            )
+        self.assertEqual(result, "abcdefghi")
+        self.assertFalse(still_truncated)
+
+    async def test_removes_repeated_overlap_longer_than_3000_characters(self):
+        repeated = "x" * 4500
+        with patch(
+            "main.groq_request",
+            new=AsyncMock(return_value={"content": repeated + "continued", "finish_reason": "stop"}),
+        ):
+            result, still_truncated = await continue_truncated_groq_output(
+                "prefix" + repeated, "task context", "plain text"
+            )
+        self.assertEqual(result, "prefix" + repeated + "continued")
+        self.assertFalse(still_truncated)
+
+    async def test_reports_still_truncated_after_bounded_rounds(self):
+        with patch(
+            "main.groq_request",
+            new=AsyncMock(return_value={"content": "more", "finish_reason": "length"}),
+        ) as mocked:
+            result, still_truncated = await continue_truncated_groq_output(
+                "start", "task context", "plain text", max_rounds=3
+            )
+        self.assertEqual(mocked.await_count, 3)
+        self.assertTrue(still_truncated)
+        self.assertTrue(result.startswith("start"))
+
+    async def test_preflights_and_shrinks_continuation_prompt_to_tpm_budget(self):
+        with (
+            patch("main.GROQ_TPM_LIMIT", 1000),
+            patch("main.GROQ_TPM_RESERVE", 100),
+            patch("main.GROQ_MIN_COMPLETION_TOKENS", 100),
+            patch("main.estimate_groq_prompt_tokens", side_effect=lambda prompt: len(prompt) // 2),
+            patch(
+                "main.groq_request",
+                new=AsyncMock(return_value={"content": "continued", "finish_reason": "stop"}),
+            ) as mocked,
+        ):
+            result, still_truncated = await continue_truncated_groq_output(
+                "x" * 10000, "context " * 10000, "return the rest"
+            )
+
+        self.assertFalse(still_truncated)
+        self.assertTrue(result.endswith("continued"))
+        self.assertEqual(mocked.await_count, 1)
+        prompt = mocked.await_args.args[0]
+        self.assertLessEqual(len(prompt) // 2, 800)
+        self.assertLessEqual(mocked.await_args.kwargs["max_output_tokens"], 5000)
+
+    async def test_skips_continuation_when_even_minimum_prompt_exceeds_budget(self):
+        with (
+            patch("main.GROQ_TPM_LIMIT", 200),
+            patch("main.GROQ_TPM_RESERVE", 100),
+            patch("main.GROQ_MIN_COMPLETION_TOKENS", 100),
+            patch("main.estimate_groq_prompt_tokens", return_value=999),
+            patch("main.groq_request", new=AsyncMock()) as mocked,
+        ):
+            result, still_truncated = await continue_truncated_groq_output(
+                "partial", "context", "contract"
+            )
+
+        self.assertEqual(result, "partial")
+        self.assertTrue(still_truncated)
+        mocked.assert_not_awaited()
+
+
+class Bot2ValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.files = {
+            "main.py": (
+                "import discord\n"
+                "import sqlite3\n"
+                "BOT2_MIN_GUILD_MEMBERS = 500\n"
+                "async def on_message(message):\n    pass\n"
+                "def is_moderator(member):\n    return member.guild_permissions.manage_messages\n"
+                "EU_COUNTRIES = ['DE', 'PL']\n"
+                "def search_requests():\n    pass\n"
+                "processed_message_ids = set()\n"
+                "async def health_handler():\n    pass\n"
+            ),
+            "requirements.txt": "discord.py>=2.0\n",
+            "README.md": "Discord bot setup and Environment Variables.\n",
+        }
+
+    def test_accepts_required_bot2_ast_signals(self):
+        errors = validate_generated_project(
+            self.files,
+            bot2=True,
+            require_discord=True,
+        )
+        self.assertEqual(errors, [])
+
+    def test_rejects_unconditional_allow_all_moderator_function(self):
+        self.files["main.py"] = self.files["main.py"].replace(
+            "def is_moderator(member):\n    return member.guild_permissions.manage_messages",
+            "def is_moderator(member):\n    return True",
+        )
+        errors = validate_generated_project(
+            self.files,
+            bot2=True,
+            require_discord=True,
+        )
+        self.assertTrue(any("безумовно повертає True" in error for error in errors))
+
+    def test_comments_and_strings_cannot_fake_bot2_features(self):
+        self.files["main.py"] = (
+            "# import discord on_message member_count moderator approval\n"
+            "description = '500 sqlite EU search duplicate /health'\n"
+        )
+        errors = validate_generated_project(
+            self.files,
+            bot2=True,
+            require_discord=True,
+        )
+        self.assertGreaterEqual(len(errors), 5)
+
+
+class NewOrderIntentTests(unittest.TestCase):
+    def test_casual_site_mention_does_not_open_order(self):
+        self.assertFalse(is_order_message("У мене є сайт і бот, вони працюють."))
+
+    def test_broken_existing_bot_does_not_open_new_order(self):
+        self.assertFalse(is_order_message("Мій bot is down."))
+
+    def test_explicit_create_website_opens_order(self):
+        self.assertTrue(is_order_message("Створи сайт для магазину."))
+
+    def test_need_discord_bot_opens_order(self):
+        self.assertTrue(is_order_message("Мені потрібен Discord bot."))
+
+    def test_build_web_app_opens_order(self):
+        self.assertTrue(is_order_message("Build a web app for my project."))
+
+
+class IntegrationPreflightTests(unittest.TestCase):
+    def test_website_only_requires_vercel(self):
+        with patch("main.VERCEL_TOKEN", None):
+            self.assertEqual(
+                missing_required_integration_settings("Створи сайт для магазину."),
+                ["VERCEL_TOKEN"],
+            )
+
+    def test_discord_bot_reports_missing_owner_integrations(self):
+        with (
+            patch("main.GITHUB_TOKEN", None),
+            patch("main.GITHUB_REPO", None),
+            patch("main.RENDER_API_KEY", None),
+            patch("main.GENERATED_DISCORD_TOKEN", None),
+        ):
+            missing = missing_required_integration_settings("Створи Discord bot.")
+        self.assertEqual(
+            missing,
+            ["GITHUB_TOKEN", "GITHUB_REPO", "RENDER_API_KEY", "GROX_BUILDER_DISCORD_TOKEN"],
+        )
+
+    def test_unsupported_platform_fails_before_questionnaire(self):
+        with (
+            patch("main.GITHUB_TOKEN", None),
+            patch("main.GITHUB_REPO", None),
+            patch("main.RENDER_API_KEY", None),
+            patch("main.GENERATED_DISCORD_TOKEN", None),
+        ):
+            missing = missing_required_integration_settings("Створи Telegram bot.")
+        self.assertEqual(
+            missing,
+            ["автоматичне розгортання зараз підтримує лише Discord-ботів"],
+        )
+
+
+class VercelProjectNamingTests(unittest.TestCase):
+    def test_project_name_is_stable_for_an_order(self):
+        self.assertEqual(vercel_project_name(1001), "grox-order-1001")
+        self.assertEqual(vercel_project_name("1001"), "grox-order-1001")
+
+
+class AdditionalDangerousApiTests(unittest.TestCase):
+    def make_files(self, main_code):
+        return {
+            "main.py": main_code,
+            "requirements.txt": "# no third-party dependencies\n",
+            "README.md": "Project environment configuration.\n",
+        }
+
+    def test_detects_asyncio_subprocess_shell(self):
+        errors = validate_generated_project(
+            self.make_files('import asyncio\nasyncio.create_subprocess_shell("id")\n')
+        )
+        self.assertTrue(any("asyncio" in error for error in errors))
+
+    def test_detects_aliased_os_posix_spawn(self):
+        errors = validate_generated_project(
+            self.make_files('from os import posix_spawn as launch\nlaunch("sh", ["sh"])\n')
+        )
+        self.assertTrue(any("posix_spawn" in error for error in errors))
+
+
+class GroqRequestBudgetTests(unittest.TestCase):
+    def test_repair_budget_leaves_room_for_a_complete_file_response(self):
+        with (
+            patch("main.GROQ_TPM_LIMIT", 8000),
+            patch("main.GROQ_TPM_RESERVE", 700),
+            patch("main.GROQ_MIN_COMPLETION_TOKENS", 256),
+        ):
+            output_budget, input_budget = groq_request_budgets(3500)
+
+        self.assertEqual(output_budget, 3500)
+        self.assertEqual(input_budget, 3800)
+
+    def test_budget_scales_down_for_smaller_tpm_limits(self):
+        with (
+            patch("main.GROQ_TPM_LIMIT", 1000),
+            patch("main.GROQ_TPM_RESERVE", 100),
+            patch("main.GROQ_MIN_COMPLETION_TOKENS", 100),
+        ):
+            output_budget, input_budget = groq_request_budgets(3500)
+
+        self.assertEqual(output_budget, 450)
+        self.assertEqual(input_budget, 450)
+
+
+class GroqTokenReservationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_waits_for_requested_completion_budget_instead_of_sending_tiny_reply(self):
+        class FakeTransaction:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class FakeConnection:
+            def __init__(self):
+                self.usage_values = iter([500, 0])
+                self.inserted_reservations = []
+
+            def transaction(self):
+                return FakeTransaction()
+
+            async def execute(self, query, *args):
+                return "DELETE 0"
+
+            async def fetchval(self, query, *args):
+                if "pg_advisory_xact_lock" in query:
+                    return None
+                if "COALESCE(SUM(reserved_tokens)" in query:
+                    return next(self.usage_values)
+                if "EXTRACT(EPOCH FROM" in query:
+                    return 0.1
+                if "INSERT INTO grox_groq_token_usage" in query:
+                    self.inserted_reservations.append(args[0])
+                    return 77
+                raise AssertionError(f"Unexpected SQL in token reservation test: {query}")
+
+        class FakeAcquire:
+            def __init__(self, connection):
+                self.connection = connection
+
+            async def __aenter__(self):
+                return self.connection
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class FakePool:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def acquire(self):
+                return FakeAcquire(self.connection)
+
+        connection = FakeConnection()
+        with (
+            patch("main.db_pool", FakePool(connection)),
+            patch("main.GROQ_TPM_LIMIT", 1000),
+            patch("main.GROQ_TPM_RESERVE", 100),
+            patch("main.GROQ_MIN_COMPLETION_TOKENS", 100),
+            patch("main.estimate_groq_prompt_tokens", return_value=200),
+            patch("main.asyncio.sleep", new=AsyncMock()) as mocked_sleep,
+        ):
+            output_tokens, reservation_id, input_tokens = await reserve_groq_tokens(
+                "repair prompt", 500
+            )
+
+        self.assertEqual(mocked_sleep.await_count, 1)
+        self.assertEqual(output_tokens, 500)
+        self.assertEqual(reservation_id, 77)
+        self.assertEqual(input_tokens, 200)
+        self.assertEqual(connection.inserted_reservations, [700])
+
+    async def test_caps_requested_completion_at_configured_tpm_limit(self):
+        class FakeTransaction:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class FakeConnection:
+            def __init__(self):
+                self.inserted_reservations = []
+
+            def transaction(self):
+                return FakeTransaction()
+
+            async def execute(self, query, *args):
+                return "DELETE 0"
+
+            async def fetchval(self, query, *args):
+                if "pg_advisory_xact_lock" in query:
+                    return None
+                if "COALESCE(SUM(reserved_tokens)" in query:
+                    return 0
+                if "INSERT INTO grox_groq_token_usage" in query:
+                    self.inserted_reservations.append(args[0])
+                    return 78
+                raise AssertionError(f"Unexpected SQL in token reservation test: {query}")
+
+        class FakeAcquire:
+            def __init__(self, connection):
+                self.connection = connection
+
+            async def __aenter__(self):
+                return self.connection
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class FakePool:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def acquire(self):
+                return FakeAcquire(self.connection)
+
+        connection = FakeConnection()
+        with (
+            patch("main.db_pool", FakePool(connection)),
+            patch("main.GROQ_TPM_LIMIT", 1000),
+            patch("main.GROQ_TPM_RESERVE", 100),
+            patch("main.GROQ_MIN_COMPLETION_TOKENS", 100),
+            patch("main.estimate_groq_prompt_tokens", return_value=200),
+        ):
+            output_tokens, reservation_id, input_tokens = await reserve_groq_tokens(
+                "repair prompt", 5000
+            )
+
+        self.assertEqual(output_tokens, 700)
+        self.assertEqual(reservation_id, 78)
+        self.assertEqual(input_tokens, 200)
+        self.assertEqual(connection.inserted_reservations, [900])
+
+
+class RetryAfterParsingTests(unittest.TestCase):
+    def test_parses_numeric_seconds(self):
+        self.assertEqual(parse_retry_after_seconds("3.5"), 3.5)
+
+    def test_parses_compound_minutes_and_seconds(self):
+        self.assertEqual(parse_retry_after_seconds("try again in 1m20s"), 80.0)
+
+    def test_parses_milliseconds(self):
+        self.assertAlmostEqual(parse_retry_after_seconds("retry after 500ms"), 0.5)
+
+
+class GeneratedProjectBranchTests(unittest.TestCase):
+    def test_each_project_gets_a_separate_branch(self):
+        self.assertEqual(
+            generated_project_branch("generated_projects/order_1001_ab12cd"),
+            "generated-projects/order_1001_ab12cd",
+        )
+
+    def test_rejects_empty_project_path(self):
+        with self.assertRaises(ValueError):
+            generated_project_branch("")
+
+
+if __name__ == "__main__":
+    unittest.main()

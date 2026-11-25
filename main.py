@@ -1,5 +1,9 @@
 import asyncio
+import signal
 import ast
+import sys
+import time
+import hashlib
 import os
 import re
 import uuid
@@ -7,7 +11,7 @@ import random
 import base64
 import json
 from dataclasses import asdict, dataclass
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import aiohttp
 import asyncpg
@@ -31,9 +35,15 @@ VERCEL_TOKEN = os.getenv("VERCEL_TOKEN")
 # Optional GitHub/Render integration for generated software bots.
 # These are intentionally optional so Grox can still run for website-only work.
 RENDER_API_KEY = os.getenv("RENDER_API_KEY")
+RENDER_OWNER_ID = os.getenv("RENDER_OWNER_ID", "").strip()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
-GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip() or "main"
+# Keep generated-project commits off Grox's auto-deploy branch by default.
+GROX_PROJECTS_BRANCH = (
+    os.getenv("GROX_PROJECTS_BRANCH", "generated-projects").strip().strip("/")
+    or "generated-projects"
+)
 
 # Optional Telegram credentials passed to generated Telegram projects.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -139,6 +149,10 @@ POST_DELIVERY_TIMEOUT = int(
     os.getenv("POST_DELIVERY_TIMEOUT", "86400")
 )
 
+ORDER_STALE_AFTER_SECONDS = int(
+    os.getenv("ORDER_STALE_AFTER_SECONDS", "600")
+)
+
 # Maximum number of clarification rounds before Grox builds the final TЗ.
 MAX_REQUIREMENT_ROUNDS = int(
     os.getenv("MAX_REQUIREMENT_ROUNDS", "3")
@@ -238,13 +252,18 @@ intents.guilds = True
 
 bot = commands.Bot(
     command_prefix="!",
-    intents=intents
+    intents=intents,
+    allowed_mentions=discord.AllowedMentions.none(),
 )
 
 
 # ============================================================
 # ORDER DATA
 # ============================================================
+
+class ActiveOrderLimitReached(Exception):
+    """Raised when the database-wide per-client active order limit is reached."""
+
 
 @dataclass
 class Order:
@@ -270,10 +289,13 @@ class Order:
 
     # Generated software-bot deployment information.
     project_repo_path: str | None = None
+    project_branch: str | None = None
     deployment_url: str | None = None
     render_service_id: str | None = None
 
     status: str = "WAITING_TZ"
+    delivered_at: int | None = None
+    post_delivery_expires_at: int | None = None
 
     # Used to prevent stale/duplicate approval handling.
     approval_message_id: int = 0
@@ -281,20 +303,19 @@ class Order:
 
 orders: dict[int, Order] = {}
 active_orders: set[int] = set()
+processing_tasks: set[asyncio.Task] = set()
+post_delivery_tasks: set[int] = set()
 
 # Number of currently open orders per client (see MAX_ACTIVE_ORDERS_PER_USER).
 active_clients: dict[int, int] = {}
 
-# Names of Render services deployed with the shared Discord builder token.
-builder_token_services: list[str] = []
 
-next_order_id = 1000
 db_pool: asyncpg.Pool | None = None
 
 
 async def initialize_database():
     """Create Grox's own tables and restore saved order records."""
-    global db_pool, next_order_id
+    global db_pool
 
     if not GROX_DATABASE_URL:
         raise RuntimeError("Відсутня Environment Variable: GROX_DATABASE_URL")
@@ -322,35 +343,79 @@ async def initialize_database():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        await connection.execute(
+            "CREATE SEQUENCE IF NOT EXISTS grox_order_id_seq START WITH 1000"
+        )
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS grox_groq_token_usage (
+                id BIGSERIAL PRIMARY KEY,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                reserved_tokens INTEGER NOT NULL CHECK (reserved_tokens > 0)
+            )
+            """
+        )
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS grox_builder_token_usage (
+                token_fingerprint TEXT PRIMARY KEY,
+                order_id BIGINT NOT NULL,
+                service_name TEXT NOT NULL,
+                service_id TEXT,
+                status TEXT NOT NULL DEFAULT 'RESERVED',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        # Multiple Render instances can start during a deploy. Serialize
+        # sequence synchronization and never move it behind an ID already used.
+        async with connection.transaction():
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(8472011, 1)"
+            )
+            await connection.fetchval(
+                """
+                SELECT setval(
+                    'grox_order_id_seq',
+                    GREATEST(
+                        (SELECT last_value FROM grox_order_id_seq),
+                        COALESCE((SELECT MAX(order_id) FROM grox_orders), 1000)
+                    ),
+                    true
+                )
+                """
+            )
         rows = await connection.fetch(
             "SELECT payload FROM grox_orders ORDER BY order_id"
         )
 
     restored = 0
+    skipped_corrupt = 0
     for row in rows:
-        payload = row["payload"]
-        if isinstance(payload, str):
-            payload = json.loads(payload)
-        order = Order(**payload)
+        try:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if not isinstance(payload, dict):
+                raise ValueError("Order payload is not an object.")
+            order = Order(**payload)
+        except Exception as error:
+            skipped_corrupt += 1
+            print(
+                "[DATABASE WARNING] Skipped one malformed saved order: "
+                f"{type(error).__name__}; record details omitted."
+            )
+            continue
         orders[order.order_id] = order
         restored += 1
 
-    if orders:
-        next_order_id = max(orders)
-
-    # In-memory Discord listeners/tasks cannot survive a Render restart.
-    # Mark unfinished orders as interrupted instead of leaving them falsely
-    # looking active forever after the process comes back online.
-    interrupted = 0
-    for order in orders.values():
-        if order.status in {"WAITING_TZ", "IN_PROGRESS"}:
-            order.status = "INTERRUPTED"
-            await save_order(order)
-            interrupted += 1
-
+    # Active orders are recovered by a stale-heartbeat worker. This avoids
+    # marking an order interrupted while an older Render instance is still
+    # processing it during a zero-downtime deploy.
     print(
         f"[DATABASE] Neon connected; restored {restored} saved order(s); "
-        f"marked {interrupted} interrupted order(s)."
+        f"skipped {skipped_corrupt} malformed order(s); "
+        "stale-order recovery worker will monitor unfinished orders."
     )
 
 
@@ -389,30 +454,264 @@ async def save_order(order: Order):
         )
 
 
+async def reserve_builder_token(
+    token_fingerprint: str,
+    order_id: int,
+    service_name: str,
+):
+    """Persistently reserve a Discord token so it cannot run two bot services."""
+    if db_pool is None:
+        raise RuntimeError("Grox database is not initialized.")
+    async with db_pool.acquire() as connection:
+        async with connection.transaction():
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(8472011, 3)"
+            )
+            existing = await connection.fetchrow(
+                """
+                SELECT service_name, service_id, status
+                FROM grox_builder_token_usage
+                WHERE token_fingerprint = $1
+                """,
+                token_fingerprint,
+            )
+            if existing is not None:
+                return False, dict(existing)
+            await connection.execute(
+                """
+                INSERT INTO grox_builder_token_usage (
+                    token_fingerprint, order_id, service_name, status
+                )
+                VALUES ($1, $2, $3, 'RESERVED')
+                """,
+                token_fingerprint,
+                order_id,
+                service_name,
+            )
+            return True, None
+
+
+async def release_builder_token_reservation(
+    token_fingerprint: str,
+    order_id: int,
+):
+    """Release only an unused reservation before any Render service exists."""
+    if db_pool is None:
+        return
+    await db_pool.execute(
+        """
+        DELETE FROM grox_builder_token_usage
+        WHERE token_fingerprint = $1
+          AND order_id = $2
+          AND service_id IS NULL
+          AND status = 'RESERVED'
+        """,
+        token_fingerprint,
+        order_id,
+    )
+
+
+async def update_builder_token_service(
+    token_fingerprint: str,
+    order_id: int,
+    service_id: str,
+    service_name: str,
+    status: str = "CREATED",
+):
+    if db_pool is None:
+        raise RuntimeError("Grox database is not initialized.")
+    await db_pool.execute(
+        """
+        UPDATE grox_builder_token_usage
+        SET service_id = $1, service_name = $2, status = $3
+        WHERE token_fingerprint = $4 AND order_id = $5
+        """,
+        service_id,
+        service_name,
+        status,
+        token_fingerprint,
+        order_id,
+    )
+
+
+async def heartbeat_order(order_id: int):
+    """Keep a live order fresh so another Render instance will not recover it."""
+    while True:
+        await asyncio.sleep(45)
+        if db_pool is None:
+            return
+        try:
+            await db_pool.execute(
+                """
+                UPDATE grox_orders
+                SET updated_at = NOW()
+                WHERE order_id = $1 AND status IN ('WAITING_TZ', 'IN_PROGRESS')
+                """,
+                order_id,
+            )
+        except Exception as error:
+            print(
+                f"[ORDER HEARTBEAT] order=#{order_id} "
+                f"database update failed: {type(error).__name__}."
+            )
+
+
+async def notify_interrupted_order(order: Order):
+    if not bot.is_ready() or not order.thread_id:
+        return
+    try:
+        channel = bot.get_channel(order.thread_id)
+        if channel is None:
+            channel = await bot.fetch_channel(order.thread_id)
+        if not isinstance(channel, discord.Thread):
+            return
+        if channel.archived:
+            await channel.edit(archived=False)
+        await channel.send(
+            "⚠️ **Попереднє виконання було перерване перезапуском Grox.**\n\n"
+            "Твоє технічне завдання та збережені файли залишилися в історії, "
+            "але автоматичне продовження перерваної генерації поки не підтримується. "
+            "Щоб продовжити роботу, надішли нове завдання."
+        )
+    except Exception as error:
+        print(
+            f"[ORDER RECOVERY] Could not notify order #{order.order_id}: "
+            f"{type(error).__name__}."
+        )
+
+
+async def recover_stale_orders():
+    """Mark orders interrupted only after their live-process heartbeat expires."""
+    while True:
+        await asyncio.sleep(60)
+        if db_pool is None:
+            return
+        try:
+            rows = await db_pool.fetch(
+                """
+                UPDATE grox_orders
+                SET status = 'INTERRUPTED',
+                    payload = jsonb_set(
+                        payload,
+                        '{status}',
+                        to_jsonb('INTERRUPTED'::text),
+                        true
+                    ),
+                    updated_at = NOW()
+                WHERE status IN ('WAITING_TZ', 'IN_PROGRESS')
+                  AND updated_at < NOW() - ($1 * INTERVAL '1 second')
+                RETURNING order_id
+                """,
+                ORDER_STALE_AFTER_SECONDS,
+            )
+            for row in rows:
+                order = orders.get(row["order_id"])
+                if order is not None:
+                    order.status = "INTERRUPTED"
+                    await notify_interrupted_order(order)
+            if rows:
+                print(
+                    f"[ORDER RECOVERY] Marked {len(rows)} stale order(s) as interrupted."
+                )
+        except Exception as error:
+            print(
+                f"[ORDER RECOVERY] Database scan failed: {type(error).__name__}."
+            )
+
+
 # ============================================================
 # ORDER HELPERS
 # ============================================================
 
-def create_order(message: discord.Message):
-    global next_order_id
+async def create_order(message: discord.Message) -> Order | None:
+    """Atomically allocate an order ID and reject duplicate Discord messages."""
+    if db_pool is None:
+        raise RuntimeError("Grox database is not initialized.")
 
-    next_order_id += 1
+    async with db_pool.acquire() as connection:
+        async with connection.transaction():
+            # Use the same advisory lock as startup sequence synchronization.
+            # This prevents a concurrent startup from rewinding the sequence
+            # between nextval() and a new order reservation.
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(8472011, 1)"
+            )
 
-    order = Order(
-        order_id=next_order_id,
-        discord_message_id=message.id,
-        client_id=message.author.id,
-        client_name=message.author.name,
-    )
+            existing_order_id = await connection.fetchval(
+                "SELECT order_id FROM grox_orders WHERE discord_message_id = $1",
+                message.id,
+            )
+            if existing_order_id is not None:
+                return None
+
+            # Enforce the per-client limit across overlapping Render instances,
+            # not only through each process's local active_clients dictionary.
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 8472011))",
+                str(message.author.id),
+            )
+            active_count = await connection.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM grox_orders
+                WHERE client_id = $1
+                  AND (
+                    status IN ('WAITING_TZ', 'IN_PROGRESS')
+                    OR (
+                        status = 'COMPLETED'
+                        AND CASE
+                            WHEN jsonb_typeof(payload->'post_delivery_expires_at') = 'number'
+                            THEN (payload->>'post_delivery_expires_at')::bigint
+                            ELSE 0
+                        END > EXTRACT(EPOCH FROM NOW())::bigint
+                    )
+                  )
+                """,
+                message.author.id,
+            )
+            if int(active_count or 0) >= MAX_ACTIVE_ORDERS_PER_USER:
+                raise ActiveOrderLimitReached(
+                    f"Client already has {active_count} active order(s)."
+                )
+
+            order_id = await connection.fetchval(
+                "SELECT nextval('grox_order_id_seq')"
+            )
+            order = Order(
+                order_id=order_id,
+                discord_message_id=message.id,
+                client_id=message.author.id,
+                client_name=message.author.name,
+            )
+            payload = json.dumps(asdict(order), ensure_ascii=False)
+            inserted_id = await connection.fetchval(
+                """
+                INSERT INTO grox_orders (
+                    order_id, discord_message_id, client_id, status, payload, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
+                ON CONFLICT (discord_message_id) DO NOTHING
+                RETURNING order_id
+                """,
+                order.order_id,
+                order.discord_message_id,
+                order.client_id,
+                order.status,
+                payload,
+            )
+
+    if inserted_id is None:
+        print(
+            f"[ORDER DUPLICATE] message={message.id} already exists in database; "
+            "skipping duplicate event."
+        )
+        return None
 
     orders[order.order_id] = order
-
     print(
         f"[ORDER CREATED] #{order.order_id} "
-        f"client={order.client_id} "
-        f"message={message.id}"
+        f"client={order.client_id} message={message.id}"
     )
-
     return order
 
 
@@ -616,7 +915,26 @@ def contains_service_keyword(text: str) -> bool:
 
 
 def is_order_message(text: str) -> bool:
-    return contains_service_keyword(text)
+    if not contains_service_keyword(text):
+        return False
+
+    creation_intent = (
+        "створи", "створити", "зроби", "зробити", "розроби", "розробити",
+        "напиши", "потрібен", "потрібна", "потрібно", "мені треба",
+        "хочу", "запрограмуй", "create", "build", "make", "develop",
+        "need", "i need", "i want",
+    )
+    if has_keyword(text, creation_intent):
+        return True
+
+    # Short task descriptions such as "сайт для магазину" are also valid
+    # starts; casual mentions such as "мій сайт не працює" are not.
+    task_description_starts = (
+        "бот для", "сайт для", "вебсайт для", "додаток для",
+        "скрипт для", "website for", "bot for", "app for",
+    )
+    normalized = (text or "").casefold().strip()
+    return any(phrase in normalized for phrase in task_description_starts)
 
 
 # ============================================================
@@ -696,7 +1014,15 @@ def extract_budget(text: str):
 # GROQ REQUEST
 # ============================================================
 
-GROQ_REQUEST_LOCK = asyncio.Lock()
+def groq_request_budgets(requested_output_tokens: int) -> tuple[int, int]:
+    """Return a safe completion target and the matching maximum input budget."""
+    available_tpm = GROQ_TPM_LIMIT - GROQ_TPM_RESERVE
+    minimum_output = GROQ_MIN_COMPLETION_TOKENS
+    desired_output = min(
+        max(minimum_output, int(requested_output_tokens)),
+        max(minimum_output, available_tpm // 2),
+    )
+    return desired_output, available_tpm - desired_output
 
 
 def estimate_groq_prompt_tokens(prompt: str) -> int:
@@ -713,6 +1039,150 @@ def estimate_groq_prompt_tokens(prompt: str) -> int:
     return max(200, int(non_ascii * 0.65 + ascii_chars * 0.4) + 200)
 
 
+async def reserve_groq_tokens(prompt: str, requested_output_tokens: int):
+    """Reserve a rolling 60-second token budget shared by all Grox instances."""
+    if db_pool is None:
+        raise RuntimeError("Grox database is not initialized; TPM budget cannot be coordinated.")
+
+    estimated_input_tokens = estimate_groq_prompt_tokens(prompt)
+    max_possible_output = GROQ_TPM_LIMIT - GROQ_TPM_RESERVE - estimated_input_tokens
+    if max_possible_output < GROQ_MIN_COMPLETION_TOKENS:
+        raise RuntimeError(
+            "Запит до Groq завеликий для поточного ліміту TPM. "
+            "Потрібно скоротити вхідний контекст або розбити завдання на частини. "
+            f"Оцінка вхідних токенів: {estimated_input_tokens}; "
+            f"ліміт: {GROQ_TPM_LIMIT}; резерв: {GROQ_TPM_RESERVE}."
+        )
+
+    while True:
+        wait_seconds = None
+        async with db_pool.acquire() as connection:
+            async with connection.transaction():
+                # Coordinate reservations across overlapping Render instances.
+                await connection.fetchval(
+                    "SELECT pg_advisory_xact_lock(8472011, 2)"
+                )
+                await connection.execute(
+                    "DELETE FROM grox_groq_token_usage "
+                    "WHERE created_at < NOW() - INTERVAL '60 seconds'"
+                )
+                used_tokens = await connection.fetchval(
+                    "SELECT COALESCE(SUM(reserved_tokens), 0) "
+                    "FROM grox_groq_token_usage"
+                )
+                available_output_tokens = (
+                    GROQ_TPM_LIMIT
+                    - GROQ_TPM_RESERVE
+                    - estimated_input_tokens
+                    - int(used_tokens or 0)
+                )
+
+                # Do not silently send a request with only the minimum
+                # completion budget when the caller needs a larger response.
+                # That behavior produced tiny, truncated project repairs while
+                # appearing to have successfully reserved TPM capacity.
+                target_output_tokens = min(
+                    max(GROQ_MIN_COMPLETION_TOKENS, int(requested_output_tokens)),
+                    max_possible_output,
+                )
+                if available_output_tokens >= target_output_tokens:
+                    output_tokens = target_output_tokens
+                    reservation_id = await connection.fetchval(
+                        """
+                        INSERT INTO grox_groq_token_usage (reserved_tokens)
+                        VALUES ($1)
+                        RETURNING id
+                        """,
+                        estimated_input_tokens + output_tokens,
+                    )
+                    return output_tokens, reservation_id, estimated_input_tokens
+
+                wait_seconds = await connection.fetchval(
+                    """
+                    SELECT EXTRACT(EPOCH FROM (
+                        MIN(created_at) + INTERVAL '60 seconds' - NOW()
+                    ))
+                    FROM grox_groq_token_usage
+                    """
+                )
+
+        delay = max(0.5, min(60.0, float(wait_seconds or 1.0) + 0.1))
+        print(
+            f"[GROQ TPM] Waiting for requested completion budget "
+            f"({target_output_tokens} tokens; currently available "
+            f"{max(0, available_output_tokens)}); retry in {delay:.1f}s."
+        )
+        await asyncio.sleep(delay)
+
+
+async def update_groq_token_reservation(reservation_id: int, usage):
+    """Replace a conservative reservation with provider-reported actual usage."""
+    if db_pool is None or not isinstance(usage, dict):
+        return
+    total_tokens = usage.get("total_tokens")
+    if not isinstance(total_tokens, int) or total_tokens <= 0:
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+            total_tokens = prompt_tokens + completion_tokens
+    if not isinstance(total_tokens, int) or total_tokens <= 0:
+        return
+    try:
+        await db_pool.execute(
+            "UPDATE grox_groq_token_usage SET reserved_tokens = $1 WHERE id = $2",
+            total_tokens,
+            reservation_id,
+        )
+    except Exception as error:
+        # Keep the original conservative reservation if usage reconciliation fails.
+        print(f"[GROQ TPM] Could not reconcile usage: {type(error).__name__}.")
+
+
+def parse_retry_after_seconds(value) -> float | None:
+    """Parse numeric seconds and compound provider delays such as 1m20s."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        numeric = float(raw)
+        return max(0.0, numeric)
+    except (TypeError, ValueError):
+        pass
+
+    unit_seconds = {
+        "ms": 0.001,
+        "millisecond": 0.001,
+        "milliseconds": 0.001,
+        "s": 1.0,
+        "sec": 1.0,
+        "secs": 1.0,
+        "second": 1.0,
+        "seconds": 1.0,
+        "m": 60.0,
+        "min": 60.0,
+        "mins": 60.0,
+        "minute": 60.0,
+        "minutes": 60.0,
+        "h": 3600.0,
+        "hr": 3600.0,
+        "hour": 3600.0,
+        "hours": 3600.0,
+    }
+    matches = re.findall(
+        r"(\d+(?:\.\d+)?)\s*(milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)(?=$|\s|\d|[.,;])",
+        raw,
+        re.IGNORECASE,
+    )
+    if not matches:
+        return None
+    return sum(
+        float(amount) * unit_seconds[unit.casefold()]
+        for amount, unit in matches
+    )
+
+
 async def _groq_request_unlocked(
     prompt: str,
     max_output_tokens: int,
@@ -724,23 +1194,10 @@ async def _groq_request_unlocked(
     last_error = None
     total_attempts = max(1, GROQ_RETRIES + 1)
 
-    # Leave headroom for estimation error and concurrent requests using the
-    # same organization-level TPM quota.
-    estimated_input_tokens = estimate_groq_prompt_tokens(prompt)
-    available_output_tokens = (
-        GROQ_TPM_LIMIT - GROQ_TPM_RESERVE - estimated_input_tokens
-    )
-    if available_output_tokens < GROQ_MIN_COMPLETION_TOKENS:
-        raise RuntimeError(
-            "Запит до Groq завеликий для поточного ліміту TPM. "
-            "Потрібно скоротити вхідний контекст або розбити завдання на частини. "
-            f"Оцінка вхідних токенів: {estimated_input_tokens}; "
-            f"ліміт: {GROQ_TPM_LIMIT}; резерв: {GROQ_TPM_RESERVE}."
-        )
-
-    current_max_output_tokens = min(
-        max(GROQ_MIN_COMPLETION_TOKENS, int(max_output_tokens)),
-        available_output_tokens,
+    # Reserve input + requested completion against the shared rolling TPM
+    # window before sending the request. The database coordinates deploy overlap.
+    current_max_output_tokens, reservation_id, estimated_input_tokens = (
+        await reserve_groq_tokens(prompt, max_output_tokens)
     )
     if current_max_output_tokens < max_output_tokens:
         print(
@@ -762,6 +1219,7 @@ async def _groq_request_unlocked(
     timeout = aiohttp.ClientTimeout(total=CLIENT_TIMEOUT)
 
     for attempt in range(1, total_attempts + 1):
+        retry_after_seconds = None
         try:
             print(
                 f"[GROQ] Attempt {attempt}/{total_attempts} "
@@ -782,6 +1240,11 @@ async def _groq_request_unlocked(
                         data = {}
 
                     if response.status >= 400:
+                        retry_after_header = response.headers.get("Retry-After") or response.headers.get("retry-after")
+                        if retry_after_header:
+                            retry_after_seconds = parse_retry_after_seconds(
+                                retry_after_header
+                            )
                         api_error = data.get("error") if isinstance(data, dict) else None
                         if isinstance(api_error, dict):
                             error_message = api_error.get("message") or response_text
@@ -818,6 +1281,7 @@ async def _groq_request_unlocked(
 
                     usage = data.get("usage")
                     if isinstance(usage, dict):
+                        await update_groq_token_reservation(reservation_id, usage)
                         print(
                             "[GROQ] Usage: "
                             f"prompt={usage.get('prompt_tokens', 'unknown')} "
@@ -884,7 +1348,7 @@ async def _groq_request_unlocked(
                 error,
                 (asyncio.TimeoutError, aiohttp.ClientError)
             ) or any(code in error_text for code in (
-                "413", "429", "rate limit", "resource exhausted", "503",
+                "408", "413", "429", "500", "rate limit", "resource exhausted", "503",
                 "unavailable", "temporarily", "deadline", "timeout",
                 "overloaded", "service unavailable", "502", "504",
             ))
@@ -894,13 +1358,10 @@ async def _groq_request_unlocked(
             if attempt >= total_attempts:
                 break
             delay = min(60, (2 ** (attempt - 1)) + random.uniform(0.5, 2.0))
-            retry_after_match = re.search(
-                r"(?:try again in|retry after)\s*([0-9]+(?:\.[0-9]+)?)\s*s",
-                str(error),
-                re.IGNORECASE,
-            )
-            if retry_after_match:
-                provider_delay = float(retry_after_match.group(1))
+            provider_delay = retry_after_seconds
+            if provider_delay is None:
+                provider_delay = parse_retry_after_seconds(str(error))
+            if provider_delay is not None:
                 delay = max(delay, provider_delay + random.uniform(0.25, 0.75))
             delay = min(120, delay)
             print(f"[GROQ] Тимчасова помилка. Повтор через {delay:.1f}s...")
@@ -922,18 +1383,163 @@ async def groq_request(
     max_output_tokens: int,
     return_metadata: bool = False,
 ):
-    """Serialize requests and retries against the shared organization TPM quota."""
-    async with GROQ_REQUEST_LOCK:
-        return await _groq_request_unlocked(
-            prompt,
-            max_output_tokens,
-            return_metadata=return_metadata,
+    """Use PostgreSQL token reservations to coordinate concurrent Groq calls."""
+    return await _groq_request_unlocked(
+        prompt,
+        max_output_tokens,
+        return_metadata=return_metadata,
+    )
+
+
+async def continue_truncated_groq_output(
+    partial_output: str,
+    context: str,
+    output_contract: str,
+    max_rounds: int = 3,
+):
+    """Continue truncated output while preflighting every continuation prompt."""
+    result = partial_output or ""
+    still_truncated = True
+    max_input_tokens = (
+        GROQ_TPM_LIMIT - GROQ_TPM_RESERVE - GROQ_MIN_COMPLETION_TOKENS
+    )
+
+    for round_number in range(1, max_rounds + 1):
+        # Preserve the newest output first: it is the strongest signal for the
+        # exact point where generation stopped. Shrink optional context before
+        # shrinking this tail so continuation still has enough local syntax.
+        context_budget = min(len(context), 3000)
+        tail_budget = min(len(result), 6000)
+        continuation_prompt = ""
+
+        while True:
+            context_part = context[:context_budget]
+            if context_budget < len(context):
+                context_part += "\n...[контекст скорочено]..."
+            tail = result[-tail_budget:] if tail_budget else ""
+            continuation_prompt = f"""
+Ти продовжуєш відповідь, яку Groq обрізав за лімітом токенів.
+
+КОНТЕКСТ ЗАВДАННЯ:
+{context_part}
+
+ФОРМАТ РЕЗУЛЬТАТУ:
+{output_contract}
+
+ОСТАННІЙ ФРАГМЕНТ, ЯКИЙ ВЖЕ БУЛО ВИДАНО (ЛИШЕ ДЛЯ КОНТЕКСТУ):
+<<<ALREADY_OUTPUT>>>
+{tail}
+<<<END_ALREADY_OUTPUT>>>
+
+ПРОДОВЖУЙ:
+- Продовжуй точно з наступного символу після наведеного фрагмента.
+- Не повторюй жодного рядка з уже виданого фрагмента.
+- Не починай файл або відповідь спочатку.
+- Якщо обірвався рядок чи вираз, продовж його без повторення попередньої частини.
+- Заверши поточний файл/документ і поверни всі решту обов'язкових частин.
+- Поверни лише продовження результату, без пояснень.
+"""
+            estimated_input = estimate_groq_prompt_tokens(continuation_prompt)
+            if estimated_input <= max_input_tokens:
+                break
+            if context_budget > 0:
+                context_budget = max(0, context_budget // 2)
+            elif tail_budget > 750:
+                tail_budget = max(750, tail_budget // 2)
+            else:
+                continuation_prompt = ""
+                break
+
+        if not continuation_prompt:
+            print(
+                f"[GROQ CONTINUATION] round={round_number}/{max_rounds} "
+                f"skipped_over_budget estimated_input_tokens={estimated_input} "
+                f"max_input_tokens={max_input_tokens}."
+            )
+            break
+
+        available_output = max_input_tokens - estimated_input
+        requested_output = min(5000, available_output)
+        if requested_output < GROQ_MIN_COMPLETION_TOKENS:
+            print(
+                f"[GROQ CONTINUATION] round={round_number}/{max_rounds} "
+                "skipped_insufficient_completion_budget."
+            )
+            break
+
+        try:
+            continuation = await groq_request(
+                continuation_prompt,
+                max_output_tokens=requested_output,
+                return_metadata=True,
+            )
+        except Exception as error:
+            print(
+                f"[GROQ CONTINUATION] round={round_number}/{max_rounds} "
+                f"failed={type(error).__name__}: {safe_error_detail(error)}"
+            )
+            break
+
+        addition = continuation.get("content", "")
+        if not isinstance(addition, str) or not addition.strip():
+            print(
+                f"[GROQ CONTINUATION] round={round_number}/{max_rounds} "
+                "returned empty content."
+            )
+            break
+
+        # Remove the complete exact suffix/prefix overlap using KMP.
+        pattern = addition
+        prefix = [0] * len(pattern)
+        matched = 0
+        for index in range(1, len(pattern)):
+            while matched and pattern[index] != pattern[matched]:
+                matched = prefix[matched - 1]
+            if pattern[index] == pattern[matched]:
+                matched += 1
+            prefix[index] = matched
+
+        overlap = 0
+        previous_tail = result[-min(len(result), len(pattern)):]
+        for index, char in enumerate(previous_tail):
+            while overlap and char != pattern[overlap]:
+                overlap = prefix[overlap - 1]
+            if char == pattern[overlap]:
+                overlap += 1
+            if overlap == len(pattern) and index != len(previous_tail) - 1:
+                overlap = prefix[overlap - 1]
+
+        result += addition[overlap:]
+        finish_reason = continuation.get("finish_reason")
+        print(
+            f"[GROQ CONTINUATION] round={round_number}/{max_rounds} "
+            f"added_chars={len(addition) - overlap} "
+            f"finish_reason={finish_reason}."
         )
+        if finish_reason != "length":
+            still_truncated = False
+            break
+
+    return result, still_truncated
 
 
 # ============================================================
 # REQUIREMENT DISCOVERY / CLIENT CONVERSATION
 # ============================================================
+
+CREDENTIAL_REQUEST_PATTERN = re.compile(
+    r"(?i)\b(?:github\s*)?(?:personal\s+access\s+token|pat|token|"
+    r"api[\s-]*key|access[\s-]*key|private[\s-]*key|secret[\s-]*key|"
+    r"парол\w*|токен\w*|api[\s-]*ключ\w*|"
+    r"ключ(?:і)?\s+(?:доступу|api|приватн\w*|секретн\w*|авторизац\w*)|"
+    r"приватн\w*\s+ключ\w*|секретн\w*\s+ключ\w*|"
+    r"секрет\w*|database\s*url|\.env)\b"
+)
+
+
+def contains_credential_request(text: str) -> bool:
+    return bool(CREDENTIAL_REQUEST_PATTERN.search(text or ""))
+
 
 async def analyze_requirements(conversation: str):
     prompt = f"""
@@ -1010,26 +1616,15 @@ FINAL_TZ: ...
     final_tz = final_match.group(1).strip() if final_match else ""
 
     # Never let the requirements model ask a client to disclose credentials.
-    # Integrations are configured by the owner in the server environment.
-    credential_request = re.search(
-        r"(?i)\b(?:github\s*)?(?:pat|token|api\s*key|access\s*key|"
-        r"парол\w*|токен\w*|ключ\w*|секрет\w*|"
-        r"database\s*url|\.env)\b",
-        question
-    )
+    # Match credential phrases specifically: the Ukrainian word "ключові"
+    # (key/important features) must not be mistaken for an API key.
+    credential_request = contains_credential_request(question)
     if credential_request:
-        if GITHUB_TOKEN:
-            # The credential is already configured server-side; it is not a
-            # client requirement. Continue using the provided task description.
-            ready = True
-            final_tz = final_tz or conversation
-        else:
-            # Do not expose a request for secrets to the client.
-            ready = False
-            question = (
-                "Внутрішня конфігурація інтеграції потребує перевірки "
-                "власником Grox. Будь ласка, продовжуйте описувати функції проєкту."
-            )
+        # Credentials are configured by the owner in server environment
+        # variables. Their absence is reported during the deployment phase.
+        ready = True
+        question = ""
+        final_tz = final_tz or conversation
 
     return {
         "ready": ready,
@@ -1317,10 +1912,21 @@ JavaScript повинен бути робочим.
 {client_task}
 """
 
-    result = await groq_request(
+    generation = await groq_request(
         prompt,
-        max_output_tokens=30000
+        max_output_tokens=30000,
+        return_metadata=True,
     )
+    result = generation["content"]
+    if generation.get("finish_reason") == "length":
+        result, still_truncated = await continue_truncated_groq_output(
+            result,
+            context="Клієнтське ТЗ:\n" + client_task,
+            output_contract="Поверни продовження одного повного HTML-документа; CSS і JavaScript мають бути всередині HTML.",
+            max_rounds=3,
+        )
+        if still_truncated:
+            raise RuntimeError("Groq не зміг завершити HTML після трьох продовжень; сайт не буде розгорнуто.")
 
     return clean_html_output(result)
 
@@ -1371,10 +1977,24 @@ async def fix_site_code(
 {html_code}
 """
 
-    result = await groq_request(
+    generation = await groq_request(
         prompt,
-        max_output_tokens=30000
+        max_output_tokens=30000,
+        return_metadata=True,
     )
+    result = generation["content"]
+    if generation.get("finish_reason") == "length":
+        result, still_truncated = await continue_truncated_groq_output(
+            result,
+            context=(
+                "Клієнтське ТЗ:\n" + client_task
+                + "\nЗвіт QA:\n" + test_report
+            ),
+            output_contract="Поверни продовження повного виправленого HTML-документа; не повторюй попередній текст.",
+            max_rounds=3,
+        )
+        if still_truncated:
+            raise RuntimeError("Groq не зміг завершити виправлений HTML після трьох продовжень.")
 
     return clean_html_output(result)
 
@@ -1386,16 +2006,44 @@ async def fix_site_code(
 
 def is_revision_request(text: str) -> bool:
     normalized = normalize_user_text(text)
+    if not normalized:
+        return False
 
-    revision_words = (
-        "правк", "змін", "додай", "добав", "прибери", "видали",
-        "зроби", "перероби", "виправ", "заміни", "хочу щоб",
-        "хочу, щоб", "потрібно змінити", "треба змінити",
-        "не подобається", "колір", "кнопк", "текст", "дизайн",
-        "секц", "блок", "додати", "прибрати",
+    explicit_action = re.search(
+        r"(?<!\w)(?:додай|добав|прибери|видали|заміни|виправ|перероби|зміни|"
+        r"change|add|remove|replace|fix|update)(?!\w)\s+\S+",
+        normalized,
+        re.IGNORECASE,
     )
+    if explicit_action:
+        return True
 
-    return any(word in normalized for word in revision_words)
+    make_specific_change = re.search(
+        r"(?<!\w)(?:зроби|make)(?!\w).{0,80}"
+        r"(?:кнопк\w*|колір\w*|текст\w*|фон\w*|розмір\w*|шрифт\w*|"
+        r"секц\w*|блок\w*|дизайн\w*|анімац\w*|посил\w*|форм\w*|"
+        r"зображ\w*|красив\w*|сучасн\w*|більш\w*|менш\w*)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if make_specific_change:
+        return True
+
+    issue_or_preference = (
+        "не працює",
+        "не відкривається",
+        "не натискається",
+        "не відображається",
+        "не подобається",
+        "потрібно змінити",
+        "треба змінити",
+        "хочу щоб",
+        "хочу, щоб",
+        "doesn't work",
+        "does not work",
+        "not working",
+    )
+    return any(phrase in normalized for phrase in issue_or_preference)
 
 
 async def revise_site_code(
@@ -1433,10 +2081,24 @@ async def revise_site_code(
 ПОВЕРНИ ПОВНУ ОНОВЛЕНУ ВЕРСІЮ САЙТУ.
 """
 
-    result = await groq_request(
+    generation = await groq_request(
         prompt,
-        max_output_tokens=30000
+        max_output_tokens=30000,
+        return_metadata=True,
     )
+    result = generation["content"]
+    if generation.get("finish_reason") == "length":
+        result, still_truncated = await continue_truncated_groq_output(
+            result,
+            context=(
+                "Поточне ТЗ:\n" + current_task
+                + "\nНова правка:\n" + client_revision
+            ),
+            output_contract="Поверни продовження повного оновленого HTML-документа; збережи всі попередні функції.",
+            max_rounds=3,
+        )
+        if still_truncated:
+            raise RuntimeError("Groq не зміг завершити HTML після трьох продовжень правки.")
 
     return clean_html_output(result)
 
@@ -1444,8 +2106,16 @@ async def revise_site_code(
 async def revise_and_test_website(
     order: Order,
     thread: discord.Thread,
-    html_code: str
+    html_code: str,
+    client_task: str | None = None,
 ):
+    if order.site_code and html_code.strip() == order.site_code.strip():
+        await thread.send(
+            "⚠️ Groq не запропонував змін у HTML. Я не буду створювати новий "
+            "деплой без фактичної зміни коду. Уточніть потрібну правку."
+        )
+        return False
+
     for attempt in range(
         1,
         MAX_WEBSITE_FIX_ATTEMPTS + 1
@@ -1457,10 +2127,9 @@ async def revise_and_test_website(
             "кнопки, посилання та форми."
         )
 
-        project_name = (
-            f"grox-revision-"
-            f"{uuid.uuid4().hex[:12]}"
-        )
+        # Reuse one Vercel project per order; revisions should create new
+        # deployments inside that project, not a new project each time.
+        project_name = vercel_project_name(order.order_id)
 
         live_url = await deploy_to_vercel(
             project_name,
@@ -1468,19 +2137,27 @@ async def revise_and_test_website(
         )
 
         if not live_url:
-            if attempt >= MAX_WEBSITE_FIX_ATTEMPTS:
-                return False
             await thread.send(
-                "⚠️ Оновлений сайт не вдалося розгорнути. "
-                "Повторюю спробу."
+                "❌ **Vercel не підтвердив розгортання оновленого сайту.**\n\n"
+                "Не буду повторно публікувати той самий HTML без змін. "
+                "Перевір стан розгортання у Vercel."
             )
-            continue
+            return False
 
         qa_result = await test_website(live_url)
+
+        if qa_result.get("infra_error"):
+            await thread.send(
+                "⚠️ **QA-середовище не змогло перевірити оновлений сайт.**\n\n"
+                "Я не буду переписувати код через помилку браузера або тестового середовища."
+            )
+            return False
 
         if qa_result["success"]:
             order.site_url = live_url
             order.site_code = html_code
+            if client_task is not None:
+                order.task = client_task
             await save_order(order)
             await thread.send(
                 "✅ **Правку внесено та перевірено!**\n\n"
@@ -1503,11 +2180,18 @@ async def revise_and_test_website(
             return False
 
         try:
+            previous_html = html_code
             html_code = await fix_site_code(
                 html_code,
                 qa_result["report"],
-                order.task
+                client_task or order.task
             )
+            if html_code.strip() == previous_html.strip():
+                await thread.send(
+                    "⚠️ QA не пройшов, а автоматичне виправлення не змінило HTML. "
+                    "Зупиняю повторні однакові деплої."
+                )
+                return False
         except Exception as error:
             print(
                 f"[REVISION FIX ERROR] "
@@ -1561,27 +2245,27 @@ async def answer_client_message(
 
 async def post_delivery_conversation(
     order: Order,
-    thread: discord.Thread
+    thread: discord.Thread,
+    send_intro: bool = True,
 ):
-    await thread.send(
-        "💬 **Grox залишається на зв'язку.**\n\n"
-        "Можете поставити питання або написати, що потрібно змінити "
-        "у проєкті. Якщо це правка сайту — я внесу її, перевірю "
-        "результат і надішлю оновлену версію."
-    )
+    if send_intro:
+        await thread.send(
+            "💬 **Grox залишається на зв'язку.**\n\n"
+            "Можете поставити питання або написати, що потрібно змінити "
+            "у проєкті. Якщо це правка сайту — я внесу її, перевірю "
+            "результат і надішлю оновлену версію."
+        )
 
-    started_at = asyncio.get_running_loop().time()
+    if order.delivered_at is None:
+        order.delivered_at = int(time.time())
+    if order.post_delivery_expires_at is None:
+        order.post_delivery_expires_at = int(time.time()) + POST_DELIVERY_TIMEOUT
+        await save_order(order)
 
     while True:
-        elapsed = (
-            asyncio.get_running_loop().time()
-            - started_at
-        )
-
-        remaining_timeout = max(
-            1,
-            POST_DELIVERY_TIMEOUT - int(elapsed)
-        )
+        remaining_timeout = int(order.post_delivery_expires_at - time.time())
+        if remaining_timeout <= 0:
+            return
 
         def check(msg: discord.Message):
             return (
@@ -1594,13 +2278,12 @@ async def post_delivery_conversation(
             client_message = await bot.wait_for(
                 "message",
                 check=check,
-                timeout=remaining_timeout
+                timeout=max(1, remaining_timeout),
             )
         except asyncio.TimeoutError:
             return
 
         text = client_message.content.strip()
-
         if not text:
             continue
 
@@ -1610,6 +2293,11 @@ async def post_delivery_conversation(
                 f"Максимум: {MAX_TASK_LENGTH} символів."
             )
             continue
+
+        # Persist the idle timeout before doing any slow AI or deploy work.
+        # If Render restarts now, on_ready can resume this conversation.
+        order.post_delivery_expires_at = int(time.time()) + POST_DELIVERY_TIMEOUT
+        await save_order(order)
 
         print(
             f"[CLIENT FOLLOW-UP] "
@@ -1638,13 +2326,11 @@ async def post_delivery_conversation(
                     text
                 )
 
-                order.task = updated_task
-                await save_order(order)
-
                 success = await revise_and_test_website(
                     order,
                     thread,
-                    revised_html
+                    revised_html,
+                    client_task=updated_task,
                 )
 
                 if not success:
@@ -1665,7 +2351,6 @@ async def post_delivery_conversation(
                     "Можете описати її ще раз."
                 )
 
-            started_at = asyncio.get_running_loop().time()
             continue
 
         try:
@@ -1686,12 +2371,66 @@ async def post_delivery_conversation(
                 "що саме потрібно зробити або змінити."
             )
 
-        started_at = asyncio.get_running_loop().time()
+
+async def resume_post_delivery_conversation(order: Order):
+    """Resume an unexpired completed order after a Discord/Render restart."""
+    try:
+        channel = bot.get_channel(order.thread_id)
+        if channel is None:
+            channel = await bot.fetch_channel(order.thread_id)
+        if not isinstance(channel, discord.Thread):
+            print(
+                f"[POST-DELIVERY RESUME] order=#{order.order_id}: "
+                "saved channel is not a Discord thread."
+            )
+            return
+        if channel.archived:
+            try:
+                await channel.edit(archived=False)
+            except discord.HTTPException:
+                print(
+                    f"[POST-DELIVERY RESUME] order=#{order.order_id}: "
+                    "could not unarchive thread."
+                )
+                return
+        await post_delivery_conversation(order, channel, send_intro=False)
+    except Exception as error:
+        print(
+            f"[POST-DELIVERY RESUME] order=#{order.order_id} "
+            f"failed: {type(error).__name__}."
+        )
 
 
-# ============================================================
-# VERCEL DEPLOY
-# ============================================================
+def schedule_post_delivery_resumes():
+    """Start one listener per completed order whose persisted idle window is live."""
+    now = int(time.time())
+    for order in list(orders.values()):
+        if (
+            order.status != "COMPLETED"
+            or not order.thread_id
+            or not order.post_delivery_expires_at
+            or order.post_delivery_expires_at <= now
+            or order.order_id in post_delivery_tasks
+        ):
+            continue
+
+        post_delivery_tasks.add(order.order_id)
+        task = asyncio.create_task(resume_post_delivery_conversation(order))
+        processing_tasks.add(task)
+
+        def finished(done_task, order_id=order.order_id):
+            processing_tasks.discard(done_task)
+            post_delivery_tasks.discard(order_id)
+
+        task.add_done_callback(finished)
+
+
+
+
+def vercel_project_name(order_id: int) -> str:
+    """Use one stable Vercel project for all deployments of the same order."""
+    return f"grox-order-{int(order_id)}"
+
 
 async def deploy_to_vercel(
     project_name: str,
@@ -1760,35 +2499,68 @@ async def deploy_to_vercel(
                 except Exception:
                     data = {}
 
-                if response.status in (
-                    200,
-                    201
-                ):
-                    deployment_url = data.get(
-                        "url"
+                if response.status not in (200, 201) or not isinstance(data, dict):
+                    print(
+                        f"[VERCEL ERROR] HTTP {response.status}; response body omitted."
                     )
+                    return None
 
-                    if deployment_url:
-                        if not deployment_url.startswith(
-                            "http"
-                        ):
-                            deployment_url = (
-                                "https://"
-                                + deployment_url
-                            )
+                deployment_id = data.get("id") or data.get("uid")
+                deployment_url = data.get("url")
+                if not isinstance(deployment_url, str) or not deployment_url.strip():
+                    print("[VERCEL ERROR] Create response did not include a deployment URL.")
+                    return None
 
-                        print(
-                            f"[VERCEL] "
-                            f"Deployment successful: "
-                            f"{deployment_url}"
-                        )
+                if not deployment_url.startswith("http://") and not deployment_url.startswith("https://"):
+                    deployment_url = "https://" + deployment_url
 
-                        return deployment_url
+                # A successful POST only queues a deployment. Wait for Vercel's
+                # explicit READY state before the caller starts browser QA.
+                ready_state = str(data.get("readyState") or "").upper()
+                if ready_state == "READY":
+                    print(f"[VERCEL] Deployment READY: {deployment_url}")
+                    return deployment_url
 
-                print(
-                    f"[VERCEL ERROR] HTTP {response.status}; response body omitted."
+                if not deployment_id:
+                    print("[VERCEL ERROR] Deployment ID missing; readiness cannot be verified.")
+                    return None
+
+                deadline = asyncio.get_running_loop().time() + 600
+                deployment_endpoint = (
+                    "https://api.vercel.com/v13/deployments/"
+                    + quote(str(deployment_id), safe="")
                 )
+                while asyncio.get_running_loop().time() < deadline:
+                    async with session.get(
+                        deployment_endpoint,
+                        headers=headers,
+                    ) as status_response:
+                        if status_response.status >= 400:
+                            print(
+                                f"[VERCEL ERROR] Readiness poll HTTP {status_response.status}; "
+                                "response body omitted."
+                            )
+                            return None
+                        try:
+                            status_data = await status_response.json(content_type=None)
+                        except Exception:
+                            status_data = {}
 
+                    if not isinstance(status_data, dict):
+                        print("[VERCEL ERROR] Readiness poll returned an unexpected response.")
+                        return None
+
+                    ready_state = str(status_data.get("readyState") or "").upper()
+                    if ready_state == "READY":
+                        print(f"[VERCEL] Deployment READY: {deployment_url}")
+                        return deployment_url
+                    if ready_state in {"ERROR", "CANCELED", "CANCELLED"}:
+                        print(f"[VERCEL ERROR] Deployment ended with state {ready_state}.")
+                        return None
+
+                    await asyncio.sleep(3)
+
+                print("[VERCEL ERROR] Timed out waiting for deployment READY state.")
                 return None
 
     except Exception as error:
@@ -1805,6 +2577,54 @@ async def deploy_to_vercel(
 # WEBSITE QA TEST
 # ============================================================
 
+def has_meaningful_page_content(visible_text: str, meaningful_element_count: int) -> bool:
+    """Reject empty semantic wrappers while allowing text, media, and usable controls."""
+    return bool((visible_text or "").strip()) or meaningful_element_count > 0
+
+
+def website_navigation_failure(error: Exception) -> dict:
+    """Treat an unreachable preview as a QA infrastructure/deployment failure, not an HTML defect."""
+    return {
+        "success": False,
+        "infra_error": True,
+        "report": (
+            "QA не змогла відкрити попередній перегляд сайту. "
+            "Це може бути мережева помилка, DNS/TLS, тайм-аут або недоступний preview. "
+            "Не змінюй HTML на підставі цього результату. "
+            f"Тип помилки: {type(error).__name__}."
+        ),
+    }
+
+
+def is_same_origin_url(candidate_url: str, reference_url: str) -> bool:
+    """Compare URL origins structurally; string-prefix checks accept hostile lookalike hosts."""
+    try:
+        candidate = urlsplit(candidate_url)
+        reference = urlsplit(reference_url)
+        if not candidate.scheme or not candidate.hostname:
+            return False
+        if not reference.scheme or not reference.hostname:
+            return False
+
+        def normalized_port(parsed):
+            explicit = parsed.port
+            if explicit is not None:
+                return explicit
+            return 443 if parsed.scheme.casefold() == "https" else 80 if parsed.scheme.casefold() == "http" else None
+
+        return (
+            candidate.scheme.casefold(),
+            candidate.hostname.casefold(),
+            normalized_port(candidate),
+        ) == (
+            reference.scheme.casefold(),
+            reference.hostname.casefold(),
+            normalized_port(reference),
+        )
+    except ValueError:
+        return False
+
+
 async def test_website(url: str):
     print(
         f"[QA] Starting website test: {url}"
@@ -1814,6 +2634,8 @@ async def test_website(url: str):
     warnings = []
     console_errors = []
     failed_requests = []
+    parsed_site_url = urlsplit(url)
+    site_origin = f"{parsed_site_url.scheme}://{parsed_site_url.netloc}"
 
     title = ""
     button_count = 0
@@ -1856,15 +2678,31 @@ async def test_website(url: str):
             # ------------------------------------------------
 
             def handle_request_failed(request):
-                failed_requests.append(
+                detail = (
                     f"{request.method} {request.url} "
                     f"-> {request.failure}"
                 )
+                if is_same_origin_url(request.url, url):
+                    errors.append(
+                        "Внутрішній ресурс сайту не завантажився: "
+                        f"{urlsplit(request.url).path}."
+                    )
+                else:
+                    failed_requests.append(detail)
 
-            page.on(
-                "requestfailed",
-                handle_request_failed
-            )
+            def handle_response(response):
+                if (
+                    response.status >= 400
+                    and is_same_origin_url(response.url, url)
+                    and response.request.resource_type != "document"
+                ):
+                    errors.append(
+                        f"Внутрішній ресурс повернув HTTP {response.status}: "
+                        f"{urlsplit(response.url).path}."
+                    )
+
+            page.on("requestfailed", handle_request_failed)
+            page.on("response", handle_response)
 
             # ------------------------------------------------
             # PAGE ERROR
@@ -1887,25 +2725,31 @@ async def test_website(url: str):
             try:
                 response = await page.goto(
                     url,
-                    wait_until="networkidle",
+                    wait_until="domcontentloaded",
                     timeout=30000
                 )
 
             except Exception as error:
                 await browser.close()
 
-                return {
-                    "success": False,
-                    "report": (
-                        "Сайт не вдалося відкрити.\n"
-                        f"Помилка: {error}"
-                    )
-                }
+                return website_navigation_failure(error)
 
             if response is None:
                 errors.append(
                     "Сторінка не повернула HTTP response."
                 )
+
+            elif response.status in (401, 403):
+                await browser.close()
+                return {
+                    "success": False,
+                    "infra_error": True,
+                    "report": (
+                        f"Vercel preview повернув HTTP {response.status}. "
+                        "Можливий Deployment Protection або обмеження доступу. "
+                        "Це не доказ помилки в HTML; перевір налаштування доступу Vercel."
+                    ),
+                }
 
             elif response.status >= 400:
                 errors.append(
@@ -1935,6 +2779,16 @@ async def test_website(url: str):
                 errors.append(
                     "Відсутній <body>."
                 )
+            else:
+                visible_text = (await page.locator("body").inner_text()).strip()
+                meaningful_elements = await page.locator(
+                    "input:visible, textarea:visible, select:visible, "
+                    "img:visible[src], video:visible[src], canvas:visible, iframe:visible"
+                ).count()
+                if not has_meaningful_page_content(visible_text, meaningful_elements):
+                    errors.append(
+                        "Сторінка порожня: немає видимого тексту або змістовних елементів."
+                    )
 
             # ------------------------------------------------
             # FIND BUTTONS
@@ -2093,9 +2947,11 @@ async def test_website(url: str):
 
         return {
             "success": False,
+            "infra_error": True,
             "report": (
-                "QA-система не змогла завершити "
-                "перевірку.\n"
+                "QA-система не змогла завершити перевірку через внутрішню "
+                "помилку браузера або тестового середовища. Код сайту не слід "
+                "змінювати на підставі цього результату.\n"
                 f"Помилка: {type(error).__name__}."
             )
         }
@@ -2207,10 +3063,8 @@ async def generate_test_and_fix_website(
         # DEPLOY TEST VERSION
         # ----------------------------------------------------
 
-        project_name = (
-            f"grox-job-"
-            f"{uuid.uuid4().hex[:12]}"
-        )
+        # Keep every QA attempt for this order inside one Vercel project.
+        project_name = vercel_project_name(order.order_id)
 
         live_url = await deploy_to_vercel(
             project_name,
@@ -2218,18 +3072,10 @@ async def generate_test_and_fix_website(
         )
 
         if not live_url:
-            if attempt >= MAX_WEBSITE_FIX_ATTEMPTS:
-                raise RuntimeError(
-                    "Vercel не зміг виконати "
-                    "тестовий деплой."
-                )
-
-            await thread.send(
-                "⚠️ Тестовий деплой не вдався. "
-                "Повторюю."
+            raise RuntimeError(
+                "Vercel не підтвердив тестовий деплой. "
+                "Однаковий HTML не буде повторно публікуватися без змін."
             )
-
-            continue
 
         # ----------------------------------------------------
         # RUN QA
@@ -2238,6 +3084,18 @@ async def generate_test_and_fix_website(
         qa_result = await test_website(
             live_url
         )
+
+        # A broken Playwright/browser environment is not evidence that the
+        # generated website is defective. Never feed infrastructure failures
+        # into the LLM repair loop or redeploy unchanged HTML.
+        if qa_result.get("infra_error"):
+            await thread.send(
+                "⚠️ **Автоматична QA-перевірка не завершилася через помилку "
+                "тестового середовища.**\n\n"
+                "Я не буду змінювати код сайту навмання або повторно розгортати "
+                "той самий HTML. Перевір налаштування Playwright/Chromium у Grox."
+            )
+            return False
 
         if qa_result["success"]:
             await thread.send(
@@ -2281,11 +3139,18 @@ async def generate_test_and_fix_website(
         # ----------------------------------------------------
 
         try:
+            previous_html = html_code
             html_code = await fix_site_code(
                 html_code,
                 qa_result["report"],
                 order.task
             )
+            if html_code.strip() == previous_html.strip():
+                await thread.send(
+                    "⚠️ QA не пройшов, а автоматичне виправлення не змінило HTML. "
+                    "Зупиняю повторні однакові деплої."
+                )
+                return False
 
         except Exception as error:
             print(
@@ -2351,20 +3216,102 @@ def is_software_bot_project(task: str) -> bool:
     return is_bot2_project(task) or has_keyword(task, bot_words)
 
 
+def _first_keyword_position(text: str, keywords) -> int | None:
+    positions = []
+    for keyword in keywords:
+        match = re.search(_keyword_regex(keyword), text or "", re.IGNORECASE)
+        if match:
+            positions.append(match.start())
+    return min(positions) if positions else None
+
+
+def is_website_project(task: str) -> bool:
+    """Choose the primary deliverable, not a platform mentioned as an integration."""
+    website_position = _first_keyword_position(
+        task,
+        ("сайт", "website", "web", "лендинг", "landing", "вебсайт"),
+    )
+    if website_position is None:
+        return False
+
+    bot_position = _first_keyword_position(
+        task,
+        ("discord bot", "discord бот", "telegram bot", "telegram бот", "bot", "бот"),
+    )
+    return bot_position is None or website_position < bot_position
+
+
+def missing_required_integration_settings(task: str) -> list[str]:
+    """Return missing owner-side settings before Grox starts a long questionnaire."""
+    missing = []
+
+    if is_website_project(task):
+        if not VERCEL_TOKEN:
+            missing.append("VERCEL_TOKEN")
+        return missing
+
+    if is_software_bot_project(task):
+        platform = detect_bot_platform(task)
+        if platform != "Discord":
+            return [
+                "автоматичне розгортання зараз підтримує лише Discord-ботів"
+            ]
+
+        if not GITHUB_TOKEN:
+            missing.append("GITHUB_TOKEN")
+        if not GITHUB_REPO:
+            missing.append("GITHUB_REPO")
+        else:
+            try:
+                validate_github_repo(GITHUB_REPO)
+            except Exception:
+                missing.append("GITHUB_REPO (перевір формат owner/repository)")
+
+        if not RENDER_API_KEY:
+            missing.append("RENDER_API_KEY")
+
+        if not GENERATED_DISCORD_TOKEN:
+            missing.append("GROX_BUILDER_DISCORD_TOKEN")
+        elif GENERATED_DISCORD_TOKEN == DISCORD_TOKEN:
+            missing.append(
+                "окремий токен Discord-бота (не токен самого Grox)"
+            )
+
+    return missing
+
+
 def detect_bot_platform(task: str) -> str:
     # Bot 2 is explicitly Discord-only, even if the description mentions
     # other platforms while explaining what must NOT be supported.
     if is_bot2_project(task):
         return "Discord"
 
-    normalized = task.casefold()
+    telegram_bot_position = _first_keyword_position(
+        task,
+        ("telegram bot", "telegram-бот", "телеграм бот", "бот для телеграм", "бот у телеграм"),
+    )
+    discord_bot_position = _first_keyword_position(
+        task,
+        ("discord bot", "discord-бот", "discord бот", "бот для discord", "бот у discord"),
+    )
 
-    if any(word in normalized for word in ("telegram", "телеграм")):
+    if telegram_bot_position is not None and discord_bot_position is not None:
+        return "Telegram" if telegram_bot_position < discord_bot_position else "Discord"
+    if telegram_bot_position is not None:
         return "Telegram"
-
-    if "discord" in normalized:
+    if discord_bot_position is not None:
         return "Discord"
 
+    normalized = (task or "").casefold()
+    mentions_telegram = "telegram" in normalized or "телеграм" in normalized
+    mentions_discord = "discord" in normalized
+    if mentions_telegram and not mentions_discord:
+        return "Telegram"
+    if mentions_discord and not mentions_telegram:
+        return "Discord"
+
+    # If both platforms are merely mentioned, do not guess which one is the
+    # bot's host platform; cross-platform integrations are not a platform cue.
     return "Software bot"
 
 
@@ -2421,20 +3368,65 @@ from DISCORD_TOKEN, and never print or commit secrets.
 """
 
 
-# Constructs that a generated customer bot has no legitimate need for.
-# Best-effort static screening: it cannot make LLM-written code "safe",
-# it only blocks the most obvious dangerous patterns before publishing.
-DANGEROUS_CODE_PATTERNS = (
-    (r"\bos\s*\.\s*system\s*\(", "os.system()"),
-    (r"\bsubprocess\b", "subprocess"),
-    (r"(?<![\w.])(?:eval|exec)\s*\(", "eval()/exec()"),
-    (r"__import__\s*\(", "__import__()"),
-    (r"\bpickle\s*\.\s*loads?\s*\(", "pickle.load()"),
-    (
-        r"GITHUB_TOKEN|RENDER_API_KEY|VERCEL_TOKEN",
-        "доступ до секретів Grox",
-    ),
-)
+def is_safe_project_file_path(filename: str) -> bool:
+    """Accept portable relative project paths; reject traversal and absolute paths."""
+    if not isinstance(filename, str) or not filename or len(filename) > 240:
+        return False
+    if "\\" in filename or filename.startswith("/"):
+        return False
+    if re.match(r"^[A-Za-z]:", filename):
+        return False
+    parts = filename.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return False
+    if any(not re.fullmatch(r"[A-Za-z0-9_.@+-]+", part) for part in parts):
+        return False
+    return True
+
+
+def extract_marked_project_files(
+    raw_response: str,
+    return_errors: bool = False,
+):
+    """Parse marked files and fail closed on duplicate paths."""
+    extracted: dict[str, str] = {}
+    errors: list[str] = []
+    seen_paths: set[str] = set()
+    duplicate_paths: set[str] = set()
+    marker = re.compile(
+        r"(?im)^\s*(?:```[^\n]*\n\s*)?===\s*FILE\s*:\s*"
+        r"([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*)\s*===\s*$"
+    )
+    matches = list(marker.finditer(raw_response or ""))
+    for index, match in enumerate(matches):
+        filename = match.group(1)
+        if not is_safe_project_file_path(filename):
+            errors.append(f"Відхилено небезпечний шлях у маркері файлу: {filename[:120]}.")
+            continue
+        normalized = filename.casefold()
+        if normalized in seen_paths:
+            duplicate_paths.add(normalized)
+            errors.append(
+                f"Файл {filename} позначено більше одного разу; неоднозначний вміст відхилено."
+            )
+            extracted.pop(filename, None)
+            continue
+        seen_paths.add(normalized)
+        body_start = match.end()
+        body_end = matches[index + 1].start() if index + 1 < len(matches) else len(raw_response or "")
+        body = (raw_response or "")[body_start:body_end].strip()
+        body = re.sub(r"^\s*```(?:python|py|text|markdown|json|yaml|yml|javascript|typescript)?\s*", "", body, flags=re.IGNORECASE)
+        body = re.sub(r"\s*```\s*$", "", body)
+        if body.strip():
+            extracted[filename] = body.strip()
+
+    # A duplicate differing only by case must also invalidate the original.
+    if duplicate_paths:
+        extracted = {
+            name: content for name, content in extracted.items()
+            if name.casefold() not in duplicate_paths
+        }
+    return (extracted, errors) if return_errors else extracted
 
 
 def validate_generated_project(
@@ -2442,83 +3434,297 @@ def validate_generated_project(
     bot2: bool = False,
     require_discord: bool = False,
 ) -> list[str]:
-    """Perform deterministic checks before any generated files are published."""
+    """Validate every generated Python file before any file is published."""
     errors: list[str] = []
+    reported: set[str] = set()
+
+    if not isinstance(files, dict):
+        return ["Список файлів проєкту має некоректний формат."]
+    if len(files) > 100:
+        add_message = "Проєкт містить понад 100 файлів; розбий його на менші модулі."
+        return [add_message]
+    total_bytes = 0
+    normalized_paths: set[str] = set()
+    for filename, content in files.items():
+        if not is_safe_project_file_path(filename):
+            errors.append(f"Некоректний або небезпечний шлях файлу: {str(filename)[:120]}.")
+            continue
+        normalized = filename.casefold()
+        if normalized in normalized_paths:
+            errors.append(f"Дубльований шлях файлу без урахування регістру: {filename}.")
+        normalized_paths.add(normalized)
+        if not isinstance(content, str):
+            errors.append(f"Вміст файлу {filename} має бути текстом.")
+            continue
+        total_bytes += len(content.encode("utf-8"))
+        if len(content.encode("utf-8")) > 1_000_000:
+            errors.append(f"Файл {filename} перевищує ліміт 1 МБ.")
+    if total_bytes > 5_000_000:
+        errors.append("Загальний розмір проєкту перевищує ліміт 5 МБ.")
+
+    def add_error(message: str):
+        if message not in reported:
+            reported.add(message)
+            errors.append(message)
 
     for required in ("main.py", "requirements.txt", "README.md"):
-        if not files.get(required, "").strip():
-            errors.append(f"Відсутній або порожній файл {required}.")
+        if not isinstance(files.get(required), str) or not files[required].strip():
+            add_error(f"Відсутній або порожній файл {required}.")
 
     main_code = files.get("main.py", "")
-    if main_code:
+    python_sources = {
+        name: content
+        for name, content in files.items()
+        if isinstance(name, str)
+        and name.lower().endswith(".py")
+        and isinstance(content, str)
+    }
+
+    forbidden_secrets = {
+        "GITHUB_TOKEN",
+        "RENDER_API_KEY",
+        "VERCEL_TOKEN",
+        "GROX_DATABASE_URL",
+    }
+    dangerous_os_calls = {
+        "system", "popen", "fork", "forkpty", "posix_spawn", "posix_spawnp", "startfile",
+        "spawnl", "spawnle", "spawnlp", "spawnlpe",
+        "spawnv", "spawnve", "spawnvp", "spawnvpe",
+        "execl", "execle", "execlp", "execlpe",
+        "execv", "execve", "execvp", "execvpe",
+    }
+    dangerous_asyncio_calls = {"create_subprocess_exec", "create_subprocess_shell"}
+
+    requirement_names: set[str] = set()
+    for requirement_line in files.get("requirements.txt", "").splitlines():
+        clean_line = requirement_line.split("#", 1)[0].strip()
+        if not clean_line or clean_line.startswith("-"):
+            continue
+        if " @ " in clean_line:
+            clean_line = clean_line.split(" @ ", 1)[0].strip()
+        package_name = re.split(r"[<>=!~;\\[]", clean_line, maxsplit=1)[0]
+        if package_name:
+            requirement_names.add(package_name.casefold().replace("_", "-").replace(".", "-"))
+
+    known_import_distributions = {
+        "aiohttp": {"aiohttp"},
+        "asyncpg": {"asyncpg"},
+        "discord": {"discord-py", "py-cord"},
+        "PIL": {"pillow"},
+        "cv2": {"opencv-python", "opencv-python-headless"},
+        "yaml": {"pyyaml"},
+        "bs4": {"beautifulsoup4"},
+        "dotenv": {"python-dotenv"},
+        "dateutil": {"python-dateutil"},
+        "jwt": {"pyjwt"},
+        "sklearn": {"scikit-learn"},
+        "telegram": {"python-telegram-bot", "aiogram", "telethon"},
+        "google": {"google-genai", "google-generativeai", "google-api-python-client"},
+        "openai": {"openai"},
+        "requests": {"requests"},
+        "flask": {"flask"},
+        "fastapi": {"fastapi"},
+        "uvicorn": {"uvicorn"},
+        "sqlalchemy": {"sqlalchemy"},
+        "psycopg": {"psycopg", "psycopg2", "psycopg2-binary"},
+        "psycopg2": {"psycopg2", "psycopg2-binary"},
+        "redis": {"redis"},
+        "playwright": {"playwright"},
+        "numpy": {"numpy"},
+        "pandas": {"pandas"},
+        "pydantic": {"pydantic"},
+        "stripe": {"stripe"},
+        "boto3": {"boto3"},
+        "supabase": {"supabase"},
+        "firebase_admin": {"firebase-admin"},
+        "qrcode": {"qrcode"},
+        "cryptography": {"cryptography"},
+        "websockets": {"websockets"},
+    }
+    standard_library = set(getattr(sys, "stdlib_module_names", ()))
+    local_modules = {
+        os.path.splitext(os.path.basename(name))[0]
+        for name in python_sources
+    }
+    local_modules.update(
+        name.split("/", 1)[0]
+        for name in python_sources
+        if "/" in name
+    )
+    imported_modules: set[str] = set()
+
+    for filename, source in python_sources.items():
         try:
-            tree = ast.parse(main_code, filename="generated_main.py")
+            tree = ast.parse(source, filename=filename)
         except SyntaxError as error:
-            errors.append(
-                f"Синтаксична помилка main.py: рядок {error.lineno}: {error.msg}."
+            add_error(
+                f"Синтаксична помилка {filename}: рядок {error.lineno}: {error.msg}."
             )
-            tree = None
+            continue
 
-        # Inspect executable syntax rather than comments or string literals.
-        if tree is not None:
-            forbidden_secrets = {
-                "GITHUB_TOKEN", "RENDER_API_KEY",
-                "VERCEL_TOKEN", "GROX_DATABASE_URL",
-            }
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    modules = {alias.name.split(".", 1)[0] for alias in node.names}
-                    if "subprocess" in modules:
-                        errors.append("У main.py заборонено імпорт subprocess.")
-                    if "pickle" in modules:
-                        errors.append("У main.py заборонено імпорт pickle.")
-                elif isinstance(node, ast.ImportFrom):
-                    module = (node.module or "").split(".", 1)[0]
-                    if module == "subprocess":
-                        errors.append("У main.py заборонено імпорт subprocess.")
-                    if module == "pickle":
-                        errors.append("У main.py заборонено імпорт pickle.")
+        # Resolve import aliases before inspecting calls. This catches aliased
+        # os modules and functions imported directly from os or builtins.
+        os_modules = {"os"}
+        pickle_modules = {"pickle"}
+        builtins_modules = {"builtins"}
+        subprocess_modules = {"subprocess"}
+        asyncio_modules = {"asyncio"}
+        dangerous_function_aliases: dict[str, str] = {}
+        getenv_aliases: set[str] = set()
+        environ_aliases: set[str] = set()
 
-                if isinstance(node, ast.Call):
-                    function = node.func
-                    if isinstance(function, ast.Name) and function.id in {"eval", "exec", "__import__"}:
-                        errors.append(f"У main.py заборонено виклик {function.id}().")
-                    if (
-                        isinstance(function, ast.Attribute)
-                        and isinstance(function.value, ast.Name)
-                        and function.value.id == "os"
-                        and function.attr == "system"
-                    ):
-                        errors.append("У main.py заборонено виклик os.system().")
-                    if (
-                        isinstance(function, ast.Attribute)
-                        and isinstance(function.value, ast.Name)
-                        and function.value.id == "subprocess"
-                    ):
-                        errors.append("У main.py заборонено виклики subprocess.")
-                    if (
-                        isinstance(function, ast.Attribute)
-                        and isinstance(function.value, ast.Name)
-                        and function.value.id == "pickle"
-                        and function.attr in {"load", "loads"}
-                    ):
-                        errors.append("У main.py заборонено десеріалізацію через pickle.")
-                    if (
-                        isinstance(function, ast.Attribute)
-                        and isinstance(function.value, ast.Name)
-                        and function.value.id == "os"
-                        and function.attr == "getenv"
-                        and node.args
-                        and isinstance(node.args[0], ast.Constant)
-                        and node.args[0].value in forbidden_secrets
-                    ):
-                        errors.append(
-                            f"У main.py заборонено читати захищену змінну {node.args[0].value}."
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".", 1)[0]
+                    imported_modules.add(root)
+                    bound_name = alias.asname or root
+                    if root == "os":
+                        os_modules.add(bound_name)
+                    elif root == "pickle":
+                        pickle_modules.add(bound_name)
+                        add_error(f"У {filename} заборонено імпорт pickle.")
+                    elif root == "subprocess":
+                        subprocess_modules.add(bound_name)
+                        add_error(f"У {filename} заборонено імпорт subprocess.")
+                    elif root == "builtins":
+                        builtins_modules.add(bound_name)
+                    elif root == "asyncio":
+                        asyncio_modules.add(bound_name)
+                    elif root in {"pty", "commands"}:
+                        add_error(f"У {filename} заборонено імпорт {root}.")
+
+            elif isinstance(node, ast.ImportFrom):
+                module = (node.module or "").split(".", 1)[0]
+                if module:
+                    imported_modules.add(module)
+                if module == "subprocess":
+                    add_error(f"У {filename} заборонено імпорт subprocess.")
+                elif module == "pickle":
+                    add_error(f"У {filename} заборонено імпорт pickle.")
+                elif module == "os":
+                    for alias in node.names:
+                        bound_name = alias.asname or alias.name
+                        if alias.name in dangerous_os_calls:
+                            dangerous_function_aliases[bound_name] = f"os.{alias.name}"
+                        elif alias.name == "getenv":
+                            getenv_aliases.add(bound_name)
+                        elif alias.name == "environ":
+                            environ_aliases.add(bound_name)
+                elif module == "builtins":
+                    for alias in node.names:
+                        if alias.name in {"eval", "exec", "__import__"}:
+                            dangerous_function_aliases[alias.asname or alias.name] = f"builtins.{alias.name}"
+                elif module == "asyncio":
+                    for alias in node.names:
+                        if alias.name in dangerous_asyncio_calls:
+                            dangerous_function_aliases[alias.asname or alias.name] = f"asyncio.{alias.name}"
+                elif module in {"pty", "commands"}:
+                    add_error(f"У {filename} заборонено імпорт {module}.")
+
+        def is_secret_argument(call_node: ast.Call) -> bool:
+            return bool(
+                call_node.args
+                and isinstance(call_node.args[0], ast.Constant)
+                and isinstance(call_node.args[0].value, str)
+                and call_node.args[0].value in forbidden_secrets
+            )
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                function = node.func
+
+                if isinstance(function, ast.Name):
+                    if function.id in {"eval", "exec", "__import__"}:
+                        add_error(f"У {filename} заборонено виклик {function.id}().")
+                    elif function.id in dangerous_function_aliases:
+                        original_name = dangerous_function_aliases[function.id]
+                        add_error(
+                            f"У {filename} заборонено виклик небезпечної функції "
+                            f"{function.id}() (оригінальна функція: {original_name}())."
+                        )
+                    if function.id in getenv_aliases and is_secret_argument(node):
+                        add_error(
+                            f"У {filename} заборонено читати захищену змінну "
+                            f"{node.args[0].value}."
                         )
 
-    # Require the Discord runtime dependency only for projects routed to
-    # Discord. Telegram and other software projects must not be rejected for
-    # correctly omitting a Discord library.
+                elif isinstance(function, ast.Attribute):
+                    owner = function.value
+                    if isinstance(owner, ast.Name):
+                        if owner.id in os_modules and function.attr in dangerous_os_calls:
+                            add_error(
+                                f"У {filename} заборонено виклик os.{function.attr}()."
+                            )
+                        if owner.id in os_modules and function.attr == "getenv" and is_secret_argument(node):
+                            add_error(
+                                f"У {filename} заборонено читати захищену змінну "
+                                f"{node.args[0].value}."
+                            )
+                        if owner.id in pickle_modules and function.attr in {"load", "loads"}:
+                            add_error(
+                                f"У {filename} заборонено десеріалізацію через pickle."
+                            )
+                        if owner.id in builtins_modules and function.attr in {"eval", "exec", "__import__"}:
+                            add_error(
+                                f"У {filename} заборонено виклик builtins.{function.attr}()."
+                            )
+                        if owner.id in environ_aliases and function.attr in {"get", "__getitem__"} and is_secret_argument(node):
+                            add_error(
+                                f"У {filename} заборонено читати захищену змінну "
+                                f"{node.args[0].value}."
+                            )
+                        if owner.id in subprocess_modules:
+                            add_error(
+                                f"У {filename} заборонено виклики subprocess."
+                            )
+                        if owner.id in asyncio_modules and function.attr in dangerous_asyncio_calls:
+                            add_error(
+                                f"У {filename} заборонено запускати дочірні процеси через asyncio."
+                            )
+
+                    elif isinstance(owner, ast.Attribute):
+                        if (
+                            isinstance(owner.value, ast.Name)
+                            and owner.value.id in os_modules
+                            and owner.attr == "environ"
+                            and function.attr in {"get", "__getitem__"}
+                            and is_secret_argument(node)
+                        ):
+                            add_error(
+                                f"У {filename} заборонено читати захищену змінну "
+                                f"{node.args[0].value}."
+                            )
+
+            elif isinstance(node, ast.Subscript):
+                owner = node.value
+                key = node.slice
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    if key.value in forbidden_secrets:
+                        if (
+                            isinstance(owner, ast.Attribute)
+                            and isinstance(owner.value, ast.Name)
+                            and owner.value.id in os_modules
+                            and owner.attr == "environ"
+                        ) or (
+                            isinstance(owner, ast.Name)
+                            and owner.id in environ_aliases
+                        ):
+                            add_error(
+                                f"У {filename} заборонено читати захищену змінну {key.value}."
+                            )
+
+    for module in sorted(imported_modules):
+        if module in standard_library or module in local_modules:
+            continue
+        expected_distributions = known_import_distributions.get(module)
+        if expected_distributions and not (expected_distributions & requirement_names):
+            expected = " або ".join(sorted(expected_distributions))
+            add_error(
+                f"У requirements.txt не вказана залежність для імпорту {module} "
+                f"(додай одну з: {expected})."
+            )
+
     if require_discord:
         requirements = files.get("requirements.txt", "")
         requirement_lines = [
@@ -2535,32 +3741,104 @@ def validate_generated_project(
             for line in requirement_lines
         )
         if not has_discord_dependency:
-            errors.append(
+            add_error(
                 "У requirements.txt не вказана залежність discord.py або py-cord."
             )
 
     if not bot2 or not main_code:
         return errors
 
-    checks = [
-        (r"import\s+discord|from\s+discord", "Discord.py"),
-        (r"on_message|wait_for\s*\(|message_content", "обробка повідомлень Discord"),
-        (r"member_count|BOT2_MIN_GUILD_MEMBERS|MIN_GUILD_MEMBERS", "фільтр серверів за кількістю учасників"),
-        (r"\b500\b|BOT2_MIN_GUILD_MEMBERS", "мінімум 500 учасників"),
-        (r"moderator|модератор|approval|approve|погодж", "модерація та ручне підтвердження"),
-        (r"sqlite|asyncpg|psycopg|DATABASE_URL|database", "постійне збереження даних"),
-        (r"europe|european|eu\b|європ", "пріоритет європейських спільнот"),
-        (r"website|web\s*site|discord\s*bot|application|software|сайт|застосунок|розроб", "пошук IT-замовлень"),
-        (r"dedup|duplicate|дубл", "захист від дублікатів"),
-        (r"/health|health_handler|discord_ready", "перевірка готовності Discord у health endpoint"),
+    try:
+        bot2_tree = ast.parse(main_code, filename="main.py")
+    except SyntaxError:
+        return errors
+
+    bot2_imports: set[str] = set()
+    bot2_identifiers: set[str] = set()
+    bot2_numbers: set[int] = set()
+    for node in ast.walk(bot2_tree):
+        if isinstance(node, ast.Import):
+            bot2_imports.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            bot2_imports.add(node.module.split(".", 1)[0])
+
+        if isinstance(node, (ast.Name, ast.Attribute, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else node.name
+            bot2_identifiers.add(name.casefold())
+        elif isinstance(node, ast.Constant):
+            if isinstance(node.value, int) and not isinstance(node.value, bool):
+                bot2_numbers.add(node.value)
+
+    def has_identifier_fragment(*fragments: str) -> bool:
+        return any(
+            fragment in identifier
+            for identifier in bot2_identifiers
+            for fragment in fragments
+        )
+
+    bot2_checks = [
+        ("discord" in bot2_imports, "Discord.py"),
+        (bool(bot2_identifiers & {"on_message", "wait_for", "message_content", "process_commands"}), "обробка повідомлень Discord"),
+        (bool(bot2_identifiers & {"member_count", "bot2_min_guild_members", "min_guild_members"}), "фільтр серверів за кількістю учасників"),
+        (500 in bot2_numbers or "bot2_min_guild_members" in bot2_identifiers, "мінімум 500 учасників"),
+        (
+            has_identifier_fragment("moderator", "approve", "approval", "mod_role", "has_permissions", "manage_messages"),
+            "модерація та ручне підтвердження",
+        ),
+        (
+            bool(bot2_imports & {"sqlite3", "asyncpg", "psycopg", "psycopg2", "sqlalchemy", "redis"})
+            or has_identifier_fragment("database_url", "db_pool", "database", "sqlite3", "asyncpg"),
+            "постійне збереження даних",
+        ),
+        (
+            has_identifier_fragment("europe", "european", "eu_", "eu_countries", "eu_keywords", "european_priority"),
+            "пріоритет європейських спільнот",
+        ),
+        (
+            has_identifier_fragment("search", "scan", "community", "keyword", "query", "request", "lead", "project", "job", "software", "website"),
+            "пошук IT-замовлень",
+        ),
+        (
+            has_identifier_fragment("dedup", "duplicate", "processed", "seen", "discord_message_id", "message_id"),
+            "захист від дублікатів",
+        ),
+        (
+            has_identifier_fragment("health", "discord_ready", "is_ready"),
+            "перевірка готовності Discord у health endpoint",
+        ),
     ]
-    for pattern, label in checks:
-        if not re.search(pattern, main_code, re.IGNORECASE):
-            errors.append(f"У main.py не знайдено реалізацію: {label}.")
+    for passed, label in bot2_checks:
+        if not passed:
+            add_error(f"У main.py не знайдено реалізацію: {label}.")
+
+    # Reject the most dangerous obvious moderator-auth bypass: a moderator
+    # predicate that unconditionally returns True. Identifier names alone
+    # are not evidence that authorization is actually enforced.
+    for node in ast.walk(bot2_tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        function_name = node.name.casefold()
+        if not any(term in function_name for term in ("moderator", "authorized", "is_admin", "has_permission")):
+            continue
+        has_true_return = any(
+            isinstance(child, ast.Return)
+            and isinstance(child.value, ast.Constant)
+            and child.value.value is True
+            for child in ast.walk(node)
+        )
+        has_guard = any(
+            isinstance(child, (ast.If, ast.IfExp, ast.Compare, ast.BoolOp))
+            for child in ast.walk(node)
+        )
+        if has_true_return and not has_guard:
+            add_error(
+                f"Функція {node.name}() безумовно повертає True; "
+                "це дозволяє всім учасникам обійти перевірку модератора."
+            )
 
     readme = files.get("README.md", "").casefold()
     if "discord" not in readme or not re.search(r"environment|змін", readme):
-        errors.append("README.md не містить достатніх інструкцій Discord та Environment Variables.")
+        add_error("README.md не містить достатніх інструкцій Discord та Environment Variables.")
 
     return errors
 
@@ -2568,6 +3846,7 @@ def validate_generated_project(
 async def generate_software_project(client_task: str):
     bot2 = is_bot2_project(client_task)
     platform = "Discord" if bot2 else detect_bot_platform(client_task)
+    is_discord_platform = "discord" in str(platform).casefold()
     special_requirements = bot2_project_spec() if bot2 else ""
 
     prompt = f"""
@@ -2596,11 +3875,19 @@ async def generate_software_project(client_task: str):
 - main.py має запускати health server паралельно з основним ботом.
 - Якщо credentials відсутні, повідомляй про це зрозуміло й без витоку секретів.
 - Якщо це Bot 2, суворо дотримуйся Discord-only вимог вище; не додавай інші платформи.
+- Використовуй модульну структуру: за потреби створи окремі .py-модулі, папки, конфігурацію, шаблони, статичні файли та тести.
+- Усі імпорти між локальними модулями мають відповідати реальній структурі папок.
+- Не дублюй код у різних файлах. Не створюй файли, які не використовуються.
+- Максимум 100 файлів; кожен текстовий файл до 1 МБ, увесь проєкт до 5 МБ.
+- Завжди повертай main.py, requirements.txt і README.md, навіть якщо додаткові файли не потрібні.
 
-ПОВЕРНИ РІВНО ТРИ ФАЙЛИ В ТАКОМУ ФОРМАТІ:
+ПОВЕРНИ КОЖЕН ФАЙЛ ПОВНІСТЮ, КОЖЕН З ОКРЕМИМ МАРКЕРОМ:
 
 ===FILE: main.py===
 <повний код>
+
+===FILE: package/module.py===
+<повний код додаткового модуля; шлях від кореня проєкту>
 
 ===FILE: requirements.txt===
 <повний вміст>
@@ -2608,7 +3895,7 @@ async def generate_software_project(client_task: str):
 ===FILE: README.md===
 <повний вміст>
 
-Не використовуй Markdown fences навколо файлів.
+Для файлів у підпапках використовуй відносні шляхи з /, наприклад src/bot.py або tests/test_bot.py. Не використовуй абсолютні шляхи, .., зворотні слеші чи Markdown fences навколо файлів. Не додавай пояснень поза файлами.
 """
 
     generation_result = await groq_request(
@@ -2618,25 +3905,36 @@ async def generate_software_project(client_task: str):
     )
     result = generation_result["content"]
     generation_truncated = generation_result["finish_reason"] == "length"
+    if generation_truncated:
+        result, generation_truncated = await continue_truncated_groq_output(
+            result,
+            context=(
+                "Клієнтське ТЗ:\n" + client_task
+                + "\nПлатформа:\n" + platform
+                + "\nСпеціальні вимоги:\n" + special_requirements
+            ),
+            output_contract=(
+                "Продовжуй повний багатофайловий проєкт з маркерами "
+                "===FILE: відносний/шлях/файлу===. Не повторюй уже завершені файли. "
+                "Обов'язково збережи main.py, requirements.txt і README.md та поверни "
+                "всі решту файлів, які ще не були завершені."
+            ),
+            max_rounds=3,
+        )
+
+    parse_errors: list[str] = []
 
     def extract_project_files(raw_response: str) -> dict[str, str]:
         """Extract named project files, tolerating common harmless LLM formatting variations."""
-        extracted: dict[str, str] = {}
+        nonlocal parse_errors
+        extracted, parse_errors = extract_marked_project_files(
+            raw_response, return_errors=True
+        )
         marker = re.compile(
             r"(?im)^\s*(?:```[^\n]*\n\s*)?===\s*FILE\s*:\s*"
-            r"(main\.py|requirements\.txt|README\.md)\s*===\s*$"
+            r"([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*)\s*===\s*$"
         )
         matches = list(marker.finditer(raw_response or ""))
-        for index, match in enumerate(matches):
-            filename = match.group(1)
-            body_start = match.end()
-            body_end = matches[index + 1].start() if index + 1 < len(matches) else len(raw_response)
-            body = raw_response[body_start:body_end].strip()
-            body = re.sub(r"^\s*```(?:python|text|markdown)?\s*", "", body, flags=re.IGNORECASE)
-            body = re.sub(r"\s*```\s*$", "", body)
-            if body.strip():
-                extracted[filename] = body.strip()
-
         # Some models omit the main.py marker or wrap the file in a Python
         # code fence. Recover only syntactically valid, recognisable entry-point
         # code; never treat arbitrary README snippets as the project main file.
@@ -2710,6 +4008,31 @@ async def generate_software_project(client_task: str):
         return extracted
 
     files = extract_project_files(result)
+
+    # Create predictable Discord metadata locally instead of spending Groq TPM
+    # on files whose contents are deterministic.
+    if is_discord_platform:
+        existing_requirements = files.get("requirements.txt", "").strip()
+        requirement_lines = [
+            line.strip() for line in existing_requirements.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if not any(re.match(r"(?i)^(discord\.py|py-cord)(?:[<=>!~]|$)", line) for line in requirement_lines):
+            requirement_lines.insert(0, "discord.py")
+        files["requirements.txt"] = "\n".join(dict.fromkeys(requirement_lines)) + "\n"
+
+        if not files.get("README.md", "").strip():
+            files["README.md"] = (
+                "# Discord bot\n\n"
+                "## Запуск\n\n"
+                "1. Встановіть залежності командою pip install -r requirements.txt.\n"
+                "2. Додайте токен у змінну середовища DISCORD_TOKEN.\n"
+                "3. Запустіть командою python main.py.\n\n"
+                "## Environment variables\n\n"
+                "- DISCORD_TOKEN — токен Discord-бота.\n"
+                "- PORT — необов'язковий порт health endpoint (за замовчуванням 10000).\n"
+            )
+
     print(
         "[PROJECT GENERATION] "
         f"response_chars={len(result)} "
@@ -2718,8 +4041,11 @@ async def generate_software_project(client_task: str):
         f"extracted={sorted(files)} "
         f"missing={[name for name in ('main.py', 'requirements.txt', 'README.md') if not files.get(name, '').strip()]}"
     )
-    validation_errors = validate_generated_project(
-        files, bot2=bot2, require_discord=(platform == "Discord")
+    validation_errors = list(parse_errors)
+    validation_errors.extend(
+        validate_generated_project(
+            files, bot2=bot2, require_discord=is_discord_platform
+        )
     )
     if generation_truncated:
         validation_errors.append(
@@ -2727,7 +4053,10 @@ async def generate_software_project(client_task: str):
         )
     # Run a bounded repair/validation cycle. Never publish files unless the
     # deterministic validator reports zero errors after a complete repair.
-    max_repair_rounds = 3
+    # Repair one file per Groq call so a large project does not send
+    # several complete source files in a single TPM-heavy prompt.
+    # Keep the process bounded even for projects with many modules.
+    max_repair_rounds = min(12, max(3, len(files) + 3))
     repair_round = 0
 
     while validation_errors and repair_round < max_repair_rounds:
@@ -2740,6 +4069,14 @@ async def generate_software_project(client_task: str):
         repair_targets = list(missing_files)
 
         error_text = "\n".join(validation_errors)
+        # Include every explicitly named file with a syntax/dependency error,
+        # including nested modules, so repairs do not silently ignore them.
+        for candidate in re.findall(
+            r"(?<![A-Za-z0-9_.@+-])([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*\.py)",
+            error_text,
+        ):
+            if is_safe_project_file_path(candidate) and candidate in files and candidate not in repair_targets:
+                repair_targets.append(candidate)
         if "main.py" in error_text and "main.py" not in repair_targets:
             repair_targets.insert(0, "main.py")
         if "requirements.txt" in error_text and "requirements.txt" not in repair_targets:
@@ -2751,18 +4088,93 @@ async def generate_software_project(client_task: str):
         if repair_round == 1 and generation_truncated:
             file_marker = re.compile(
                 r"(?im)^\s*===\s*FILE\s*:\s*"
-                r"(main\.py|requirements\.txt|README\.md)\s*===\s*$"
+                r"([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*)\s*===\s*$"
             )
-            generation_markers = list(file_marker.finditer(result or ""))
+            generation_markers = [
+                match for match in file_marker.finditer(result or "")
+                if is_safe_project_file_path(match.group(1))
+            ]
             truncated_target = (
                 generation_markers[-1].group(1)
                 if generation_markers else "main.py"
             )
-            if truncated_target not in repair_targets:
-                repair_targets.append(truncated_target)
+            if truncated_target in repair_targets:
+                repair_targets.remove(truncated_target)
+            repair_targets.insert(0, truncated_target)
 
         if not repair_targets:
             repair_targets = ["main.py"]
+
+        # Repair exactly one target per request. The validator runs again
+        # after each successful response and selects the next unresolved file.
+        repair_targets = repair_targets[:1]
+
+        # Repair syntax errors with a small local window instead of resending
+        # an entire generated source file (which can exceed Groq's TPM window).
+        syntax_match = re.search(
+            r"main\.py:\s*(?:рядок|line)\s*(\d+)",
+            error_text,
+            re.IGNORECASE,
+        )
+        if syntax_match and "main.py" in repair_targets and files.get("main.py", "").strip():
+            source_lines = files["main.py"].splitlines()
+            error_line = int(syntax_match.group(1))
+            window_start = max(1, error_line - 6)
+            window_end = min(len(source_lines), error_line + 6)
+            snippet = "\n".join(
+                source_lines[number - 1]
+                for number in range(window_start, window_end + 1)
+            )
+            syntax_prompt = (
+                "Ти — досвідчений Python-інженер. Виправ ТІЛЬКИ синтаксичну помилку "
+                "у наведеному фрагменті Python. Збережи логіку та всі рядки, які не "
+                "потрібно змінювати. Поверни повний виправлений фрагмент між точними "
+                "маркерами нижче, без Markdown та пояснень. Кожен рядок фрагмента "
+                "має бути збережений, включно з відступами.\n"
+                f"===PATCH_LINES:{window_start}-{window_end}===\n"
+                + snippet
+                + "\n\nПомилка: "
+                + "; ".join(validation_errors)[:1200]
+            )
+            try:
+                syntax_result = await groq_request(
+                    syntax_prompt, max_output_tokens=1200, return_metadata=True
+                )
+                patch_text = syntax_result.get("content", "")
+                patch_match = re.search(
+                    rf"(?s)===PATCH_LINES:{window_start}-{window_end}===\s*\n(.*)",
+                    patch_text,
+                )
+                if patch_match and syntax_result.get("finish_reason") != "length":
+                    replacement_lines = patch_match.group(1).rstrip().splitlines()
+                    if len(replacement_lines) == window_end - window_start + 1:
+                        source_lines[window_start - 1:window_end] = replacement_lines
+                        candidate_source = "\n".join(source_lines) + "\n"
+                        try:
+                            ast.parse(candidate_source, filename="main.py")
+                        except SyntaxError as syntax_error:
+                            validation_errors = [
+                                f"Синтаксична помилка main.py: рядок {syntax_error.lineno}: {syntax_error.msg}."
+                            ]
+                        else:
+                            files["main.py"] = candidate_source
+                            validation_errors = validate_generated_project(
+                                files, bot2=bot2, require_discord=is_discord_platform
+                            )
+                            print(
+                                "[PROJECT REPAIR] targeted_syntax_patch=accepted "
+                                f"lines={window_start}-{window_end}"
+                            )
+                            continue
+                    else:
+                        print("[PROJECT REPAIR] targeted_syntax_patch=rejected reason=line_count")
+                else:
+                    print("[PROJECT REPAIR] targeted_syntax_patch=rejected reason=missing_or_truncated_marker")
+            except Exception as syntax_repair_error:
+                print(
+                    "[PROJECT REPAIR] targeted_syntax_patch_failed="
+                    f"{type(syntax_repair_error).__name__}: {safe_error_detail(syntax_repair_error)}"
+                )
 
         requested_files = "\n".join(
             f"===FILE: {name}===\n<повний виправлений вміст {name}>"
@@ -2790,15 +4202,70 @@ async def generate_software_project(client_task: str):
             + "\n\nПОТОЧНІ ФАЙЛИ:\n" + current_files_context
             + "\n\nПОМИЛКИ ПЕРЕВІРКИ:\n- "
             + "\n- ".join(validation_errors)
-            + "\n\nПОЧАТКОВЕ ТЕХНІЧНЕ ЗАВДАННЯ:\n" + client_task
-            + "\n\nПЛАТФОРМА:\n" + platform
-            + "\n\nСПЕЦІАЛЬНІ ВИМОГИ:\n" + special_requirements
+            + "\n\nКОНТЕКСТ ПРОЄКТУ (скорочено):\n"
+            + "Платформа: " + str(platform)[:100] + ". "
+            + "Виправляй лише перелічені помилки, зберігай наявну функціональність. "
+            + "Для Discord requirements.txt обов'язково має містити discord.py або py-cord. "
+            + "README.md має містити короткі інструкції запуску. "
+            + "Початкове ТЗ (обмежено 1200 символами):\n"
+            + str(client_task)[:1200]
         )
+
+        # The previous repair prompt repeated the full task and special
+        # requirements every round. This could exceed the shared TPM budget
+        # and fail locally before a request reached Groq.
+        repair_input_estimate = estimate_groq_prompt_tokens(repair_prompt)
+        print(
+            "[PROJECT REPAIR] "
+            f"round={repair_round}/{max_repair_rounds} "
+            f"targets={repair_targets} "
+            f"estimated_input_tokens={repair_input_estimate} "
+            f"prompt_chars={len(repair_prompt)}"
+        )
+        if repair_input_estimate > (
+            GROQ_TPM_LIMIT - GROQ_TPM_RESERVE - GROQ_MIN_COMPLETION_TOKENS
+        ):
+            # Keep the full source of target files, but remove all optional
+            # task context and retain only the deterministic validation errors.
+            repair_prompt = (
+                "Виправ повністю зазначені файли, збережи їхню функціональність. "
+                "Поверни лише повні файли з маркерами ===FILE: шлях===. "
+                "Для Discord requirements.txt має містити discord.py або py-cord; "
+                "README.md — інструкції запуску.\n\n"
+                + "ЦІЛЬОВІ ФАЙЛИ: " + ", ".join(repair_targets)
+                + "\n\nПОТОЧНИЙ ВМІСТ:\n" + current_files_context
+                + "\n\nПОМИЛКИ:\n- " + "\n- ".join(validation_errors)
+            )
+            repair_input_estimate = estimate_groq_prompt_tokens(repair_prompt)
+            print(
+                "[PROJECT REPAIR] compact_prompt="
+                f"estimated_input_tokens={repair_input_estimate} "
+                f"prompt_chars={len(repair_prompt)}"
+            )
+
+        # Keep the repair output budget smaller so source plus output fit the
+        # 8k-TPM window. A 3500-token reservation left only 3800 tokens for
+        # the prompt and rejected ordinary source-file repairs before API call.
+        repair_output_budget, max_repair_input_tokens = groq_request_budgets(1800)
+        if repair_input_estimate > max_repair_input_tokens:
+            message = (
+                "Автоматичне виправлення зупинено до запиту Groq: навіть "
+                "скорочений контекст перевищує доступний TPM-бюджет "
+                f"({repair_input_estimate} > {max_repair_input_tokens}). "
+                "Потрібно розбити ремонт на менші частини."
+            )
+            print(
+                "[PROJECT REPAIR] skipped_over_budget="
+                f"estimated_input_tokens={repair_input_estimate} "
+                f"max_input_tokens={max_repair_input_tokens}"
+            )
+            validation_errors.append(message)
+            break
 
         try:
             repair_generation = await groq_request(
                 repair_prompt,
-                max_output_tokens=30000,
+                max_output_tokens=repair_output_budget,
                 return_metadata=True,
             )
         except Exception as repair_error:
@@ -2809,12 +4276,35 @@ async def generate_software_project(client_task: str):
             )
             validation_errors.append(
                 f"Раунд виправлення {repair_round}: запит до Groq не виконано "
-                f"({type(repair_error).__name__})."
+                f"({type(repair_error).__name__}; {safe_error_detail(repair_error)})."
             )
+            error_detail = str(repair_error).lower()
+            if "завеликий" in error_detail or "tpm" in error_detail:
+                print(
+                    "[PROJECT REPAIR] stopping_after_tpm_budget_error="
+                    f"round={repair_round}"
+                )
+                break
             continue
 
         repaired_result = repair_generation["content"]
         repair_truncated = repair_generation["finish_reason"] == "length"
+        if repair_truncated:
+            repaired_result, repair_truncated = await continue_truncated_groq_output(
+                repaired_result,
+                context=(
+                    "Клієнтське ТЗ:\n" + client_task
+                    + "\nПлатформа:\n" + platform
+                    + "\nПомилки перевірки:\n" + "\n".join(validation_errors)
+                    + "\nПоточні цільові файли:\n" + current_files_context
+                ),
+                output_contract=(
+                    "Поверни продовження повних файлів: "
+                    + ", ".join(repair_targets)
+                    + ". Не повторюй уже видані частини."
+                ),
+                max_rounds=3,
+            )
         repaired_files = extract_project_files(repaired_result)
         returned_targets = [
             name for name in repair_targets
@@ -2856,7 +4346,7 @@ async def generate_software_project(client_task: str):
             for name in repair_targets
         })
         validation_errors = validate_generated_project(
-            files, bot2=bot2, require_discord=(platform == "Discord")
+            files, bot2=bot2, require_discord=is_discord_platform
         )
 
     if validation_errors:
@@ -2971,8 +4461,8 @@ async def wait_for_generated_service_ready(
             await asyncio.sleep(max(3, BOT2_HEALTH_POLL_INTERVAL))
 
     await thread.send(
-        "❌ **Не вдалося підтвердити готовність сервісу.**\\n\\n"
-        f"Останній стан: {last_problem}\\n"
+        "❌ **Не вдалося підтвердити готовність сервісу.**\n\n"
+        f"Останній стан: {last_problem}\n"
         "Проєкт збережено в GitHub, але я не позначаю його як готовий. Перевір Render Logs."
     )
     return False
@@ -3144,127 +4634,290 @@ def _safe_github_error_detail(status: int, body: str, request_id: str | None = N
     return f"HTTP {status}. " + " | ".join(parts)
 
 
-async def github_upsert_file(
-    repo_path: str,
-    file_path: str,
-    content: str,
-    commit_message: str
-):
-    if not GITHUB_TOKEN:
-        raise RuntimeError("GITHUB_TOKEN не налаштований.")
+def generated_project_branch(root_dir: str) -> str:
+    """Return an isolated branch name for one generated project directory."""
+    if not isinstance(root_dir, str) or not root_dir.strip():
+        raise ValueError("Порожній шлях згенерованого проєкту.")
+    project_slug = root_dir.rstrip("/").split("/")[-1]
+    if project_slug in {"", ".", ".."}:
+        raise ValueError("Некоректний шлях згенерованого проєкту.")
+    return f"{GROX_PROJECTS_BRANCH}/{project_slug}"
 
-    if not GITHUB_REPO:
-        raise RuntimeError("GITHUB_REPO не налаштований.")
+
+async def github_publish_project(
+    root_dir: str,
+    files: dict[str, str],
+    commit_message: str,
+    branch: str | None = None,
+):
+    """Publish every project file through one atomic Git commit."""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        raise RuntimeError("GITHUB_TOKEN або GITHUB_REPO не налаштований.")
 
     repo = validate_github_repo(GITHUB_REPO)
-
-    encoded_path = "/".join(
-        quote(part, safe="")
-        for part in file_path.split("/")
-    )
-
-    url = (
-        f"{GITHUB_API_URL}/repos/"
-        f"{repo}/contents/{encoded_path}"
-    )
-
+    branch = (branch or generated_project_branch(root_dir)).strip("/")
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-
-    branch = GITHUB_BRANCH
-
+    base_url = f"{GITHUB_API_URL}/repos/{repo}"
     timeout = aiohttp.ClientTimeout(total=60)
 
     async with GITHUB_WRITE_LOCK:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            sha = None
-    
-            async with session.get(
-                url,
-                headers=headers,
-                params={"ref": branch}
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    sha = data.get("sha")
-                elif response.status != 404:
+            async def request_json(method: str, url: str, payload=None):
+                request_kwargs = {"headers": headers}
+                if payload is not None:
+                    request_kwargs["json"] = payload
+                async with session.request(method, url, **request_kwargs) as response:
                     body = await response.text()
-                    request_id = response.headers.get("X-GitHub-Request-Id")
-                    detail = _safe_github_error_detail(response.status, body, request_id)
-                    raise RuntimeError(f"GitHub GET failed: {detail}")
-    
-            payload = {
-                "message": commit_message,
-                "content": base64.b64encode(
-                    content.encode("utf-8")
-                ).decode("ascii"),
-                "branch": branch,
-            }
-    
-            if sha:
-                payload["sha"] = sha
-    
-            async with session.put(
-                url,
-                headers=headers,
-                json=payload
-            ) as response:
-                status = response.status
-                body = await response.text()
-                request_id = response.headers.get("X-GitHub-Request-Id")
-                accepted_permissions = response.headers.get("X-Accepted-GitHub-Permissions", "")
-    
-            if status not in (200, 201):
-                detail = _safe_github_error_detail(status, body, request_id)
-                if accepted_permissions:
-                    safe_permissions = re.sub(r"[^A-Za-z0-9_=,; -]", "", accepted_permissions)[:200]
-                    detail += f" | Потрібні права GitHub API (X-Accepted-GitHub-Permissions): {safe_permissions}"
-                message = f"GitHub PUT failed: {detail}"
-    
-                if status == 404:
-                    # Для PUT 404 додатково перевіряємо доступ до репозиторію та гілки.
+                    if response.status not in (200, 201):
+                        request_id = response.headers.get("X-GitHub-Request-Id")
+                        detail = _safe_github_error_detail(
+                            response.status,
+                            body,
+                            request_id,
+                        )
+                        raise RuntimeError(f"GitHub atomic publish failed: {detail}")
                     try:
-                        diagnosis = await _diagnose_github_404(
-                            session, headers, repo, branch
+                        data = json.loads(body)
+                    except json.JSONDecodeError as error:
+                        raise RuntimeError(
+                            "GitHub повернув некоректний JSON під час атомарної публікації."
+                        ) from error
+                    if not isinstance(data, dict):
+                        raise RuntimeError(
+                            "GitHub повернув відповідь неочікуваного формату під час публікації."
                         )
-                    except Exception as diag_error:
-                        diagnosis = (
-                            "Діагностика не вдалася: "
-                            f"{type(diag_error).__name__}"
-                        )
-                    message += f"\\nДіагностика: {diagnosis}"
-                elif status == 403:
-                    # Перевіряємо реального власника PAT і push-доступ.
-                    try:
-                        diagnosis = await _diagnose_github_403(
-                            session, headers, repo
-                        )
-                    except Exception as diag_error:
-                        diagnosis = (
-                            "Діагностика PAT не вдалася: "
-                            f"{type(diag_error).__name__}"
-                        )
-                    message += f"\\n{diagnosis}"
-    
-                raise RuntimeError(message)
-    
-            data = json.loads(body)
+                    return data
 
-    return data
+            branch_ref_url = (
+                f"{base_url}/git/ref/heads/{quote(branch, safe='/')}"
+            )
+            try:
+                ref_data = await request_json("GET", branch_ref_url)
+            except RuntimeError as error:
+                # Create a dedicated projects branch from the configured base
+                # branch on first use, so publishing a bot cannot trigger a
+                # redeploy of Grox itself when its Render service watches main.
+                if "HTTP 404" not in str(error):
+                    raise
+                base_ref_url = (
+                    f"{base_url}/git/ref/heads/{quote(GITHUB_BRANCH, safe='/')}"
+                )
+                base_ref = await request_json("GET", base_ref_url)
+                base_sha = (base_ref.get("object") or {}).get("sha")
+                if not isinstance(base_sha, str) or not base_sha:
+                    raise RuntimeError("GitHub не повернув SHA базової гілки.")
+                try:
+                    await request_json(
+                        "POST",
+                        f"{base_url}/git/refs",
+                        {"ref": f"refs/heads/{branch}", "sha": base_sha},
+                    )
+                except RuntimeError as create_error:
+                    if "HTTP 422" not in str(create_error):
+                        raise
+                ref_data = await request_json("GET", branch_ref_url)
+
+            parent_sha = (ref_data.get("object") or {}).get("sha")
+            if not isinstance(parent_sha, str) or not parent_sha:
+                raise RuntimeError("GitHub не повернув commit SHA поточної гілки.")
+
+            parent_commit = await request_json(
+                "GET",
+                f"{base_url}/git/commits/{quote(parent_sha, safe='')}",
+            )
+            base_tree_sha = (parent_commit.get("tree") or {}).get("sha")
+            if not isinstance(base_tree_sha, str) or not base_tree_sha:
+                raise RuntimeError("GitHub не повернув tree SHA поточного commit.")
+
+            tree_entries = []
+            for filename, content in files.items():
+                if (
+                    not is_safe_project_file_path(filename)
+                    or not isinstance(content, str)
+                ):
+                    raise ValueError("Некоректний шлях або вміст файлу проєкту.")
+
+                blob = await request_json(
+                    "POST",
+                    f"{base_url}/git/blobs",
+                    {"content": content, "encoding": "utf-8"},
+                )
+                blob_sha = blob.get("sha")
+                if not isinstance(blob_sha, str) or not blob_sha:
+                    raise RuntimeError(f"GitHub не повернув blob SHA для {filename}.")
+
+                tree_entries.append({
+                    "path": f"{root_dir}/{filename}",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": blob_sha,
+                })
+
+            if not tree_entries:
+                raise RuntimeError("Немає файлів для публікації в GitHub.")
+
+            tree = await request_json(
+                "POST",
+                f"{base_url}/git/trees",
+                {
+                    "base_tree": base_tree_sha,
+                    "tree": tree_entries,
+                },
+            )
+            tree_sha = tree.get("sha")
+            if not isinstance(tree_sha, str) or not tree_sha:
+                raise RuntimeError("GitHub не повернув tree SHA нового проєкту.")
+
+            commit = await request_json(
+                "POST",
+                f"{base_url}/git/commits",
+                {
+                    "message": commit_message,
+                    "tree": tree_sha,
+                    "parents": [parent_sha],
+                },
+            )
+            commit_sha = commit.get("sha")
+            if not isinstance(commit_sha, str) or not commit_sha:
+                raise RuntimeError("GitHub не повернув SHA нового commit.")
+
+            # A non-forced ref update prevents overwriting a concurrent push.
+            await request_json(
+                "PATCH",
+                f"{base_url}/git/refs/heads/{quote(branch, safe='/')}",
+                {"sha": commit_sha, "force": False},
+            )
+
+    print(
+        f"[GITHUB] Published {len(tree_entries)} project file(s) "
+        f"atomically in commit {commit_sha}."
+    )
+    return commit_sha
 
 
-# ============================================================
-# RENDER DEPLOY
-# ============================================================
+def select_render_owner_id(owners, configured_owner_id: str = "") -> str:
+    """Select a Render owner explicitly; never silently choose the first account."""
+    valid_owners = []
+    for record in owners if isinstance(owners, list) else []:
+        if not isinstance(record, dict):
+            continue
+        nested = record.get("owner")
+        candidate = (
+            nested.get("id")
+            if isinstance(nested, dict)
+            else record.get("id")
+        )
+        if candidate is not None:
+            valid_owners.append(str(candidate))
+
+    if configured_owner_id:
+        if configured_owner_id in valid_owners:
+            return configured_owner_id
+        raise RuntimeError(
+            "RENDER_OWNER_ID не знайдено серед доступних Render owners. "
+            "Перевір значення змінної середовища."
+        )
+
+    unique_owners = list(dict.fromkeys(valid_owners))
+    if len(unique_owners) == 1:
+        return unique_owners[0]
+    if not unique_owners:
+        raise RuntimeError("Render API не повернув жодного коректного owner ID.")
+    raise RuntimeError(
+        "Render API повернув кілька доступних owners. "
+        "Щоб уникнути створення сервісу не в тому workspace, "
+        "налаштуй RENDER_OWNER_ID у Environment Variables Grox."
+    )
+
+
+async def wait_for_render_deploy(service_id: str, timeout_seconds: int = 600):
+    """Wait for Render's deploy record to become live or report a build failure."""
+    if not RENDER_API_KEY:
+        raise RuntimeError("RENDER_API_KEY не налаштований.")
+
+    api_url = "https://api.render.com/v1"
+    deploys_url = (
+        f"{api_url}/services/{quote(str(service_id), safe='')}/deploys"
+    )
+    headers = {
+        "Authorization": f"Bearer {RENDER_API_KEY}",
+        "Accept": "application/json",
+    }
+    deadline = asyncio.get_running_loop().time() + max(30, timeout_seconds)
+    last_status = "Render ще не створив запис розгортання."
+    terminal_failures = {
+        "build_failed", "pre_deploy_failed", "update_failed",
+        "failed", "canceled", "cancelled", "deactivated",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                async with session.get(
+                    deploys_url,
+                    headers=headers,
+                    params={"limit": "1"},
+                ) as response:
+                    if response.status != 200:
+                        last_status = f"Render deploy API повернув HTTP {response.status}."
+                    else:
+                        try:
+                            payload = await response.json(content_type=None)
+                        except Exception:
+                            payload = None
+
+                        if isinstance(payload, list) and payload:
+                            record = payload[0]
+                            deploy = record.get("deploy", record) if isinstance(record, dict) else {}
+                        elif isinstance(payload, dict):
+                            deploys = payload.get("deploys")
+                            if isinstance(deploys, list) and deploys:
+                                record = deploys[0]
+                                deploy = record.get("deploy", record) if isinstance(record, dict) else {}
+                            else:
+                                deploy = payload.get("deploy", payload)
+                        else:
+                            deploy = {}
+
+                        status = (
+                            str(deploy.get("status") or "").casefold()
+                            if isinstance(deploy, dict) else ""
+                        )
+                        if status == "live":
+                            print(f"[RENDER] Deploy {service_id} is live.")
+                            return True
+                        if status in terminal_failures:
+                            raise RuntimeError(
+                                f"Render deployment failed with status '{status}'. "
+                                "Перевір Build Logs у Render."
+                            )
+                        if status:
+                            last_status = f"Render deploy status: {status}."
+            except RuntimeError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+                last_status = f"Render deploy polling: {type(error).__name__}."
+
+            await asyncio.sleep(5)
+
+    raise RuntimeError(
+        "Не вдалося підтвердити успішне розгортання Render за відведений час. "
+        + last_status
+    )
+
 
 async def deploy_project_to_render(
     service_name: str,
     root_dir: str,
     extra_env: dict[str, str] | None = None,
-    is_bot2_service: bool = False
+    is_bot2_service: bool = False,
+    on_service_created=None,
+    project_branch: str | None = None,
 ):
     if not RENDER_API_KEY:
         raise RuntimeError(
@@ -3320,22 +4973,7 @@ async def deploy_project_to_render(
         else:
             owners = []
 
-        if not owners or not isinstance(owners[0], dict):
-            raise RuntimeError(
-                "Render API не повернув коректний список owner; відповідь API приховано."
-            )
-
-        first_owner = owners[0]
-        nested_owner = first_owner.get("owner")
-        if isinstance(nested_owner, dict):
-            owner_id = nested_owner.get("id") or first_owner.get("id")
-        else:
-            owner_id = first_owner.get("id")
-
-        if not owner_id:
-            raise RuntimeError(
-                "Не вдалося визначити ownerId Render."
-            )
+        owner_id = select_render_owner_id(owners, RENDER_OWNER_ID)
 
         repo_url = (
             f"https://github.com/{repo}.git"
@@ -3369,7 +5007,7 @@ async def deploy_project_to_render(
             "name": service_name,
             "ownerId": owner_id,
             "repo": repo_url,
-            "branch": GITHUB_BRANCH,
+            "branch": (project_branch or generated_project_branch(root_dir)).strip("/"),
             "rootDir": root_dir,
             "envVars": env_vars,
             "serviceDetails": {
@@ -3429,9 +5067,20 @@ async def deploy_project_to_render(
     # Render's service-list response nests the primary URL under
     # serviceDetails.url; creation responses may expose it at the top level.
     service_url = service.get("url") or service_details.get("url")
+    service_id = service.get("id")
+    if not service_id:
+        raise RuntimeError("Render створив відповідь без service ID; розгортання не підтверджено.")
+
+    if on_service_created is not None:
+        await on_service_created(
+            str(service_id),
+            str(service.get("name") or service_name),
+        )
+
+    await wait_for_render_deploy(str(service_id), timeout_seconds=600)
 
     return {
-        "id": service.get("id"),
+        "id": service_id,
         "url": service_url,
         "name": service.get("name", service_name),
     }
@@ -3493,14 +5142,6 @@ async def build_and_deploy_software_bot(
         )
         return False
 
-    if generated_platform == "Discord" and builder_token_services:
-        await thread.send(
-            "⚠️ **Увага: токен `GROX_BUILDER_DISCORD_TOKEN` уже використовує "
-            "сервіс: " + ", ".join(builder_token_services[-3:]) + ".**\n\n"
-            "Два сервіси з одним токеном одночасно відповідатимуть двічі. "
-            "Для кожного окремого Discord-бота потрібен власний токен."
-        )
-
     await thread.send(
         "🤖 **Генерую програмний проєкт...**\n\n"
         + ("Для Bot 2 застосовую окреме Discord-only технічне завдання та перевірки."
@@ -3517,18 +5158,48 @@ async def build_and_deploy_software_bot(
     suffix = uuid.uuid4().hex[:6]
     root_dir = f"generated_projects/order_{order.order_id}_{suffix}"
     service_name = f"grox-order-{order.order_id}-{suffix}"
+    project_branch = generated_project_branch(root_dir)
 
-    await thread.send("📦 **Публікую перевірені файли в GitHub...**")
-
-    for filename, content in files.items():
-        await github_upsert_file(
-            root_dir,
-            f"{root_dir}/{filename}",
-            content,
-            f"Grox: generate order #{order.order_id} - {filename}"
+    token_fingerprint = hashlib.sha256(
+        GENERATED_DISCORD_TOKEN.encode("utf-8")
+    ).hexdigest()
+    reserved, existing_usage = await reserve_builder_token(
+        token_fingerprint,
+        order.order_id,
+        service_name,
+    )
+    if not reserved:
+        existing_name = (existing_usage or {}).get("service_name") or "невідомий сервіс"
+        existing_id = (existing_usage or {}).get("service_id")
+        await thread.send(
+            "🔒 **Цей Discord-токен уже закріплений за іншим Render-сервісом.**\n\n"
+            f"Сервіс: {existing_name}"
+            + (f" (ID: {existing_id})" if existing_id else "")
+            + "\n\nОдин токен не можна використовувати для двох ботів. "
+            "Створи окремий Discord application/bot і додай його токен у "
+            "GROX_BUILDER_DISCORD_TOKEN. Не надсилай токен у чат."
         )
+        return False
+
+    await thread.send(
+        "📦 **Публікую перевірені файли в GitHub одним атомарним комітом...**"
+    )
+    try:
+        await github_publish_project(
+            root_dir,
+            files,
+            f"Grox: generate order #{order.order_id}",
+            branch=project_branch,
+        )
+    except Exception:
+        await release_builder_token_reservation(
+            token_fingerprint,
+            order.order_id,
+        )
+        raise
 
     order.project_repo_path = root_dir
+    order.project_branch = project_branch
     await save_order(order)
     await thread.send("☁️ **Створюю окремий Render-сервіс...**")
 
@@ -3537,7 +5208,11 @@ async def build_and_deploy_software_bot(
     # Generated projects may use Groq independently of Grox. Pass the
     # dedicated Groq key only when the generated source explicitly references
     # GROQ_API_KEY; never copy Render/GitHub/Vercel or Grox database secrets.
-    if any("GROQ_API_KEY" in content for content in files.values()):
+    if any(
+        "GROQ_API_KEY" in content
+        for filename, content in files.items()
+        if filename.lower().endswith((".py", ".js", ".ts", ".mjs", ".cjs"))
+    ):
         render_env["GROQ_API_KEY"] = GROQ_API_KEY
 
     if generated_platform == "Discord":
@@ -3550,20 +5225,34 @@ async def build_and_deploy_software_bot(
         if BOT2_DATABASE_URL:
             render_env["DATABASE_URL"] = BOT2_DATABASE_URL
 
+    async def record_created_service(service_id: str, actual_name: str):
+        await update_builder_token_service(
+                token_fingerprint,
+                order.order_id,
+                service_id,
+                actual_name,
+                status="CREATED",
+            )
+
     render_info = await deploy_project_to_render(
         service_name,
         root_dir,
         extra_env=render_env,
-        is_bot2_service=bot2
+        is_bot2_service=bot2,
+        on_service_created=record_created_service,
+        project_branch=project_branch,
     )
 
     order.render_service_id = render_info.get("id")
     order.deployment_url = render_info.get("url")
     await save_order(order)
 
-    if generated_platform == "Discord":
-        builder_token_services.append(
-            render_info.get("name") or service_name
+    await update_builder_token_service(
+            token_fingerprint,
+            order.order_id,
+            str(render_info.get("id")),
+            str(render_info.get("name") or service_name),
+            status="ACTIVE",
         )
 
     if bot2:
@@ -3606,31 +5295,47 @@ async def build_and_deploy_software_bot(
 # ============================================================
 
 async def process_order(
-    message: discord.Message
+    message: discord.Message,
+    slot_reserved: bool = False,
 ):
     if message.author.id != GROX_OWNER_ID:
         return
 
-    if message.id in active_orders:
-        return
+    if not slot_reserved:
+        if message.id in active_orders:
+            return
+        active_orders.add(message.id)
+        active_clients[message.author.id] = (
+            active_clients.get(message.author.id, 0) + 1
+        )
+    elif message.id not in active_orders:
+        # Defensive fallback for an internal caller that reserved only a slot.
+        active_orders.add(message.id)
 
-    active_orders.add(
-        message.id
-    )
-
-    active_clients[message.author.id] = (
-        active_clients.get(message.author.id, 0) + 1
-    )
+    heartbeat_task = None
 
     try:
         # ====================================================
         # CREATE ORDER
         # ====================================================
 
-        order = create_order(
-            message
-        )
-        await save_order(order)
+        try:
+            order = await create_order(message)
+        except ActiveOrderLimitReached:
+            await message.channel.send(
+                "⚠️ Досягнуто ліміту одночасних завдань. "
+                f"Максимум — {MAX_ACTIVE_ORDERS_PER_USER}. "
+                "Зачекайте, поки завершиться одне з попередніх."
+            )
+            return
+
+        if order is None:
+            # Another Render instance may already have processed this exact
+            # Discord message. The database uniqueness constraint is the
+            # cross-instance source of truth; do not create another thread.
+            return
+
+        heartbeat_task = asyncio.create_task(heartbeat_order(order.order_id))
 
         # ====================================================
         # CREATE THREAD
@@ -3747,6 +5452,18 @@ async def process_order(
             await save_order(order)
             return
 
+        missing_settings = missing_required_integration_settings(first_task)
+        if missing_settings:
+            await thread.send(
+                "⚙️ **Не можу почати уточнення вимог: не налаштовані інтеграції.**\n\n"
+                "В Render → Environment перевір такі змінні:\n"
+                + "\n".join(f"• {item}" for item in missing_settings)
+                + "\n\nНе надсилай токени або ключі в Discord."
+            )
+            order.status = "ERROR"
+            await save_order(order)
+            return
+
         # ====================================================
         # CONVERSATIONAL REQUIREMENT DISCOVERY
         # ====================================================
@@ -3763,7 +5480,27 @@ async def process_order(
             return
 
         if len(final_task) > MAX_TASK_LENGTH:
-            final_task = final_task[:MAX_TASK_LENGTH]
+            await thread.send(
+                "❌ **Фінальне ТЗ перевищує допустимий розмір.**\n\n"
+                f"Максимум — {MAX_TASK_LENGTH} символів. Я не буду мовчки "
+                "обрізати вимоги, щоб не втратити важливу частину завдання. "
+                "Скоротіть ТЗ і створіть нове замовлення."
+            )
+            order.status = "ERROR"
+            await save_order(order)
+            return
+
+        missing_settings = missing_required_integration_settings(final_task)
+        if missing_settings:
+            await thread.send(
+                "⚙️ **Не можу почати розробку: не налаштовані інтеграції.**\n\n"
+                "В Render → Environment перевір такі змінні:\n"
+                + "\n".join(f"• {item}" for item in missing_settings)
+                + "\n\nНе надсилай токени або ключі в Discord."
+            )
+            order.status = "ERROR"
+            await save_order(order)
+            return
 
         order.task = final_task
         await save_order(order)
@@ -3803,20 +5540,7 @@ async def process_order(
         # PROJECT TYPE DETECTION
         # ====================================================
 
-        website_project = (
-            not is_software_bot_project(order.task)
-            and has_keyword(
-                order.task,
-                (
-                    "сайт",
-                    "website",
-                    "web",
-                    "лендинг",
-                    "landing",
-                    "вебсайт",
-                )
-            )
-        )
+        website_project = is_website_project(order.task)
 
         # ====================================================
         # WEBSITE
@@ -3933,6 +5657,8 @@ async def process_order(
         # ====================================================
 
         order.status = "COMPLETED"
+        order.delivered_at = int(time.time())
+        order.post_delivery_expires_at = order.delivered_at + POST_DELIVERY_TIMEOUT
         await save_order(order)
 
         # ====================================================
@@ -3974,15 +5700,16 @@ async def process_order(
         # POST-DELIVERY CLIENT CONVERSATION
         # ====================================================
 
-        await post_delivery_conversation(
-            order,
-            thread
-        )
+        post_delivery_tasks.add(order.order_id)
+        try:
+            await post_delivery_conversation(order, thread)
+        finally:
+            post_delivery_tasks.discard(order.order_id)
 
     except Exception as error:
         # Do not leave a failed order marked WAITING_TZ or IN_PROGRESS.
         # Completed/expired/unsupported orders keep their terminal status.
-        if "order" in locals() and order.status not in {
+        if isinstance(locals().get("order"), Order) and order.status not in {
             "COMPLETED", "ERROR", "EXPIRED", "QA_FAILED",
             "UNSUPPORTED", "INTERRUPTED",
         }:
@@ -4019,7 +5746,11 @@ async def process_order(
             pass
 
     finally:
-        if "order" in locals():
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+        if isinstance(locals().get("order"), Order):
             try:
                 await save_order(order)
             except Exception as persist_error:
@@ -4045,9 +5776,16 @@ async def process_order(
 # ============================================================
 
 @bot.event
+async def on_connect():
+    # Confirms that the Discord Gateway WebSocket handshake succeeded.
+    print("[DISCORD] Gateway connected; waiting for READY event.", flush=True)
+
+
+@bot.event
 async def on_ready():
     global discord_ready
     discord_ready = True
+    print("[DISCORD] READY event received.", flush=True)
     print(
         "========================================"
     )
@@ -4079,6 +5817,14 @@ async def on_ready():
         f"{MAX_WEBSITE_FIX_ATTEMPTS}"
     )
 
+    # Safe integration diagnostics: report presence only, never values.
+    print(
+        "[CONFIG] Software-bot integration: "
+        f"GITHUB_TOKEN={'SET' if bool(GITHUB_TOKEN) else 'MISSING'}; "
+        f"GITHUB_REPO={'SET' if bool(GITHUB_REPO) else 'MISSING'}; "
+        f"RENDER_API_KEY={'SET' if bool(RENDER_API_KEY) else 'MISSING'}; "
+        f"GROX_BUILDER_DISCORD_TOKEN={'SET' if bool(GENERATED_DISCORD_TOKEN) else 'MISSING'}"
+    )
     print(
         f"🤖 Software bot generation: "
         f"{'YES' if GITHUB_TOKEN and GITHUB_REPO and RENDER_API_KEY else 'NO'}"
@@ -4087,6 +5833,8 @@ async def on_ready():
     print(
         "🚀 Grox готовий!"
     )
+
+    schedule_post_delivery_resumes()
 
     print(
         "========================================"
@@ -4159,17 +5907,23 @@ async def on_message(
             pass
         return
 
+    # Reserve the in-memory slot synchronously before scheduling the task.
+    # Without this, several messages arriving in one event-loop turn can all
+    # pass the limit check before process_order increments the counter.
+    active_orders.add(message.id)
+    active_clients[message.author.id] = (
+        active_clients.get(message.author.id, 0) + 1
+    )
+
     print(
         f"[ORDER DETECTED] user_id={message.author.id} "
         f"message_id={message.id} "
         f"message_length={len(message.content)}"
     )
 
-    asyncio.create_task(
-        process_order(
-            message
-        )
-    )
+    task = asyncio.create_task(process_order(message, slot_reserved=True))
+    processing_tasks.add(task)
+    task.add_done_callback(processing_tasks.discard)
 
 
 # ============================================================
@@ -4258,16 +6012,52 @@ def discord_retry_delay(error, attempt: int) -> tuple[int, str]:
 async def main():
     global discord_ready
 
-    print("🚀 Starting Grox...")
+    print("🚀 Starting Grox...", flush=True)
     health_runner = await start_health_server()
+    print("[STARTUP] Health server started.", flush=True)
     attempt = 0
+    loop = asyncio.get_running_loop()
+
+    recovery_task = None
+
+    def request_shutdown():
+        print("[SHUTDOWN] Signal received; closing Discord client gracefully.")
+        if not bot.is_closed():
+            asyncio.create_task(bot.close())
+
+    for shutdown_signal in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(shutdown_signal, request_shutdown)
+        except (NotImplementedError, RuntimeError):
+            # Signal handlers may be unavailable on non-Unix test platforms.
+            pass
 
     try:
-        await initialize_database()
+        # Keep the health endpoint alive and report the exact startup stage.
+        # Database failures are retried without exposing connection details.
+        database_attempt = 0
+        while True:
+            database_attempt += 1
+            print(f"[DATABASE] Initializing database (attempt {database_attempt})...", flush=True)
+            try:
+                await initialize_database()
+                print("[DATABASE] Database initialized successfully.", flush=True)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                print(
+                    f"[DATABASE] Initialization failed: {safe_exception(error)}. "
+                    "Retrying in 30 seconds.",
+                    flush=True,
+                )
+                await asyncio.sleep(30)
+
+        recovery_task = asyncio.create_task(recover_stale_orders())
         while True:
             attempt += 1
             discord_ready = False
-            print(f"[DISCORD] Підключення до Discord (спроба {attempt})...")
+            print(f"[DISCORD] Підключення до Discord (спроба {attempt})...", flush=True)
 
             try:
                 # discord.py handles normal gateway reconnects. This loop
@@ -4337,6 +6127,27 @@ async def main():
         discord_ready = False
         if not bot.is_closed():
             await bot.close()
+
+        # Render sends SIGTERM before stopping an instance. Give active orders
+        # a short grace period to persist their state, then cancel leftovers.
+        pending_tasks = set(processing_tasks)
+        if pending_tasks:
+            _, pending_tasks = await asyncio.wait(pending_tasks, timeout=20)
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+        if recovery_task is not None:
+            recovery_task.cancel()
+            await asyncio.gather(recovery_task, return_exceptions=True)
+
+        for shutdown_signal in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.remove_signal_handler(shutdown_signal)
+            except (NotImplementedError, RuntimeError):
+                pass
+
         await health_runner.cleanup()
         await close_database()
 
