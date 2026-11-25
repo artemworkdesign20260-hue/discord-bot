@@ -3846,6 +3846,7 @@ def validate_generated_project(
 async def generate_software_project(client_task: str):
     bot2 = is_bot2_project(client_task)
     platform = "Discord" if bot2 else detect_bot_platform(client_task)
+    is_discord_platform = "discord" in str(platform).casefold()
     special_requirements = bot2_project_spec() if bot2 else ""
 
     prompt = f"""
@@ -4010,7 +4011,7 @@ async def generate_software_project(client_task: str):
 
     # Create predictable Discord metadata locally instead of spending Groq TPM
     # on files whose contents are deterministic.
-    if platform == "Discord":
+    if is_discord_platform:
         existing_requirements = files.get("requirements.txt", "").strip()
         requirement_lines = [
             line.strip() for line in existing_requirements.splitlines()
@@ -4043,7 +4044,7 @@ async def generate_software_project(client_task: str):
     validation_errors = list(parse_errors)
     validation_errors.extend(
         validate_generated_project(
-            files, bot2=bot2, require_discord=(platform == "Discord")
+            files, bot2=bot2, require_discord=is_discord_platform
         )
     )
     if generation_truncated:
@@ -4278,7 +4279,7 @@ async def generate_software_project(client_task: str):
             for name in repair_targets
         })
         validation_errors = validate_generated_project(
-            files, bot2=bot2, require_discord=(platform == "Discord")
+            files, bot2=bot2, require_discord=is_discord_platform
         )
 
     if validation_errors:
