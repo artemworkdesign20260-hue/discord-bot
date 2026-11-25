@@ -4112,7 +4112,7 @@ async def generate_software_project(client_task: str):
         # Repair syntax errors with a small local window instead of resending
         # an entire generated source file (which can exceed Groq's TPM window).
         syntax_match = re.search(
-            r"main\\.py:\\s*(?:рядок|line)\\s*(\\d+)",
+            r"main\.py:\s*(?:рядок|line)\s*(\d+)",
             error_text,
             re.IGNORECASE,
         )
@@ -4121,7 +4121,7 @@ async def generate_software_project(client_task: str):
             error_line = int(syntax_match.group(1))
             window_start = max(1, error_line - 6)
             window_end = min(len(source_lines), error_line + 6)
-            snippet = "\\n".join(
+            snippet = "\n".join(
                 f"{number}: {source_lines[number - 1]}"
                 for number in range(window_start, window_end + 1)
             )
@@ -4142,14 +4142,14 @@ async def generate_software_project(client_task: str):
                 )
                 patch_text = syntax_result.get("content", "")
                 patch_match = re.search(
-                    rf"(?s)===PATCH_LINES:{window_start}-{window_end}===\\s*\\n(.*)",
+                    rf"(?s)===PATCH_LINES:{window_start}-{window_end}===\s*\n(.*)",
                     patch_text,
                 )
                 if patch_match and syntax_result.get("finish_reason") != "length":
                     replacement_lines = patch_match.group(1).rstrip().splitlines()
                     if len(replacement_lines) == window_end - window_start + 1:
                         source_lines[window_start - 1:window_end] = replacement_lines
-                        candidate_source = "\\n".join(source_lines) + "\\n"
+                        candidate_source = "\n".join(source_lines) + "\n"
                         try:
                             ast.parse(candidate_source, filename="main.py")
                         except SyntaxError as syntax_error:
