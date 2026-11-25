@@ -4109,7 +4109,74 @@ async def generate_software_project(client_task: str):
         # after each successful response and selects the next unresolved file.
         repair_targets = repair_targets[:1]
 
-        requested_files = "\n".join(
+        # Repair syntax errors with a small local window instead of resending
+        # an entire generated source file (which can exceed Groq's TPM window).
+        syntax_match = re.search(
+            r"main\\.py:\\s*(?:рядок|line)\\s*(\\d+)",
+            error_text,
+            re.IGNORECASE,
+        )
+        if syntax_match and "main.py" in repair_targets and files.get("main.py", "").strip():
+            source_lines = files["main.py"].splitlines()
+            error_line = int(syntax_match.group(1))
+            window_start = max(1, error_line - 6)
+            window_end = min(len(source_lines), error_line + 6)
+            snippet = "\\n".join(
+                f"{number}: {source_lines[number - 1]}"
+                for number in range(window_start, window_end + 1)
+            )
+            syntax_prompt = (
+                "Ти — досвідчений Python-інженер. Виправ ТІЛЬКИ синтаксичну помилку "
+                "у наведеному фрагменті Python. Збережи логіку та всі рядки, які не "
+                "потрібно змінювати. Поверни повний виправлений фрагмент між точними "
+                "маркерами нижче, без Markdown та пояснень. Кожен рядок фрагмента "
+                "має бути збережений, включно з відступами.\n"
+                f"===PATCH_LINES:{window_start}-{window_end}===\n"
+                + snippet
+                + "\n\nПомилка: "
+                + "; ".join(validation_errors)[:1200]
+            )
+            try:
+                syntax_result = await groq_request(
+                    syntax_prompt, max_output_tokens=1200, return_metadata=True
+                )
+                patch_text = syntax_result.get("content", "")
+                patch_match = re.search(
+                    rf"(?s)===PATCH_LINES:{window_start}-{window_end}===\\s*\\n(.*)",
+                    patch_text,
+                )
+                if patch_match and syntax_result.get("finish_reason") != "length":
+                    replacement_lines = patch_match.group(1).rstrip().splitlines()
+                    if len(replacement_lines) == window_end - window_start + 1:
+                        source_lines[window_start - 1:window_end] = replacement_lines
+                        candidate_source = "\\n".join(source_lines) + "\\n"
+                        try:
+                            ast.parse(candidate_source, filename="main.py")
+                        except SyntaxError as syntax_error:
+                            validation_errors = [
+                                f"Синтаксична помилка main.py: рядок {syntax_error.lineno}: {syntax_error.msg}."
+                            ]
+                        else:
+                            files["main.py"] = candidate_source
+                            validation_errors = validate_generated_project(
+                                files, bot2=bot2, require_discord=is_discord_platform
+                            )
+                            print(
+                                "[PROJECT REPAIR] targeted_syntax_patch=accepted "
+                                f"lines={window_start}-{window_end}"
+                            )
+                            continue
+                    else:
+                        print("[PROJECT REPAIR] targeted_syntax_patch=rejected reason=line_count")
+                else:
+                    print("[PROJECT REPAIR] targeted_syntax_patch=rejected reason=missing_or_truncated_marker")
+            except Exception as syntax_repair_error:
+                print(
+                    "[PROJECT REPAIR] targeted_syntax_patch_failed="
+                    f"{type(syntax_repair_error).__name__}: {safe_error_detail(syntax_repair_error)}"
+                )
+
+        requested_files = "\\n".join(
             f"===FILE: {name}===\n<повний виправлений вміст {name}>"
             for name in repair_targets
         )
