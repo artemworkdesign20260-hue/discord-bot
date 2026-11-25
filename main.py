@@ -5905,8 +5905,9 @@ def discord_retry_delay(error, attempt: int) -> tuple[int, str]:
 async def main():
     global discord_ready
 
-    print("🚀 Starting Grox...")
+    print("🚀 Starting Grox...", flush=True)
     health_runner = await start_health_server()
+    print("[STARTUP] Health server started.", flush=True)
     attempt = 0
     loop = asyncio.get_running_loop()
 
@@ -5925,12 +5926,31 @@ async def main():
             pass
 
     try:
-        await initialize_database()
+        # Keep the health endpoint alive and report the exact startup stage.
+        # Database failures are retried without exposing connection details.
+        database_attempt = 0
+        while True:
+            database_attempt += 1
+            print(f"[DATABASE] Initializing database (attempt {database_attempt})...", flush=True)
+            try:
+                await initialize_database()
+                print("[DATABASE] Database initialized successfully.", flush=True)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                print(
+                    f"[DATABASE] Initialization failed: {safe_exception(error)}. "
+                    "Retrying in 30 seconds.",
+                    flush=True,
+                )
+                await asyncio.sleep(30)
+
         recovery_task = asyncio.create_task(recover_stale_orders())
         while True:
             attempt += 1
             discord_ready = False
-            print(f"[DISCORD] Підключення до Discord (спроба {attempt})...")
+            print(f"[DISCORD] Підключення до Discord (спроба {attempt})...", flush=True)
 
             try:
                 # discord.py handles normal gateway reconnects. This loop
