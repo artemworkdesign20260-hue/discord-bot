@@ -5817,6 +5817,14 @@ async def on_ready():
         f"{MAX_WEBSITE_FIX_ATTEMPTS}"
     )
 
+    # Safe integration diagnostics: report presence only, never values.
+    print(
+        "[CONFIG] Software-bot integration: "
+        f"GITHUB_TOKEN={'SET' if bool(GITHUB_TOKEN) else 'MISSING'}; "
+        f"GITHUB_REPO={'SET' if bool(GITHUB_REPO) else 'MISSING'}; "
+        f"RENDER_API_KEY={'SET' if bool(RENDER_API_KEY) else 'MISSING'}; "
+        f"GROX_BUILDER_DISCORD_TOKEN={'SET' if bool(GENERATED_DISCORD_TOKEN) else 'MISSING'}"
+    )
     print(
         f"🤖 Software bot generation: "
         f"{'YES' if GITHUB_TOKEN and GITHUB_REPO and RENDER_API_KEY else 'NO'}"
